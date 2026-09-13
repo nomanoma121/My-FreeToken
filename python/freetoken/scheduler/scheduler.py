@@ -144,10 +144,36 @@ class Scheduler(SchedulerIOMixin):
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
+        # --moe-bank-rewarm: an idle-time re-read of a mapped bank's cold rows. Started when the
+        # scheduler goes idle, stopped the moment a message is received.
+        self.bank_rewarm = None
+        rewarm_s = float(getattr(config, "moe_bank_rewarm", 0.0) or 0.0)
+        banks = getattr(getattr(self.engine, "bank_tier", None), "banks", None)
+        if rewarm_s > 0 and banks is not None and getattr(banks, "cold_spans", None):
+            from freetoken.moe.bank_rewarm import BankRewarm
+
+            self.bank_rewarm = BankRewarm(banks, rewarm_s, log=logger.info)
+            inner_receive = self.receive_msg
+
+            def receive_msg(blocking: bool = False):
+                msgs = inner_receive(blocking)
+                if msgs:
+                    self.bank_rewarm.busy()
+                return msgs
+
+            self.receive_msg = receive_msg
+        elif rewarm_s > 0:
+            logger.warning_rank0(
+                "--moe-bank-rewarm has nothing to do: it needs --moe-bank-ram with a file-backed "
+                "part (every row is resident, or the bank is not mapped)"
+            )
+
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        if getattr(self, "bank_rewarm", None) is not None:
+            self.bank_rewarm.idle()
 
     @torch.inference_mode()
     def rebuild_cache(

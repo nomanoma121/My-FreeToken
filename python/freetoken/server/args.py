@@ -747,6 +747,18 @@ def parse_args(
         default=ServerArgs.moe_bank_dir,
         help="Directory for the cold bank file. Defaults beside the checkpoint.",
     )
+    parser.add_argument(
+        "--moe-bank-rewarm",
+        type=float,
+        default=ServerArgs.moe_bank_rewarm,
+        help=(
+            "With --moe-bank-ram: after this many seconds idle, check how much of the bank's "
+            "file-backed rows the page cache still holds, and if it has dropped (memory "
+            "pressure, WSL2 autoMemoryReclaim), read them back in file order until a request "
+            "arrives. Measured on an RTX 2060: the first follow-up after the cache was emptied "
+            "took 31 s to its first token instead of 1 s. 0 (default) = off."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cache-policy",

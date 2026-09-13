@@ -306,6 +306,9 @@ class MappedBanks:
         self.whole_blocks = 0
         self.registered_bytes = 0
         self.sources: dict[str, list] = {}
+        # (offset, nbytes) of every block's file-backed remainder, in file order: what the
+        # page cache may drop and --moe-bank-rewarm reads back (moe/bank_rewarm.py).
+        self.cold_spans: list[tuple[int, int]] = []
         # FREETOKEN_BANK_PRELOAD: pull the non-resident rows into the page cache too. They
         # are not locked, so the kernel may still drop them -- this only says how much of
         # the decode cost is faulting them back in, by removing that cost on a host with
@@ -370,6 +373,10 @@ class MappedBanks:
                     else self.layout.hot_per_layer
                 )
                 self.whole_blocks += span <= _WHOLE_BLOCK_BYTES
+                if span > lock_rows * row_bytes:
+                    self.cold_spans.append(
+                        (off + lock_rows * row_bytes, span - lock_rows * row_bytes)
+                    )
                 self._settle(off, lock_rows * row_bytes, span, register)
                 self._advise(hint, off, span, len(self._map))
                 if preload:
@@ -574,6 +581,51 @@ class MappedBanks:
                 self._registered.append(addr)
                 return
             clear_cuda_error()
+
+    def cold_residency(self) -> float:
+        """Share of the file-backed rows the page cache holds right now (1.0 when there are none).
+
+        mincore(2) on this process's own mapping, over page-aligned spans. The resident prefix
+        is left out on purpose: it is held regardless, and counting it would hide a cold side
+        that has been emptied behind it.
+        """
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+        limit = len(self._map)
+        pages = present = 0
+        for off, nbytes in self.cold_spans:
+            span = advise_range(off, nbytes, limit)
+            if span is None:
+                continue
+            count = (span[1] + ALIGN - 1) // ALIGN
+            vec = ctypes.create_string_buffer(count)
+            if libc.mincore(ctypes.c_void_p(self._base + span[0]), span[1], vec) != 0:
+                raise OSError(ctypes.get_errno(), "mincore failed")
+            pages += count
+            present += sum(b & 1 for b in vec.raw)
+        return present / pages if pages else 1.0
+
+    def rewarm(self, cancel: threading.Event, step_bytes: int = 64 << 20) -> tuple[int, float, bool]:
+        """Read the file-backed rows back into the page cache, in file order, checking
+        ``cancel`` between steps. Returns (bytes walked, seconds, finished).
+
+        A byte per page through the mapping, as _touch does for FREETOKEN_BANK_PRELOAD and for
+        the same reason: MADV_WILLNEED is a hint the kernel is free to ignore under exactly the
+        pressure that emptied the cache. The step bounds how long a request that arrives
+        mid-walk waits for this to let go -- 64 MiB is well under a second even from disk.
+        """
+        started = time.perf_counter()
+        walked = 0
+        for off, nbytes in self.cold_spans:
+            pos, end = off, off + nbytes
+            while pos < end:
+                if cancel.is_set():
+                    return walked, time.perf_counter() - started, False
+                step = min(step_bytes, end - pos)
+                self._touch(self._buf, pos, step)
+                walked += step
+                pos += step
+        return walked, time.perf_counter() - started, True
 
     def _advise(self, option, start: int, length: int, limit: int) -> None:
         if option is None or length <= 0:

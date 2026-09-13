@@ -1106,6 +1106,7 @@ class Engine:
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         bank_tier = self._build_bank_tier(config)
+        self.bank_tier = bank_tier  # --moe-bank-rewarm reads the mapped banks through this
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
         requested_residency = None
         if split_residency:

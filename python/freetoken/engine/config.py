@@ -71,6 +71,10 @@ class EngineConfig:
     moe_bank_stats: list[str] | None = None
     # --moe-bank-dir: where the cold bank file lives. Defaults beside the checkpoint.
     moe_bank_dir: str | None = None
+    # --moe-bank-rewarm: seconds of scheduler idle after which a --moe-bank-ram bank's
+    # file-backed rows are checked and, if the page cache has lost them, read back in file
+    # order until a request arrives (moe/bank_rewarm.py). 0 = off.
+    moe_bank_rewarm: float = 0.0
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
