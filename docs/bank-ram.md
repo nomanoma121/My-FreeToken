@@ -412,6 +412,44 @@ So far `ft bank pack`, `verify` and `unpack` have run on the small synthetic NVF
 checkpoints of the test suite only; none of the timings or sizes above for real checkpoints has
 been measured.
 
+### 6. Experimental: ask for the rows each step routes to (`--moe-bank-prefetch`)
+
+```bash
+ft serve ... --moe-strategy hybrid --moe-bank-ram 48G --moe-bank-prefetch
+```
+
+Without it, a non-resident row is read by whichever CPU executor worker first touches it: a
+4 KiB fault, answered by one readahead window around that page, while the other workers fault
+on their own pages. That is why step 3 matters so much -- the window decides both how much one
+fault brings in and how much of it belongs to experts nobody routed to.
+
+With it, the executor looks at the routing before it wakes its workers. For every distinct
+non-resident row the layer is about to read, it checks the page cache (`mincore`) and, for a row
+that is not all there, calls `madvise(MADV_WILLNEED)` on exactly that row. That puts every page
+of the row into the page cache at once and submits the reads without waiting for them; a worker
+that faults afterwards waits for a read already in flight instead of starting its own, and
+nothing outside the row is read. The gate/up rows are asked for before the workers start and
+the down rows right after, since the down pass cannot begin until the gate/up pass is done.
+Rows already in the page cache cost the `mincore` call and nothing else; resident rows and
+routes served on the GPU are skipped.
+
+This is not the `madvise` described under "What this looked like while it was wrong" below: that
+was a hint on the whole mapping at startup, which changes how faults read ahead. This is a request
+for particular rows, made per layer from the routing, and it does not depend on the fault path.
+
+What is known and what is not:
+
+- It has **not been measured end to end** yet -- no decode figure with and without it. The flag
+  is off by default until it has.
+- It needs a CPU executor reading the mapped file (`--moe-strategy cpu` or `hybrid`), Linux, and
+  a `--moe-bank-ram` that actually split. The startup log says how many file-backed blocks it
+  took; otherwise it says why it has nothing to do.
+- `MADV_WILLNEED` is advice. Under memory pressure the kernel may allocate fewer pages than asked,
+  and the rest are faulted in the old way -- never worse than without the flag, but not better
+  either.
+- Whether step 3's readahead setting still matters with it on is also unmeasured. Keep it.
+- On shutdown (Ctrl+C) it logs how many rows it saw and how much it asked for.
+
 ## Measured
 
 Two RTX 3060 12 GB, a Core i5-12600KF, 128 GB of DDR5-4000, a Gen4 NVMe on the CPU-direct M.2,

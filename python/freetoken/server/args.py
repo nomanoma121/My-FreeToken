@@ -831,6 +831,19 @@ def parse_args(
             "took 31 s to its first token instead of 1 s. 0 (default) = off."
         ),
     )
+    parser.add_argument(
+        "--moe-bank-prefetch",
+        action="store_true",
+        dest="moe_bank_prefetch",
+        default=ServerArgs.moe_bank_prefetch,
+        help=(
+            "With --moe-bank-ram and cpu/hybrid decode: before the CPU executor computes a "
+            "layer, ask the kernel for exactly the non-resident expert rows that layer routes "
+            "to (mincore, then MADV_WILLNEED), so the workers wait on reads already in flight "
+            "instead of faulting 4 KiB at a time through readahead windows that also read "
+            "neighbouring experts. Linux only. Experimental, off by default."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cache-policy",

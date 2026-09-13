@@ -185,6 +185,11 @@ class MappedBanks:
         # (file offset, nbytes) of every block's file-backed remainder, in file order: what the
         # page cache may drop and --moe-bank-rewarm reads back (moe/bank_rewarm.py).
         self.cold_spans: list[tuple[int, int]] = []
+        # (bank name, position in this rank's layers -- the layer id the cache and the CPU
+        # executor use --, address of row 0 in this rank's mapping, bytes per row, first
+        # file-backed row) for every block with a file-backed part: what --moe-bank-prefetch
+        # hands the CPU executor so it can advise exactly the rows a step routes to.
+        self.cold_blocks: list[tuple[str, int, int, int, int]] = []
         # FREETOKEN_BANK_PRELOAD: pull the non-resident rows into the page cache too. They
         # are not locked, so the kernel may still drop them -- this only says how much of
         # the decode cost is faulting them back in, by removing that cost on a host with
@@ -237,7 +242,7 @@ class MappedBanks:
         for name, row_shape, dtype_name, row_bytes in self.layout.banks:
             dtype = _dtype_of(dtype_name)
             per_layer = []
-            for layer in self.layers:
+            for pos, layer in enumerate(self.layers):
                 off = self.layout.offset_of(name, layer)
                 rel = off - self._map_offset  # the mapping starts at this rank's first block
                 span = self.layout.num_experts * row_bytes
@@ -254,6 +259,7 @@ class MappedBanks:
                     self.cold_spans.append(
                         (off + lock_rows * row_bytes, span - lock_rows * row_bytes)
                     )
+                    self.cold_blocks.append((name, pos, self._base + rel, row_bytes, lock_rows))
                 self._settle(rel, lock_rows * row_bytes, span, register)
                 self._advise(hint, rel, span, len(self._map))
                 if preload:

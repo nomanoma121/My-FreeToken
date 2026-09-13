@@ -89,6 +89,11 @@ class EngineConfig:
     # file-backed rows are checked and, if the page cache has lost them, read back in file
     # order until a request arrives (moe/bank_rewarm.py). 0 = off.
     moe_bank_rewarm: float = 0.0
+    # --moe-bank-prefetch: the CPU MoE executor advises (mincore + MADV_WILLNEED) the
+    # file-backed rows each task routes to before its workers read them, instead of leaving
+    # them to 4 KiB faults and readahead windows (kernel/csrc/cpu_moe, PrefetchSpan). Off by
+    # default until measured end to end.
+    moe_bank_prefetch: bool = False
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

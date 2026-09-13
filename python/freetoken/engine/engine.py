@@ -1305,6 +1305,8 @@ class Engine:
         assert len(layers) == config.model_config.num_moe_layers + self._mtp_bank_layers
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
+        if getattr(config, "moe_bank_prefetch", False):
+            self._enable_bank_prefetch(bank_tier)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
@@ -2324,7 +2326,40 @@ class Engine:
             f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
         )
 
+    def _enable_bank_prefetch(self, bank_tier) -> None:
+        """``--moe-bank-prefetch``: hand the CPU executor the mapped bank's file-backed blocks.
+
+        It needs both halves: a mapped bank with a file-backed part (``--moe-bank-ram`` that
+        actually split) and a CPU executor reading from it (cpu or hybrid decode). Anything
+        else leaves nothing to advise, which is said once and is not an error.
+        """
+        banks = getattr(bank_tier, "banks", None)
+        executor = self.cpu_moe_executor
+        blocks = getattr(banks, "cold_blocks", None) or []
+        kept = executor.enable_bank_prefetch(blocks) if executor is not None and blocks else 0
+        if kept:
+            logger.info(
+                f"--moe-bank-prefetch: the CPU executor advises each task's cold rows before "
+                f"reading them ({kept} of {len(blocks)} file-backed blocks)"
+            )
+            return
+        why = (
+            "it needs --moe-bank-ram with a file-backed part" if not blocks
+            else "it needs cpu or hybrid decode" if executor is None
+            else "the CPU executor does not read the mapped blocks directly, or this build "
+            "cannot advise them (Linux only)"
+        )
+        logger.warning_rank0(f"--moe-bank-prefetch has nothing to do: {why}")
+
     def shutdown(self) -> None:
+        if self.cpu_moe_executor is not None and getattr(self.config, "moe_bank_prefetch", False):
+            s = self.cpu_moe_executor.bank_prefetch_stats()
+            logger.info(
+                f"--moe-bank-prefetch: {s['tasks']} tasks had cold rows ({s['rows']} rows), "
+                f"{s['ranges_advised']} ranges advised ({s['bytes_advised'] / 2**30:.2f} GiB), "
+                f"{s['ns'] / 1e9:.2f} s in the calls"
+                + (f", last madvise errno {s['errno']}" if s["errno"] else "")
+            )
         self._write_moe_stats()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
