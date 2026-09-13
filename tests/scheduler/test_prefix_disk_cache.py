@@ -391,6 +391,40 @@ def test_an_aborted_wait_does_not_leave_a_load_behind(tmp_path):
     b.disk.close(wait=True)
 
 
+def test_a_read_slower_than_recomputing_is_abandoned(tmp_path):
+    """Seen on a 2060 under memory pressure: an 83 MiB entry took 7.95 s to read for a prompt
+    that prefills in 3 s. Past the deadline the request stops waiting and prefills."""
+    import threading
+
+    ids = torch.arange(1, 65, dtype=torch.int32)
+    a = Rig(tmp_path)
+    a.donate(ids)
+    a.disk.persist_idle()
+    a.disk.close(wait=True)
+
+    b = Rig(tmp_path)
+    b.disk.read_deadline_base_s = 0.05
+    b.disk.read_deadline_tokens_per_s = 1e9
+    release = threading.Event()
+    real_load = b.store.load
+
+    def slow_load(entry, expect_ids=None):
+        release.wait(10)
+        return real_load(entry, expect_ids=expect_ids)
+
+    b.store.load = slow_load
+    req = _pending(torch.cat([ids, ids[:1]]))
+    assert b.disk.admit_gate(req) is False
+    import time as _t
+    _t.sleep(0.1)
+    assert b.disk.admit_gate(req) is True, "past the deadline it goes on without the entry"
+    assert b.disk.stats["load_abandoned"] == 1 and b.pages_of(ids)[0] == 0
+    release.set()
+    b.disk.close(wait=True)
+    assert b.disk.admit_gate(req) is True and b.pages_of(ids)[0] == 0, "a late result is dropped"
+    b.check_conservation()
+
+
 def test_pool_classes_it_does_not_know_are_refused():
     class Other:
         pass
@@ -426,6 +460,33 @@ def test_the_fingerprint_moves_with_what_the_bytes_mean(tmp_path):
     assert fingerprint_digest(build_fingerprint(cfg(), PoolLayout(_kv(8, 1, "q8_0"), _linear(), 1))) != base
     (model / "model.safetensors").write_bytes(b"y" * 11)            # re-downloaded weights
     assert fingerprint_digest(build_fingerprint(cfg(), layout)) != base
+
+
+def test_an_uncommitted_change_moves_the_code_identity(tmp_path):
+    """The first version passed the pathspec "python" from inside python/, which names
+    python/python: the diff was always empty and an edited kernel read the old code's entries."""
+    import shutil
+    import subprocess
+
+    from freetoken.scheduler.prefix_disk import code_identity
+
+    if shutil.which("git") is None:
+        pytest.skip("no git")
+    repo = tmp_path / "repo"
+    src = repo / "python" / "pkg"
+    src.mkdir(parents=True)
+    (src / "kernel.py").write_text("SCALE = 1")
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+    for cmd in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "x"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True, env=env, capture_output=True)
+    clean = code_identity(str(repo / "python"))
+    assert "commit" in clean and "uncommitted" not in clean
+    (src / "kernel.py").write_text("SCALE = 2")
+    dirty = code_identity(str(repo / "python"))
+    assert dirty["commit"] == clean["commit"] and dirty.get("uncommitted")
+    (src / "kernel.py").write_text("SCALE = 3")
+    assert code_identity(str(repo / "python"))["uncommitted"] != dirty["uncommitted"]
 
 
 def _parse(argv):

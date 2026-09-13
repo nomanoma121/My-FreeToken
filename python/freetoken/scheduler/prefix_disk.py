@@ -53,6 +53,13 @@ MIN_TOKENS = 1024
 # A disk entry is read only when it reaches at least this much deeper than the tree's own hit
 # (and at least 1/8 of its length): reading and uploading is not free either.
 MIN_GAIN_TOKENS = 512
+# A read is abandoned (the request prefills normally) once it has taken longer than recomputing
+# the gain could plausibly take: READ_DEADLINE_BASE_S plus the gain at this many tokens per second
+# -- faster than any prefill these machines do, so the wait never exceeds the recompute. Seen on
+# an RTX 2060 host under memory pressure: an 83 MiB entry that took 7.95 s to read, for a prompt
+# that prefills in 3 s.
+READ_DEADLINE_BASE_S = 1.0
+READ_DEADLINE_TOKENS_PER_S = 2000
 # Host memory one idle pass may queue for the writer before it stops and leaves the rest for
 # the next idle.
 IDLE_PASS_BYTES = 512 << 20
@@ -234,6 +241,8 @@ class PrefixDiskCache:
         min_tokens: int = MIN_TOKENS,
         min_gain: int = MIN_GAIN_TOKENS,
         idle_pass_bytes: int = IDLE_PASS_BYTES,
+        read_deadline_base_s: float = READ_DEADLINE_BASE_S,
+        read_deadline_tokens_per_s: float = READ_DEADLINE_TOKENS_PER_S,
         log: Callable[[str], None] | None = None,
     ) -> None:
         if not cache_manager.is_hybrid:
@@ -244,6 +253,8 @@ class PrefixDiskCache:
         self.min_tokens = max(int(min_tokens), cache_manager.page_size)
         self.min_gain = int(min_gain)
         self.idle_pass_bytes = int(idle_pass_bytes)
+        self.read_deadline_base_s = float(read_deadline_base_s)
+        self.read_deadline_tokens_per_s = float(read_deadline_tokens_per_s)
         self._log = log or logger.info
         self._writer = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefix-disk-write")
         self._reader = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefix-disk-read")
@@ -251,7 +262,7 @@ class PrefixDiskCache:
         self._queued_bytes = 0
         self._loads: set = set()
         self.stats = {"written": 0, "write_bytes": 0, "write_failed": 0, "restored": 0,
-                      "restored_tokens": 0, "restore_skipped": 0, "load_missed": 0}
+                      "restored_tokens": 0, "restore_skipped": 0, "load_missed": 0, "load_abandoned": 0}
 
     # ------------------------------------------------------------------ write side
     def persist_idle(self) -> int:
@@ -369,6 +380,9 @@ class PrefixDiskCache:
             if gain < max(self.min_gain, entry.length // 8):
                 return True
             req.disk_entry = entry
+            req.disk_started = time.monotonic()
+            req.disk_deadline = (req.disk_started + self.read_deadline_base_s
+                                 + gain / self.read_deadline_tokens_per_s)
             fut = self._reader.submit(self._load, entry, ids[: entry.length].clone())
             with self._lock:
                 self._loads.add(fut)
@@ -377,7 +391,22 @@ class PrefixDiskCache:
             req.disk_state = fut
             state = fut
         if isinstance(state, cf.Future):
-            if not state.done() or not can_restore:
+            if not state.done():
+                if time.monotonic() < req.disk_deadline:
+                    return False
+                # the disk is slower than recomputing would be: stop waiting (the read finishes
+                # in the background and its result is dropped)
+                req.disk_state = "done"
+                self.stats["load_abandoned"] += 1
+                logger.warning(
+                    f"prefix disk cache: request {req.uid} stopped waiting for its "
+                    f"{req.disk_entry.length}-token entry after "
+                    f"{time.monotonic() - req.disk_started:.1f} s (the read is slower than "
+                    f"prefilling it would be); it prefills instead"
+                )
+                req.disk_entry = None
+                return True
+            if not can_restore:
                 return False
             req.disk_state = "done"
             loaded = state.result()
@@ -477,20 +506,24 @@ def model_identity(model_path: str) -> dict:
     return out
 
 
-def code_identity() -> dict:
+def code_identity(src_dir: str | None = None) -> dict:
     """The freetoken version, and when running from a git checkout, its commit plus a digest of
-    any uncommitted change under python/ -- a kernel fix that moves the numbers must not read
-    entries the old code wrote."""
+    any uncommitted change to tracked files under the source directory (``python/``) -- a kernel
+    fix that moves the numbers must not read entries the old code wrote. (Untracked new files are
+    not seen; a change that matters lands in a tracked file.)"""
     from freetoken.version import __version__
 
     out: dict = {"version": __version__}
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # python/freetoken/scheduler/prefix_disk.py -> python/. The diff is taken over "." from
+    # there: a pathspec of "python" would name python/python and always come back empty (the
+    # first version of this did exactly that, so uncommitted changes never moved the digest).
+    src = src_dir or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
-        head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True,
+        head = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"], capture_output=True,
                               text=True, timeout=10)
         if head.returncode == 0:
             out["commit"] = head.stdout.strip()
-            diff = subprocess.run(["git", "-C", root, "diff", "HEAD", "--", "python"],
+            diff = subprocess.run(["git", "-C", src, "diff", "HEAD", "--", "."],
                                   capture_output=True, timeout=30)
             if diff.returncode == 0 and diff.stdout:
                 out["uncommitted"] = hashlib.sha256(diff.stdout).hexdigest()
