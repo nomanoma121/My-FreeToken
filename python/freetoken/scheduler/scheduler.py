@@ -168,12 +168,30 @@ class Scheduler(SchedulerIOMixin):
                 "part (every row is resident, or the bank is not mapped)"
             )
 
+        # --prefix-disk-cache: hybrid prefix-cache entries written while idle, read back at
+        # admission (scheduler/prefix_disk.py). Refuses unsupported configurations here, at boot.
+        self.prefix_disk = None
+        if getattr(config, "prefix_disk_cache", None):
+            from .prefix_disk import build_prefix_disk_cache
+
+            self.prefix_disk = build_prefix_disk_cache(config, self.engine, self.cache_manager)
+            self.prefill_manager.prefix_disk = self.prefix_disk
+
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        if getattr(self, "prefix_disk", None) is not None:
+            self.prefix_disk.persist_idle()
         if getattr(self, "bank_rewarm", None) is not None:
             self.bank_rewarm.idle()
+
+    def _wait_for_prefix_disk(self) -> None:
+        """Nothing was scheduled: if that is because the head of the prefill queue is waiting for
+        a prefix to load from disk, wait on the load briefly instead of spinning the loop."""
+        disk = getattr(self, "prefix_disk", None)
+        if disk is not None and disk.loading:
+            disk.wait_for_load(0.01)
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -268,6 +286,8 @@ class Scheduler(SchedulerIOMixin):
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
                 ongoing_data = (forward_input, self._forward(forward_input))
+        elif last_data is None:
+            self._wait_for_prefix_disk()
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -302,6 +322,8 @@ class Scheduler(SchedulerIOMixin):
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
             ongoing_data = (forward_input, self._forward(forward_input))
+        else:
+            self._wait_for_prefix_disk()
 
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
@@ -326,6 +348,9 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        if getattr(self, "prefix_disk", None) is not None:
+            # writes still queued are dropped; a file half-written stays a .tmp the next start removes
+            self.prefix_disk.close(wait=False)
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()

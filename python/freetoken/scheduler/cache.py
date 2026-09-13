@@ -582,6 +582,74 @@ class CacheManager:
             row[start:end].copy_(canonical[start:end])
             self._free(ours)
 
+    def insert_restored_prefix(
+        self, input_ids: torch.Tensor, write, *, reserve_tokens: int = 0
+    ) -> Tuple[int, int]:
+        """Put a prefix read back from disk (``--prefix-disk-cache``) into the hybrid tree, as if
+        a request had just donated it. Returns ``(restored_len, uploaded_tokens)``; (0, 0) when
+        it did not happen (nothing was changed then).
+
+        ``reserve_tokens``: KV the caller has promised elsewhere (the running requests' decode) and
+        this must not take.
+
+        ``input_ids`` is the whole prefix ``[0, L)``, ``L`` a snapshot boundary (page-aligned).
+        The tree may already hold KV for some ``[0, p)`` of it: that part is kept (locked while
+        this runs) and only ``[p, L)`` gets pages. ``write(pages, first_page, slot)`` uploads the
+        entry's pages ``[first_page, ...)`` into the page ids ``pages`` and its GDN snapshot into
+        ``slot``; it runs on the current (scheduler) stream, which the next forward waits for.
+
+        Ownership follows the donate path exactly: pages come from ``_allocate`` (evicting as
+        any allocation does), the slot from the pool, and ``insert`` hands both to the tree --
+        so the new node is an ordinary evictable, unlocked node, and the admission that follows
+        matches, locks and COW-restores it like any other hit. The kept ``[0, p)`` KV was
+        computed separately from the entry's ``[p, L)``; that is the same mix a deduped chunk
+        commit makes, and only bit-level noise can tell them apart."""
+        assert self.is_hybrid, "insert_restored_prefix is the hybrid tree's"
+        pc, pool, ps = self.prefix_cache, self.linear_state_pool, self.page_size
+        L = len(input_ids)
+        if L == 0 or align_down(L, ps) != L:
+            return 0, 0
+        node, p = pc.walk_prefix(input_ids)
+        if p == L and node.mamba_value is not None:
+            return 0, 0                               # the tree already resumes here
+        pc.inc_lock(node)                              # keep [0, p) while we evict for the rest
+        pages = tokens = None
+        slot = None
+        done = False
+        try:
+            need_pages = (L - p) // ps
+            # leave the running requests' reservation alone, exactly as admission does
+            if need_pages * ps + reserve_tokens > len(self.free_slots) * ps + pc.full_evictable_size:
+                return 0, 0
+            if need_pages:
+                pages = self._allocate(need_pages)
+                tokens = self._page_to_token(pages)
+            self.ensure_mamba_slots(1)
+            if pool.num_free_slots < 1:
+                return 0, 0
+            slot = pool.alloc(1)[0]
+            page_ids = pages // ps if pages is not None else torch.empty(0, dtype=torch.long)
+            write(page_ids, p // ps, slot)
+            kv = pc._collect_kv(node)
+            if tokens is not None:
+                kv = torch.cat([kv, tokens.to(kv.dtype)])
+            prefix_len, mamba_exist = pc.insert(input_ids, kv, slot)
+            done = True                                # the tree owns whatever insert took
+            # [0, p) is locked and nothing ran between the walk and the insert, so the insert
+            # hangs its node exactly at p (or fills the tombstone at L when p == L)
+            assert prefix_len == p, f"restored prefix attached at {prefix_len}, walked to {p}"
+            if mamba_exist:
+                pool.free([slot])
+                return 0, 0
+            return L, L - p
+        finally:
+            pc.dec_lock(node)
+            if not done:
+                if tokens is not None:
+                    self._free(tokens)
+                if slot is not None:
+                    pool.free([slot])
+
     def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
         """SWA cache_req: commit the request's full KV prefix into the SWARadixCache (node.value =
         the canonical full-pool page indices; the swa KV rides along via the full->swa mapping).

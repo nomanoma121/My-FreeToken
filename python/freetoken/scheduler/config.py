@@ -18,6 +18,11 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     decode_log_interval: int = 40
     special_token_ckpt: bool = False
+    # --prefix-disk-cache DIR: keep hybrid prefix-cache entries (KV pages + GDN snapshot) on
+    # disk, written while idle and read back at admission when they reach deeper than the tree
+    # (scheduler/prefix_disk.py). None = off. --prefix-disk-cache-size caps the directory.
+    prefix_disk_cache: str | None = None
+    prefix_disk_cache_size: str = "32G"
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

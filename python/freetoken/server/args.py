@@ -659,6 +659,30 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--prefix-disk-cache",
+        default=ServerArgs.prefix_disk_cache,
+        metavar="DIR",
+        help=(
+            "Hybrid GDN models (Qwen3.5-MoE, Qwen3.8-Flash-Next), one GPU: keep prefix-cache "
+            "entries -- a prompt's KV pages and the GDN state snapshot at its end -- in this "
+            "directory, written while the server is idle, and read them back instead of "
+            "prefilling again when a prompt starts with one the in-memory cache no longer "
+            "holds, including after a restart. Only prefixes of 1024+ tokens are written. "
+            "Entries are keyed by the exact tokens and by the model, weights and cache layout; "
+            "anything else is never read. Refused with --pp-size / --tp-size > 1. "
+            "See docs/prefix-reuse.md."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-disk-cache-size",
+        default=ServerArgs.prefix_disk_cache_size,
+        metavar="SIZE",
+        help=(
+            "Cap for --prefix-disk-cache's directory (e.g. 32G, the default). The least "
+            "recently used entries are removed to stay under it."
+        ),
+    )
+    parser.add_argument(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
@@ -904,6 +928,22 @@ def parse_args(
             kwargs["pp_split"] = split
     elif pp_layers:
         parser.error("--pp-layers needs --pp-size > 1")
+
+    if kwargs["prefix_disk_cache"]:
+        if kwargs["tensor_parallel_size"] > 1:
+            parser.error(
+                "--prefix-disk-cache runs on one GPU only for now: it is refused with "
+                f"{'--pp-size' if pp_size > 1 else '--tp-size'} > 1 (every rank would have to "
+                "restore the same prefix at the same step)"
+            )
+        from freetoken.moe.bank_disk import parse_size
+
+        try:
+            size = parse_size(kwargs["prefix_disk_cache_size"])
+        except ValueError as exc:
+            parser.error(f"--prefix-disk-cache-size: {exc}")
+        if not size or size <= 0:
+            parser.error("--prefix-disk-cache-size must be a positive size, e.g. 32G")
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

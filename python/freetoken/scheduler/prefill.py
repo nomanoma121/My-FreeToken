@@ -389,6 +389,12 @@ def describe_refusal(
         )
     elif kind == "budget":
         reason = f"the prefill token budget for this turn was {refusal[1]}"
+    elif kind == "disk":
+        reason = (
+            f"its first {refusal[1]} tokens are being read back from --prefix-disk-cache and "
+            "the read has not finished"
+        )
+        outlook = " A slow or busy disk delays it; it is admitted as soon as the read ends."
     else:
         reason = "no reason was recorded"
     if outlook is None and kind != "budget":
@@ -413,6 +419,8 @@ class PrefillManager:
     stall: AdmissionStall = field(
         default_factory=lambda: AdmissionStall(ENV.ADMISSION_WARN_SECONDS.value)
     )
+    # --prefix-disk-cache (scheduler/prefix_disk.PrefixDiskCache), set by the scheduler
+    prefix_disk: object | None = None
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
@@ -447,6 +455,18 @@ class PrefillManager:
             # A prompt with images runs alone: its rope table is indexed by logical position
             # from 0 (it is never prefix-cached) and cannot share a forward with other rows.
             if pending_req.mm_embeds is not None and reqs:
+                break
+            if (
+                self.prefix_disk is not None
+                and not is_continuation
+                and adder.token_budget > 0
+                and not self.prefix_disk.admit_gate(
+                    pending_req, can_restore=not reqs, reserve_tokens=adder.reserved_size
+                )
+            ):
+                # its prompt is on disk deeper than the tree has it and is being read back;
+                # hold it (and the queue behind it, as any refusal does) until it is restored
+                adder.refusal = ("disk", pending_req.disk_entry.length)
                 break
             if req := adder.try_add_one(pending_req):
                 predecessor = pending_req.chunked_req

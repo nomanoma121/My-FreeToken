@@ -87,6 +87,12 @@ class HybridRadixCache:
             cur = cur.parent
         return HybridMatch(self.empty, 0, None, self.root)
 
+    def walk_prefix(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+        """The raw KV match (page-aligned, NOT truncated to a snapshot), splitting a node so the
+        returned node ends exactly at the returned length -- where an insert of ``input_ids``
+        would hang its new node."""
+        return self._walk(input_ids)
+
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
                mamba_value: int) -> Tuple[int, bool]:
         """Insert the committed KV prefix and DONATE ``mamba_value`` at the (page-aligned) end
