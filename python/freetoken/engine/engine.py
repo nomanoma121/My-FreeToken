@@ -1011,26 +1011,53 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import (
+            describe_plan,
+            expert_bytes_per_slot,
+            net_cache_budget_bytes,
+            resolve_moe_cache_auto,
+        )
 
-        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        cache_per_page, kv_fixed, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+        state_pool = state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size = kv_fixed + state_pool
+        # Named, so a budget that does not fit says which of them it was spent on (the GDN pool
+        # is sized by --max-running-req, not by anything the KV flags touch).
+        fixed_parts = {"KV fixed": kv_fixed, "GDN state pool": state_pool}
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
+        per_expert = expert_bytes_per_slot(banks.sources)
+        size, pages, overlap = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
+            fixed_parts=fixed_parts,
+            min_reserve_tokens=min_reserve,
         )
+        logger.info_rank0(
+            describe_plan(
+                moe_cache_size=size,
+                num_pages=pages,
+                per_expert_bytes=per_expert,
+                cache_per_page=cache_per_page,
+                budget_bytes=net_cache_budget_bytes(
+                    config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
+                ),
+                weights_bytes=self._weights_bytes,
+                fixed_parts=fixed_parts,
+                page_size=page_tokens,
+            )
+        )
+        return size, pages, overlap
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)

@@ -45,6 +45,205 @@ def required_bytes(
     return moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 
 
+class CacheBudgetTooSmall(AssertionError):
+    """The smallest workable (experts, KV) plan does not fit the budget.
+
+    Still an ``AssertionError`` -- what callers and tests have always caught -- but it carries
+    the numbers, so the caller that knows where the budget came from (free VRAM, memory_ratio,
+    weights, fixed pools) can say which flag closes the gap and to what value. The bare
+    message used to name three levers with no numbers, which on a 6 GB card meant restarting
+    the model a few times to find out which one mattered.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        budget_bytes: int,
+        need_bytes: int,
+        moe_slots: int,
+        per_expert_bytes: int,
+        kv_pages: int,
+        cache_per_page: int,
+        overlap_floor: bool,
+        num_experts: int,
+    ):
+        super().__init__(message)
+        self.budget_bytes = budget_bytes
+        self.need_bytes = need_bytes
+        self.moe_slots = moe_slots
+        self.per_expert_bytes = per_expert_bytes
+        self.kv_pages = kv_pages
+        self.cache_per_page = cache_per_page
+        self.overlap_floor = overlap_floor
+        self.num_experts = num_experts
+
+    def numbers(self) -> dict:
+        return {
+            "budget_bytes": self.budget_bytes,
+            "need_bytes": self.need_bytes,
+            "moe_slots": self.moe_slots,
+            "per_expert_bytes": self.per_expert_bytes,
+            "kv_pages": self.kv_pages,
+            "cache_per_page": self.cache_per_page,
+            "overlap_floor": self.overlap_floor,
+            "num_experts": self.num_experts,
+        }
+
+
+# memory_ratio above this leaves no room for CUDA graphs and activations; suggesting it would
+# trade a clean startup error for an OOM later.
+_MAX_SUGGESTED_RATIO = 0.98
+
+
+def shortfall_fixes(
+    exc: CacheBudgetTooSmall,
+    *,
+    baseline_free: int,
+    memory_ratio: float,
+    weights_bytes: int,
+    fixed_cache_size: int,
+    page_size: int,
+    min_reserve_tokens: int = 0,
+) -> dict:
+    """Each single flag change that would make the smallest plan fit, or None where that flag
+    cannot. Pure arithmetic; every value returned is one ``resolve_moe_cache_auto`` accepts.
+
+    - ``kv_reserve_tokens``: the most KV the budget leaves after the expert floor. With that
+      reserve the greedy fill can only take experts out of what is left, so the plan fits.
+    - ``memory_ratio``: the smallest ratio (to 0.01) whose budget covers the smallest plan,
+      unless that is above ``_MAX_SUGGESTED_RATIO``.
+    - ``disable_overlap``: whether dropping the prefill-overlap floor (2 x num_experts slots
+      down to num_experts) alone makes it fit.
+    """
+    expert_floor = exc.moe_slots * exc.per_expert_bytes
+    kv_now = exc.kv_pages * exc.cache_per_page
+
+    kv_tokens = None
+    left_for_kv = exc.budget_bytes - expert_floor
+    if left_for_kv > 0:
+        pages = left_for_kv // exc.cache_per_page
+        tokens = pages * page_size
+        if pages > 1 and tokens >= min_reserve_tokens:
+            kv_tokens = int(tokens)
+
+    ratio = None
+    if baseline_free > 0:
+        need = exc.need_bytes + weights_bytes + fixed_cache_size
+        r = max(memory_ratio, int(need * 100 / baseline_free) / 100)
+        while int(r * baseline_free) - weights_bytes - fixed_cache_size < exc.need_bytes:
+            r = round(r + 0.01, 2)
+            if r > _MAX_SUGGESTED_RATIO:
+                break
+        if r <= _MAX_SUGGESTED_RATIO:
+            ratio = r
+
+    disable_overlap = False
+    if exc.overlap_floor:
+        lower = exc.num_experts * exc.per_expert_bytes + kv_now
+        disable_overlap = lower <= exc.budget_bytes
+
+    return {"kv_reserve_tokens": kv_tokens, "memory_ratio": ratio, "disable_overlap": disable_overlap}
+
+
+def _mib(b: int) -> str:
+    return f"{b / (1 << 20):.1f} MiB"
+
+
+def _gib(b: int) -> str:
+    return f"{b / (1 << 30):.2f} GiB"
+
+
+def explain_shortfall(
+    exc: CacheBudgetTooSmall,
+    *,
+    baseline_free: int,
+    memory_ratio: float,
+    weights_bytes: int,
+    fixed_parts: dict[str, int],
+    page_size: int,
+    min_reserve_tokens: int = 0,
+) -> str:
+    """The startup error for a budget that cannot hold the smallest plan: where the budget went,
+    what the smallest plan is made of, and the exact value of each flag that would close it."""
+    fixed_total = sum(fixed_parts.values())
+    fixes = shortfall_fixes(
+        exc,
+        baseline_free=baseline_free,
+        memory_ratio=memory_ratio,
+        weights_bytes=weights_bytes,
+        fixed_cache_size=fixed_total,
+        page_size=page_size,
+        min_reserve_tokens=min_reserve_tokens,
+    )
+    parts = "  ".join(f"- {name} {_gib(b)}" for name, b in fixed_parts.items() if b) or "- fixed 0"
+    expert_floor = exc.moe_slots * exc.per_expert_bytes
+    kv_now = exc.kv_pages * exc.cache_per_page
+    short = exc.need_bytes - exc.budget_bytes
+    lines = [
+        f"cache budget too small: the smallest plan needs {_mib(exc.need_bytes)}, the budget is "
+        f"{_mib(exc.budget_bytes)} ({_mib(short)} short).",
+        f"  budget   = memory_ratio {memory_ratio:g} x {_gib(baseline_free)} free before the model"
+        f"  - weights {_gib(weights_bytes)}  {parts}",
+        f"  smallest = {exc.moe_slots} expert slots x {_mib(exc.per_expert_bytes)} = {_mib(expert_floor)}"
+        f"  + KV reserve {exc.kv_pages * page_size} tokens = {_mib(kv_now)}",
+    ]
+    options = []
+    if fixes["kv_reserve_tokens"] is not None:
+        options.append(
+            f"    --kv-reserve-tokens {fixes['kv_reserve_tokens']}"
+            f"   (what the budget leaves for KV after the expert floor)"
+        )
+    if fixes["memory_ratio"] is not None:
+        options.append(f"    --memory-ratio {fixes['memory_ratio']:.2f}")
+    if fixes["disable_overlap"]:
+        options.append(
+            f"    --disable-moe-prefill-overlap   (expert floor {2 * exc.num_experts} -> "
+            f"{exc.num_experts} slots, frees {_mib(exc.num_experts * exc.per_expert_bytes)})"
+        )
+    if options:
+        lines.append("  any one of these fits:")
+        lines.extend(options)
+    else:
+        lines.append(
+            "  no single flag closes it: free GPU memory held by other processes, or load fewer "
+            "weights onto this GPU"
+        )
+    if fixes["kv_reserve_tokens"] is None:
+        why = (
+            f"the expert floor alone is {_mib(expert_floor)} of a {_mib(exc.budget_bytes)} budget"
+            if exc.budget_bytes - expert_floor <= exc.cache_per_page
+            else f"the model needs at least {min_reserve_tokens} KV tokens"
+        )
+        lines.append(f"  (--kv-reserve-tokens cannot: {why})")
+    if fixes["memory_ratio"] is None:
+        lines.append(f"  (--memory-ratio cannot: it would have to exceed {_MAX_SUGGESTED_RATIO})")
+    return "\n".join(lines)
+
+
+def describe_plan(
+    *,
+    moe_cache_size: int,
+    num_pages: int,
+    per_expert_bytes: int,
+    cache_per_page: int,
+    budget_bytes: int,
+    weights_bytes: int,
+    fixed_parts: dict[str, int],
+    page_size: int,
+) -> str:
+    """One line for a plan that fit: what the budget was spent on, so a later OOM or a slow
+    decode can be read against it without re-deriving the arithmetic."""
+    experts = moe_cache_size * per_expert_bytes
+    kv = num_pages * cache_per_page
+    fixed = ", ".join(f"{name} {_gib(b)}" for name, b in fixed_parts.items() if b) or "none"
+    return (
+        f"cache plan: weights {_gib(weights_bytes)}; fixed {fixed}; "
+        f"experts {moe_cache_size} slots {_gib(experts)}; KV {num_pages * page_size} tokens "
+        f"{_gib(kv)}; unspent {_mib(budget_bytes - experts - kv)} of the {_gib(budget_bytes)} budget"
+    )
+
+
 def plan_cache_budget(
     budget_bytes: int,
     per_expert_bytes: int,
@@ -86,11 +285,20 @@ def plan_cache_budget(
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
     total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
-    assert total <= budget_bytes, (
-        f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
-        f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "
-        "(raise memory_ratio, lower kv_reserve_tokens, or free GPU memory)"
-    )
+    if total > budget_bytes:
+        raise CacheBudgetTooSmall(
+            f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
+            f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "
+            "(raise memory_ratio, lower kv_reserve_tokens, or free GPU memory)",
+            budget_bytes=budget_bytes,
+            need_bytes=total,
+            moe_slots=moe_cache_size,
+            per_expert_bytes=per_expert_bytes,
+            kv_pages=num_pages,
+            cache_per_page=cache_per_page,
+            overlap_floor=overlap,
+            num_experts=num_experts,
+        )
     assert num_pages > 1, "not enough memory for KV cache after MoE allocation"
     return moe_cache_size, num_pages, overlap
 
@@ -109,8 +317,13 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    fixed_parts: dict[str, int] | None = None,
+    min_reserve_tokens: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
+
+    ``fixed_parts`` names what ``fixed_cache_size`` is made of and ``min_reserve_tokens`` is
+    the model's own KV floor; both are only read to explain a budget that is too small.
 
     ``max_slots`` is the expert kernel's addressable slot limit; the plan never exceeds it.
 
@@ -121,13 +334,25 @@ def resolve_moe_cache_auto(
     budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
-    return plan_cache_budget(
-        budget_bytes=budget_bytes,
-        per_expert_bytes=per_expert_bytes,
-        cache_per_page=cache_per_page,
-        num_experts=num_experts,
-        total_experts=total_experts,
-        prefill_overlap=prefill_overlap,
-        kv_reserve_pages=kv_reserve_pages,
-        max_slots=max_slots,
-    )
+    try:
+        return plan_cache_budget(
+            budget_bytes=budget_bytes,
+            per_expert_bytes=per_expert_bytes,
+            cache_per_page=cache_per_page,
+            num_experts=num_experts,
+            total_experts=total_experts,
+            prefill_overlap=prefill_overlap,
+            kv_reserve_pages=kv_reserve_pages,
+            max_slots=max_slots,
+        )
+    except CacheBudgetTooSmall as exc:
+        message = explain_shortfall(
+            exc,
+            baseline_free=baseline_free,
+            memory_ratio=memory_ratio,
+            weights_bytes=weights_bytes,
+            fixed_parts=fixed_parts or {"fixed cache": fixed_cache_size},
+            page_size=page_size,
+            min_reserve_tokens=min_reserve_tokens,
+        )
+        raise CacheBudgetTooSmall(message, **exc.numbers()) from None
