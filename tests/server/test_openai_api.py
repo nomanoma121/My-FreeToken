@@ -835,3 +835,33 @@ def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob(
     message = response["choices"][0]["message"]
     assert message["reasoning_content"] == "private thought"
     assert message["content"] == "visible answer"
+
+
+# --- logprobs: refused, not silently dropped ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs, param",
+    [({"logprobs": True}, "logprobs"), ({"logprobs": True, "top_logprobs": 5}, "logprobs"),
+     ({"top_logprobs": 3}, "top_logprobs")],
+)
+def test_chat_completion_refuses_logprobs_instead_of_dropping_them(kwargs, param):
+    """The engine keeps no token probabilities. Accepting the field and answering 200 without it
+    tells an eval harness the answer had no alternatives; a 400 tells it the truth."""
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    response = run(handle_chat_completion(chat_request(tools=None, **kwargs), request=None, state=state, model_sampling={}))
+
+    assert response.status_code == 400
+    body = json.loads(response.body)
+    assert body["error"]["param"] == param
+    assert "not supported" in body["error"]["message"]
+    assert state.sent is None  # refused before anything reached the engine
+
+
+@pytest.mark.parametrize("kwargs", [{"logprobs": False}, {"top_logprobs": 0}, {"logprobs": False, "top_logprobs": 0}])
+def test_chat_completion_accepts_logprobs_turned_off(kwargs):
+    """Some clients send logprobs=false / top_logprobs=0 on every request; that asks for nothing."""
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    response = run(handle_chat_completion(chat_request(tools=None, **kwargs), request=None, state=state, model_sampling={}))
+
+    assert response["choices"][0]["message"]["content"] == "hi"

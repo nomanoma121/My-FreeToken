@@ -162,6 +162,13 @@ async def handle_chat_completion(
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
+    # Refused rather than ignored: an eval harness that asks for logprobs and gets a 200 without
+    # them reads the missing field as "no alternatives", not as "not implemented". false / 0 are
+    # what some clients send by default, and ask for nothing.
+    if req.logprobs:
+        return create_error_response("logprobs is not supported", param="logprobs")
+    if req.top_logprobs:
+        return create_error_response("top_logprobs is not supported", param="top_logprobs")
     if _response_format_unsupported(req.response_format):
         return create_error_response(
             "response_format json_object/json_schema is not supported (no constrained decoding)",
