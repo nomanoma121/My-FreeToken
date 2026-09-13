@@ -168,7 +168,16 @@ class MappedBanks:
         # Only this rank's layers, which the file keeps contiguous. A private mapping is charged
         # against the commit limit for its whole length whether or not a page is ever copied, and
         # the whole file is twice one rank's share on a two-rank split.
-        self._map_offset, map_end = self.layout.range_of(self.layers)
+        first_block, map_end = self.layout.range_of(self.layers)
+        # One page more in front, which this process never registers. Every bank view shares the
+        # mapping's storage, and Tensor.is_pinned() asks about the STORAGE's first byte, not the
+        # view's: a mapping that began at the first block would begin inside a registered
+        # resident prefix, every view would read as pinned, and the whole-layer prefill copy
+        # (OffloadMoeCache._staged_h2d) would hand the driver an async copy over the
+        # unregistered rows -- "CUDA error: invalid argument" on the first prefill (measured on
+        # the 2060). The per-rank files of the earlier layout mapped from the header and never
+        # met this. The page before any block is a manifest slot or another layer's block.
+        self._map_offset = max(0, first_block - ALIGN)
         self._map = mmap.mmap(
             self._fd, map_end - self._map_offset, offset=self._map_offset,
             access=mmap.ACCESS_COPY if self.private else mmap.ACCESS_READ,

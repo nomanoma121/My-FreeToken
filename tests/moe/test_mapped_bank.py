@@ -197,10 +197,55 @@ def test_a_rank_maps_only_its_own_layers(tmp_path):
         # the mapping itself is only those layers' blocks: a private mapping is charged for its
         # whole length, and the whole file is twice a rank's share
         start, end = banks.layout.range_of([2, 3])
-        assert len(banks._map) == end - start < banks.layout.total_bytes() - banks.layout.data_offset
+        assert len(banks._map) == end - start + ALIGN < banks.layout.total_bytes() - banks.layout.data_offset
         assert len(banks.sources["packed"]) == 2
         assert torch.equal(banks.sources["packed"][0][0], src["packed"][2][p.order[2][0]])
         assert torch.equal(banks.sources["scale"][1][5], src["scale"][3][p.order[3][5]])
+    finally:
+        banks.close()
+
+
+def test_the_mapping_does_not_begin_inside_a_block(tmp_path):
+    """Every view shares the mapping's storage, and Tensor.is_pinned() asks about the storage's
+    first byte. A mapping that began at a registered resident prefix made every view read as
+    pinned, and the whole-layer prefill copy sent the unregistered rows to an async copy: CUDA
+    "invalid argument" on the first prefill of the 2060."""
+    _, _, lay, path = _built(tmp_path, num_layers=4)
+    for layers in ([0, 1, 2, 3], [2, 3]):
+        banks = MappedBanks(path, register=False, layers=layers, hot_per_layer=2)
+        try:
+            # the storage begins one page before the rank's first block, on a page it never registers
+            assert banks._map_offset + ALIGN == lay.range_of(layers)[0]
+            assert banks._buf.data_ptr() + ALIGN == banks.sources["packed"][0].data_ptr()
+        finally:
+            banks.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_view_of_a_prefix_registered_block_is_not_pinned(tmp_path, monkeypatch):
+    """The real thing: register the resident prefix and ask torch what the staged copy asks."""
+    monkeypatch.setenv("FREETOKEN_BANK_MAP", "shared")
+    src = {"packed": [torch.full((64, 131072), layer + 1, dtype=torch.uint8) for layer in range(2)]}
+    lay = layout_from_sample({"packed": src["packed"][0]}, [0, 1], 64)
+    path = str(tmp_path / "b.ftmb")
+    with BankFile.create(path, lay) as w:
+        for layer in (0, 1):
+            w.write_layer(layer, {"packed": src["packed"][layer]}, list(range(64)))
+    banks = MappedBanks(path, layers=[0, 1], hot_per_layer=16)
+    try:
+        if not banks.fully_registered:
+            pytest.skip("this device registers nothing")
+        assert not banks.sources["packed"][0].is_pinned()
+        from freetoken.moe.offload_cache import OffloadMoeCache
+
+        class _Stage:  # just what the staged copy uses
+            _staging = OffloadMoeCache._staging
+
+        dst = torch.empty((64, 131072), dtype=torch.uint8, device="cuda")
+        # what copy_missing does with a whole layer of a prefix-registered bank
+        OffloadMoeCache._staged_h2d(_Stage(), dst, banks.sources["packed"][0])
+        torch.cuda.synchronize()
+        assert torch.equal(dst.cpu(), src["packed"][0])
     finally:
         banks.close()
 
