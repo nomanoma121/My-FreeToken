@@ -206,7 +206,7 @@ CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upst
 | [docs/pipeline.md](docs/pipeline.md) | Two GPUs, one model (`--pp-size`) |
 | [docs/bank-ram.md](docs/bank-ram.md) | Half the host RAM (`--moe-bank-ram`), and the `read_ahead_kb` that is worth 2.5x |
 | [docs/prefill-chunk.md](docs/prefill-chunk.md) | The prefill chunk: sized to free VRAM (`--prefill-chunk-budget`), and made wider (`--prefill-mixer-pieces`) |
-| [docs/prefix-reuse.md](docs/prefix-reuse.md) | Why switching conversations re-prefills everything on hybrid GDN models (`--linear-state-cache-ratio`) |
+| [docs/prefix-reuse.md](docs/prefix-reuse.md) | Why switching conversations re-prefills everything on hybrid GDN models (`--linear-state-cache-ratio`), and keeping prefixes on disk (`--prefix-disk-cache`, experimental) |
 | [docs/turing.md](docs/turing.md) | Turing (sm_75): six symptoms, six causes, six fixes |
 | [docs/image-input.md](docs/image-input.md) | Image input over the OpenAI API |
 | [docs/gguf.md](docs/gguf.md) | Why 3-bit and 2-bit GGUF experts are not the shortcut they look like — a road not taken, with the numbers |

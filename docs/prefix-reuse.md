@@ -71,3 +71,45 @@ share of what the expert cache has to work with, so the trade is cheaper.
 The decode log prints the pool as `#mamba-slot: used/total`, and each prefill prints
 `#cached-token`. If a prompt you sent earlier comes back with `#cached-token: 0` while
 `token usage` is low, the snapshot pool is the limit, not KV.
+
+## Keeping prefixes on disk (`--prefix-disk-cache`)
+
+> **Experimental. The logic is covered by CPU tests; it has not yet been run on a GPU**, so
+> there are no speed numbers here yet and the flag may still change.
+
+Raising the ratio buys conversations with VRAM. The other way is to keep what the cache lets go
+of on disk:
+
+```bash
+ft serve ... --prefix-disk-cache ~/.cache/freetoken-prefix --prefix-disk-cache-size 32G
+```
+
+- **What is written.** Every boundary the in-memory cache can resume from when the server goes
+  idle -- a snapshot of the GDN state plus the KV pages in front of it -- for prefixes of 1024
+  tokens or more. A long prompt leaves one every prefill chunk, but with the default
+  `--linear-state-cache-ratio` the snapshot pool is small enough that a long prompt's earliest
+  boundaries are already gone by the time it finishes; the later ones, which a follow-up question
+  on the same document resumes from, are what reaches the disk.
+- **When.** While the server is idle (after a reply, before the next request), so it never
+  slows a request down that is already running. Entries are copied out of VRAM on the scheduler
+  and written by a background thread, with each file fsynced and renamed into place: a crash
+  leaves a temporary file that the next start removes, never a half-written entry.
+- **When it is read.** When a prompt arrives whose start is on disk at least a chunk-ish deeper
+  than the in-memory cache has it. The request waits while the file is read (the requests behind
+  it wait too), then it is admitted as an ordinary cache hit: `#cached-token` shows the restored
+  length, and the log says `resumes at N tokens from disk`.
+- **What is never read.** An entry written by a different model or weights (config.json and every
+  file's size and mtime in the model directory), a different `--dtype`, `--kv-cache-dtype`,
+  `--dense-quant`, `--quant-backend`, page size, `--spec-mtp` layout, code version (including
+  uncommitted changes to a checkout), or cache layout. Those live in a separate sub-directory
+  and only count toward the size cap. Each entry also stores its token ids and a checksum per
+  tensor, and both are checked on every read.
+- **Size.** One entry is the GDN snapshot (about 62 MiB on Ornith, whose 30 GDN layers hold a
+  128 × 128 state per head) plus the KV of the prefix; each entry is self-contained, so the
+  boundaries of one long prompt repeat its head. `--prefix-disk-cache-size` caps the whole
+  directory, least recently used out first.
+- **Page cache.** Entry files are dropped from the page cache after they are written or read, so
+  they do not push out a `--moe-bank-ram` bank's cold half.
+
+Not supported yet, and refused at startup: `--pp-size` / `--tp-size` > 1, models other than the
+hybrid GDN ones, and `--cache-type naive`. Image prompts are never cached, on disk or not.
