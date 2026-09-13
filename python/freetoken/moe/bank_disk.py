@@ -192,16 +192,39 @@ def cell_bytes_from_config(model_config) -> int | None:
     """
     from freetoken.moe.offload_cache import _BANK_BYTES_PER_EXPERT
 
+    return _per_expert_from_config(model_config, _BANK_BYTES_PER_EXPERT)
+
+
+def _per_expert_from_config(model_config, table) -> int | None:
     quant = getattr(model_config, "expert_quant", "none")
     fmt = quant if quant != "none" else (
         getattr(model_config, "moe_weight_format", None) or "bf16"
     )
-    per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
+    per_expert = table.get(fmt)
     hidden = getattr(model_config, "hidden_size", None)
     inter = getattr(model_config, "moe_intermediate_size", None)
     if per_expert is None or not (hidden and inter):
         return None
     return per_expert(hidden, inter)
+
+
+# The widest single block of one expert's row: the fused gate_up weight in every format, since
+# the scales and globals are banks of their own. This is what the device readahead window is
+# compared with (mapped_bank.py). A bank file on disk carries the exact figure in its header, and
+# a bound expert method in its layout; this is for when there is neither (ft doctor disk).
+_WIDEST_ROW_BLOCK_BYTES = {
+    "bf16": lambda H, I: 2 * I * H * 2,
+    "fp8_block": lambda H, I: 2 * I * H,
+    "q4_0": lambda H, I: 2 * I * (H // 32) * 18,
+    "nvfp4": lambda H, I: 2 * I * (H // 2),
+    "mxfp4": lambda H, I: 2 * I * (H // 2),
+    "ds_fp4": lambda H, I: 2 * I * (H // 2),
+}
+
+
+def widest_row_block_bytes_from_config(model_config) -> int | None:
+    """Bytes of the widest per-expert block row, from the config alone (None when unknown)."""
+    return _per_expert_from_config(model_config, _WIDEST_ROW_BLOCK_BYTES)
 
 
 def cell_bytes_of_layout(specs) -> int:

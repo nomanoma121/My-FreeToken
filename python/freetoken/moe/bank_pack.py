@@ -77,9 +77,14 @@ def read_pack_manifest(model_path: str | None) -> dict | None:
     return manifest
 
 
-def default_bank_dir(model_path: str) -> str:
+def bank_root() -> str:
+    """``~/.cache/freetoken/bankmap`` (or under ``$XDG_CACHE_HOME``): every model's bank directory."""
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(base, "freetoken", "bankmap", os.path.basename(os.path.normpath(model_path)))
+    return os.path.join(base, "freetoken", "bankmap")
+
+
+def default_bank_dir(model_path: str) -> str:
+    return os.path.join(bank_root(), os.path.basename(os.path.normpath(model_path)))
 
 
 def bank_path_for(model_path: str, manifest: dict | None = None, directory: str | None = None) -> str:

@@ -18,6 +18,7 @@ Commands:
   checkpoint  Convert an HF safetensors checkpoint to FTW
   bank        Inspect, pack, verify or reorder the --moe-bank-ram bank file
   bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
+  doctor      Check this host for a feature (e.g. "doctor disk" = --moe-bank-ram)
 
 Use "ft <command> --help" for command-specific options.
 Use "ft --version" to print the FreeToken version.""",
@@ -97,6 +98,36 @@ def _run_bench(argv: list[str]) -> int:
     return 2
 
 
+def _print_doctor_help(file: TextIO) -> None:
+    print(
+        """usage: ft doctor <subcommand> [args]
+
+Subcommands:
+  disk   Whether --moe-bank-ram is usable on this host: storage, readahead, memory,
+         a read benchmark and a per-RAM-cap estimate (no GPU, no root)
+
+Use "ft doctor <subcommand> --help" for subcommand-specific options.""",
+        file=file,
+    )
+
+
+def _run_doctor(argv: list[str]) -> int:
+    if not argv:
+        _print_doctor_help(sys.stderr)
+        return 2
+    sub = argv[0]
+    if sub in {"-h", "--help"}:
+        _print_doctor_help(sys.stdout)
+        return 0
+    if sub == "disk":
+        from freetoken.moe.disk_doctor import main
+
+        return main(argv[1:], prog="ft doctor disk")
+    print(f"unknown ft doctor subcommand: {sub}", file=sys.stderr)
+    _print_doctor_help(sys.stderr)
+    return 2
+
+
 COMMANDS = {
     "serve": "_run_serve",
     "shell": "_run_shell",
@@ -106,6 +137,7 @@ COMMANDS = {
     "checkpoint": "_run_checkpoint",
     "bank": "_run_bank",
     "bench": "_run_bench",
+    "doctor": "_run_doctor",
 }
 
 
