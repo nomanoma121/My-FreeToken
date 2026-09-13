@@ -14,8 +14,8 @@ import pytest
 
 from freetoken.moe.bank_disk import (
     apply_permutation,
-    bank_file_path,
     hot_per_layer_for_budget,
+    legacy_bank_files,
     load_freq,
     parse_size,
     permutation_tensor,
@@ -159,66 +159,58 @@ def test_parse_size():
         parse_size("lots")
 
 
-def test_bank_file_path_is_per_rank(tmp_path):
-    a = bank_file_path("/models/Flash-Next", 0, 2, str(tmp_path))
-    b = bank_file_path("/models/Flash-Next", 1, 2, str(tmp_path))
-    assert a != b and a.endswith("bank.rank0of2.ftmb")
+def test_one_bank_file_for_every_rank(tmp_path):
+    """The file covers every MoE layer, so a layer split changes nothing about where it is."""
+    from freetoken.moe.bank_pack import bank_path_for
+
+    assert bank_path_for("/models/Flash-Next", None, str(tmp_path)) == str(tmp_path / "bank.ftmb")
 
 
 def test_bank_file_path_defaults_outside_the_checkpoint(tmp_path, monkeypatch):
+    from freetoken.moe.bank_pack import bank_path_for
+
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    p = bank_file_path("/models/Flash-Next", 0, 1, None)
+    p = bank_path_for("/models/Flash-Next")
     assert str(tmp_path) in p and "Flash-Next" in p
     assert "/models/" not in p.replace("\\", "/")
 
 
-def _rank_files(tmp_path, width=4):
-    # rank 0 owns decoder layers 0..1, rank 1 owns 2..3; every layer's histogram is distinct,
-    # hottest expert = the global layer id, so a placement shows which layer it was sorted by
-    paths = []
-    for rank, start in ((0, 0), (1, 2)):
-        rows = [[100 if e == start + i else e for e in range(width)] for i in range(2)]
-        p = tmp_path / f"moe-stats.rank{rank}.json"
-        p.write_text(json.dumps({"layer_range": [start, start + 2], "decode_freq": rows}),
-                     encoding="utf-8")
-        paths.append(str(p))
-    return paths
+def test_a_packed_checkpoint_keeps_its_bank_inside(tmp_path):
+    from freetoken.moe.bank_pack import bank_path_for
+
+    slim = str(tmp_path / "slim")
+    assert bank_path_for(slim, {"bank": "bank.ftmb"}) == str(tmp_path / "slim" / "bank.ftmb")
+    assert bank_path_for(slim, {"bank": "/elsewhere/bank.ftmb"}) == "/elsewhere/bank.ftmb"
+    # --moe-bank-dir still wins
+    assert bank_path_for(slim, {"bank": "bank.ftmb"}, str(tmp_path / "d")) == str(tmp_path / "d" / "bank.ftmb")
 
 
-class _Cfg:
-    num_experts = 4
-    hidden_size = 8
-    moe_intermediate_size = 4
+def test_legacy_per_rank_files_are_found(tmp_path):
+    for name in ("bank.rank0of2.ftmb", "bank.rank1of2.ftmb", "bank.ftmb"):
+        (tmp_path / name).write_bytes(b"x")
+    assert [p.rsplit("/", 1)[-1] for p in legacy_bank_files(str(tmp_path))] == [
+        "bank.rank0of2.ftmb", "bank.rank1of2.ftmb",
+    ]
 
 
-def test_a_later_pipeline_rank_sorts_by_its_own_layers(tmp_path, monkeypatch):
-    from freetoken.moe import bank_disk
-
-    monkeypatch.setattr(bank_disk, "cell_bytes_from_config", lambda _cfg: 100)
-    paths = _rank_files(tmp_path)
-    # rank 1: local layers 0..1 are the model's 2..3
-    placement, _ = bank_disk.plan_from_config(_Cfg(), 200, [0, 1], paths, first_bank_layer=2)
-    assert placement.order[0][0] == 2 and placement.order[1][0] == 3
-    # rank 0 is unchanged
-    placement, _ = bank_disk.plan_from_config(_Cfg(), 200, [0, 1], paths, first_bank_layer=0)
-    assert placement.order[0][0] == 0 and placement.order[1][0] == 1
+def test_load_freq_keys_are_bank_layers_under_leading_dense_layers(tmp_path):
+    """layer_range is in decoder layers; a model with dense layers first shifts the bank index."""
+    (tmp_path / "r0.json").write_text(json.dumps({"layer_range": [0, 3], "decode_freq": [[1, 0], [2, 0]]}), encoding="utf-8")
+    (tmp_path / "r1.json").write_text(json.dumps({"layer_range": [3, 5], "decode_freq": [[3, 0], [4, 0]]}), encoding="utf-8")
+    freq = load_freq([str(tmp_path / "r0.json"), str(tmp_path / "r1.json")], first_k_dense=1)
+    # rank 0 owns decoder layers 0-2 = dense layer 0 + bank layers 0, 1; rank 1 owns bank layers 2, 3
+    assert freq == {0: [1, 0], 1: [2, 0], 2: [3, 0], 3: [4, 0]}
 
 
-def test_missing_histograms_for_a_rank_are_said(tmp_path, monkeypatch):
-    from freetoken.moe import bank_disk
+def test_rank1_places_its_layers_by_its_own_histogram(tmp_path):
+    """The placement is keyed by global bank layer.
 
-    monkeypatch.setattr(bank_disk, "cell_bytes_from_config", lambda _cfg: 100)
-    rank0_only = _rank_files(tmp_path)[:1]
-    said = []
-    placement, _ = bank_disk.plan_from_config(
-        _Cfg(), 200, [0, 1], rank0_only, first_bank_layer=2, warn=said.append
-    )
-    assert placement.order[0] == [0, 1, 2, 3]  # no histogram: expert-id order, not rank 0's
-    assert said and "0 of this rank's 2 MoE layers (2..3)" in said[0]
-
-
-def test_leading_dense_layers_are_not_bank_layers(tmp_path):
-    p = tmp_path / "moe-stats.rank1.json"
-    p.write_text(json.dumps({"layer_range": [3, 5], "decode_freq": [[1, 2], [3, 4]]}),
-                 encoding="utf-8")
-    assert sorted(load_freq([str(p)], first_k_dense=1)) == [2, 3]
+    It used to be keyed by the rank's local index while load_freq keyed the histogram
+    globally, so rank 1 of --pp-size 2 looked up layers 0..n-1 -- rank 0's histograms -- and
+    put rank 0's hot experts into its own resident prefix.
+    """
+    (tmp_path / "s.rank0.json").write_text(json.dumps({"layer_range": [0, 2], "decode_freq": [[9, 0, 0], [9, 0, 0]]}), encoding="utf-8")
+    (tmp_path / "s.rank1.json").write_text(json.dumps({"layer_range": [2, 4], "decode_freq": [[0, 0, 9], [0, 9, 0]]}), encoding="utf-8")
+    freq = load_freq([str(tmp_path / "s.rank0.json"), str(tmp_path / "s.rank1.json")])
+    rank1 = plan_placement([2, 3], 3, 1, freq)
+    assert rank1.order[2][0] == 2 and rank1.order[3][0] == 1

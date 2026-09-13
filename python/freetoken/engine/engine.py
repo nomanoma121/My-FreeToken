@@ -584,6 +584,15 @@ class Engine:
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+        if not config.use_dummy_weight:
+            from freetoken.moe.bank_pack import check_served_packed
+
+            # a checkpoint packed by `ft bank pack` has no routed-expert tensors: say so now,
+            # not as a missing key after the dense weights have loaded
+            check_served_packed(
+                config.model_path, moe_bank_ram=config.moe_bank_ram,
+                offload=is_offload_moe_strategy(config.moe_strategy),
+            )
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -1147,8 +1156,11 @@ class Engine:
         # expert-tensor granularity. Both pin-after-fill.
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
-        bank_tier = self._build_bank_tier(config)
+        bank_tier = self._build_bank_tier(config, method)
         self.bank_tier = bank_tier  # --moe-bank-rewarm reads the mapped banks through this
+        # every layer of this rank already in the bank file (or reordered into place): the
+        # checkpoint's expert tensors are not opened at all
+        banks_from_file = bank_tier is not None and not config.use_dummy_weight and bank_tier.prepare()
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
         requested_residency = None
         if split_residency:
@@ -1160,18 +1172,27 @@ class Engine:
                 for i in range(config.model_config.num_moe_layers)
             ]
         try:
-            banks = load_expert_banks(
-                config.model_path,
-                config.model_config,
-                method=method,
-                device=self.device,
-                dtype=self.dtype,
-                dummy=config.use_dummy_weight,
-                parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
-                layer_residency=requested_residency,
-                layer_sink=bank_tier.sink if bank_tier else None,
-            )
+            if banks_from_file:
+                from freetoken.moe.expert_banks import ExpertBanks
+                from freetoken.moe.legacy_format import legacy_format_for
+
+                banks = ExpertBanks(
+                    legacy_format_for(method.kind, method.kernel.name), {}, streamed=True,
+                    kind=method.kind, kernel=method.kernel.name, layout=method.layout(),
+                )
+            else:
+                banks = load_expert_banks(
+                    config.model_path,
+                    config.model_config,
+                    method=method,
+                    device=self.device,
+                    dtype=self.dtype,
+                    dummy=config.use_dummy_weight,
+                    parallel=expert_parallel,
+                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                    layer_residency=requested_residency,
+                    layer_sink=bank_tier.sink if bank_tier else None,
+                )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         if bank_tier is not None:
@@ -2309,63 +2330,21 @@ class Engine:
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
-    def _build_bank_tier(self, config: EngineConfig):
-        """``--moe-bank-ram``: the mapped expert banks, or None when off or unnecessary.
+    def _build_bank_tier(self, config: EngineConfig, method=None):
+        """``--moe-bank-ram``: this rank's mapped expert banks, or None when off or unnecessary.
 
-        Built before the load, not after: the banks are written per layer as the checkpoint
-        streams in, because holding the originals and a second copy at once needs more RAM
-        than the host that wants this feature has (moe/mapped_bank.py).
+        Built before the load, not after: whether the checkpoint's experts are read at all
+        depends on what the bank file already holds, and when they are, the banks are written
+        per layer as the checkpoint streams in, because holding the originals and a second copy
+        at once needs more RAM than the host that wants this feature has (moe/mapped_bank.py).
         """
-        if not config.moe_bank_ram:
-            return None
-        from freetoken.moe import bank_disk
-        from freetoken.moe.mapped_bank import MappedTier
+        from freetoken.distributed import try_get_pp_info
+        from freetoken.moe.bank_tier import build_tier
 
-        # --moe-bank-ram is a whole-host cap, but each rank builds its own banks and every
-        # rank of a layer split lives on the same machine -- so the per-rank share is what
-        # the placement is solved against. Taking the flag per rank instead would silently
-        # double the RAM a two-GPU run uses.
-        total = bank_disk.parse_size(config.moe_bank_ram)
-        ranks = max(1, config.tp_info.size)
-        budget = total // ranks
-        layers = list(range(config.model_config.num_moe_layers))
-        # The histograms are keyed by the layer's place in the whole model; this rank's banks
-        # are indexed from 0. Under --pp-size the two differ by where the rank's window starts.
-        first_k_dense = int(getattr(config.full_model_config, "first_k_dense_replace", 0) or 0)
-        pp_range = getattr(config, "pp_layer_range", None)
-        first_bank_layer = max(0, int(pp_range[0]) - first_k_dense) if pp_range else 0
-        placement, cell_bytes = bank_disk.plan_from_config(
-            config.model_config, budget, layers, config.moe_bank_stats,
-            first_bank_layer=first_bank_layer, first_k_dense=first_k_dense,
-            warn=logger.warning,
-        )
-        bank_gib = (cell_bytes or 0) * len(layers) * config.model_config.num_experts / 2**30
-        if placement is None:
-            logger.info_rank0(
-                f"--moe-bank-ram {config.moe_bank_ram}: {budget / 2**30:.1f} GiB per rank "
-                f"({ranks} ranks) covers this rank's {bank_gib:.1f} GiB of banks; no split"
-            )
+        if config.use_dummy_weight:
             return None
-        logger.info_rank0(
-            f"--moe-bank-ram {config.moe_bank_ram}: {budget / 2**30:.1f} GiB per rank "
-            f"({ranks} ranks) against {bank_gib:.1f} GiB of banks"
-        )
-        if not config.moe_bank_stats:
-            logger.warning(
-                "--moe-bank-ram without --moe-bank-stats: the split ignores routing, so the "
-                "resident half is an arbitrary slice. Collect a histogram with "
-                "--moe-stats-out --disable-cuda-graph first."
-            )
-        # Whether the overlap survives is decided after the banks are opened, on what
-        # actually got registered -- see the caller.
-        return MappedTier(
-            placement,
-            bank_disk.bank_file_path(
-                config.model_path, config.tp_info.rank, config.tp_info.size, config.moe_bank_dir
-            ),
-            layers,
-            log=logger.info_rank0,
-            warn=logger.warning_rank0,
+        return build_tier(
+            config, method, pp=try_get_pp_info(), log=logger.info, warn=logger.warning
         )
 
     def _write_moe_stats(self) -> None:

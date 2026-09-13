@@ -14,12 +14,11 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from freetoken.moe.bank_disk import plan_placement  # noqa: E402
+from freetoken.moe.bank_file import BankFile, BankFileError, layout_from_sample  # noqa: E402
 from freetoken.moe.mapped_bank import (  # noqa: E402
     ALIGN,
     MappedBankLayout,
     MappedBanks,
-    MappedBankWriter,
-    layout_from,
 )
 
 
@@ -36,25 +35,28 @@ def _sources(num_layers=3, num_experts=6):
     return src
 
 
+def _layout(src, layers):
+    return layout_from_sample({n: src[n][0] for n in src}, layers, src["packed"][0].shape[0])
+
+
 def _built(tmp_path, num_layers=3, num_experts=6, hot=4, freq=None):
     src = _sources(num_layers, num_experts)
     layers = list(range(num_layers))
     p = plan_placement(layers, num_experts, hot, freq)
-    lay = layout_from(src, layers, p)
+    lay = _layout(src, layers)
     path = str(tmp_path / "b.ftmb")
-    w = MappedBankWriter(path, lay)
-    for layer in layers:
-        w.write_layer(layer, {n: src[n][layer] for n in src})
-    w.close()
+    with BankFile.create(path, lay) as w:
+        for layer in layers:
+            w.write_layer(layer, {n: src[n][layer] for n in src}, p.order[layer])
     return src, p, lay, path
 
 
 # ----- layout ---------------------------------------------------------------------------
 def test_blocks_are_aligned_and_do_not_overlap():
     src = _sources()
-    p = plan_placement([0, 1, 2], 6, 4, None)
-    lay = layout_from(src, [0, 1, 2], p)
-    assert lay.data_offset % ALIGN == 0
+    lay = _layout(src, [0, 1, 2])
+    assert lay.data_offset % ALIGN == 0 and lay.slot_offset % ALIGN == 0
+    assert lay.data_offset == lay.slot_offset + 2 * lay.slot_bytes
     spans = []
     for name, _, _, _ in lay.banks:
         for layer in lay.layers:
@@ -71,24 +73,24 @@ def test_blocks_are_aligned_and_do_not_overlap():
 def test_layout_header_round_trip(tmp_path):
     _, _, lay, path = _built(tmp_path)
     back = MappedBankLayout.read(path)
-    assert back.same_as(lay)
-    assert back.order == lay.order and back.banks == lay.banks
+    assert back.mismatch(lay) is None
+    assert back.banks == lay.banks and back.layers == lay.layers
 
 
-def test_same_as_rejects_a_different_row_order():
+def test_the_order_is_not_part_of_the_geometry(tmp_path):
+    """A new histogram reorders layers in place; it does not make the file another file."""
     src = _sources()
-    a = layout_from(src, [0, 1, 2], plan_placement([0, 1, 2], 6, 4, None))
-    freq = {0: [9, 0, 8, 1, 7, 2], 1: [0, 9, 1, 8, 2, 7], 2: [1, 2, 3, 4, 5, 6]}
-    b = layout_from(src, [0, 1, 2], plan_placement([0, 1, 2], 6, 4, freq))
-    # same shapes, same counts, different experts in the resident prefix
-    assert not a.same_as(b)
+    a, b = _layout(src, [0, 1, 2]), _layout(src, [0, 1, 2])
+    assert a.mismatch(b) is None and a.data_offset == b.data_offset
 
 
-def test_same_as_rejects_a_different_resident_count():
+def test_mismatch_names_what_differs():
     src = _sources()
-    a = layout_from(src, [0, 1, 2], plan_placement([0, 1, 2], 6, 4, None))
-    b = layout_from(src, [0, 1, 2], plan_placement([0, 1, 2], 6, 3, None))
-    assert not a.same_as(b)
+    a = layout_from_sample({n: src[n][0] for n in src}, [0, 1, 2], 6, {"kernel": "triton"})
+    b = layout_from_sample({n: src[n][0] for n in src}, [0, 1, 2], 6, {"kernel": "marlin"})
+    assert "kernel" in a.mismatch(b)
+    c = _layout(src, [0, 1])
+    assert "MoE layers" in _layout(src, [0, 1, 2]).mismatch(c)
 
 
 def test_bad_magic_is_refused(tmp_path):
@@ -97,6 +99,16 @@ def test_bad_magic_is_refused(tmp_path):
         f.write(b"XXXX")
     with pytest.raises(ValueError, match="not a mapped bank"):
         MappedBankLayout.read(path)
+
+
+def test_a_per_rank_file_from_an_older_build_is_named_as_such(tmp_path):
+    import struct
+
+    path = tmp_path / "bank.rank0of2.ftmb"
+    body = b'{"version":1}'
+    path.write_bytes(struct.pack("<4sIQ", b"FTMB", 1, len(body)) + body)
+    with pytest.raises(ValueError, match="older build"):
+        MappedBankLayout.read(str(path))
 
 
 # ----- round trip -----------------------------------------------------------------------
@@ -125,19 +137,19 @@ def test_layers_may_be_written_from_many_threads(tmp_path):
 
     src = _sources(num_layers=6, num_experts=6)
     layers = list(range(6))
-    p = plan_placement(layers, 6, 4, None)
-    lay = layout_from(src, layers, p)
+    p = plan_placement(layers, 6, 4, {l: [l, 5, 4, 3, 2, 1] for l in layers})
+    lay = _layout(src, layers)
     path = str(tmp_path / "b.ftmb")
-    w = MappedBankWriter(path, lay)
-    ts = [
-        threading.Thread(target=w.write_layer, args=(layer, {n: src[n][layer] for n in src}))
-        for layer in layers
-    ]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-    w.close()
+    with BankFile.create(path, lay) as w:
+        ts = [
+            threading.Thread(target=w.write_layer, args=(layer, {n: src[n][layer] for n in src}, p.order[layer]))
+            for layer in layers
+        ]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert w.present_layers() == layers
     banks = MappedBanks(path, register=False)
     try:
         for layer in layers:
@@ -149,26 +161,46 @@ def test_layers_may_be_written_from_many_threads(tmp_path):
         banks.close()
 
 
-def test_a_missing_layer_removes_the_file(tmp_path):
+def test_a_layer_never_committed_is_not_handed_out(tmp_path):
     src = _sources(num_layers=2, num_experts=4)
-    p = plan_placement([0, 1], 4, 2, None)
-    lay = layout_from(src, [0, 1], p)
+    lay = _layout(src, [0, 1])
     path = str(tmp_path / "b.ftmb")
-    w = MappedBankWriter(path, lay)
-    w.write_layer(0, {n: src[n][0] for n in src})
-    with pytest.raises(ValueError, match="never written"):
-        w.close()
-    # zeroed experts do not crash a model, so a half-written file must not survive to be
-    # picked up as reusable on the next start
-    assert not os.path.exists(path)
+    with BankFile.create(path, lay) as w:
+        w.write_layer(0, {n: src[n][0] for n in src}, [0, 1, 2, 3])
+    # zeroed experts do not crash a model, so a layer that was never written must not be
+    # mapped as if it had been
+    with pytest.raises(BankFileError, match="not committed"):
+        MappedBanks(path, register=False, layers=[0, 1])
+    banks = MappedBanks(path, register=False)
+    try:
+        assert banks.layers == [0]
+    finally:
+        banks.close()
 
 
 def test_everything_resident_is_still_a_valid_file(tmp_path):
     src, p, _, path = _built(tmp_path, hot=6)
-    banks = MappedBanks(path, register=False)
+    banks = MappedBanks(path, register=False, hot_per_layer=6)
     try:
-        assert banks.layout.hot_per_layer == 6
+        assert banks.hot_per_layer == 6
         assert torch.equal(banks.sources["packed"][0][0], src["packed"][0][p.order[0][0]])
+    finally:
+        banks.close()
+
+
+def test_a_rank_maps_only_its_own_layers(tmp_path):
+    """--pp-size: each rank hands out its window of the one file, from its first layer."""
+    src, p, _, path = _built(tmp_path, num_layers=4)
+    banks = MappedBanks(path, register=False, layers=[2, 3], hot_per_layer=2)
+    try:
+        assert banks.mapped_bytes == 2 * banks.layout.layer_bytes()
+        # the mapping itself is only those layers' blocks: a private mapping is charged for its
+        # whole length, and the whole file is twice a rank's share
+        start, end = banks.layout.range_of([2, 3])
+        assert len(banks._map) == end - start < banks.layout.total_bytes() - banks.layout.data_offset
+        assert len(banks.sources["packed"]) == 2
+        assert torch.equal(banks.sources["packed"][0][0], src["packed"][2][p.order[2][0]])
+        assert torch.equal(banks.sources["scale"][1][5], src["scale"][3][p.order[3][5]])
     finally:
         banks.close()
 
@@ -212,8 +244,9 @@ def _tier(tmp_path, registered, hot=4, blocks=6, registered_blocks=None):
     from freetoken.moe.mapped_bank import MappedTier
 
     _, p, _, path = _built(tmp_path, hot=hot)
-    tier = MappedTier(p, path, list(range(3)))
-    tier.banks = MappedBanks(path, register=False)
+    tier = MappedTier(path, list(range(3)), num_experts=6, hot_per_layer=hot)
+    tier._orders = dict(p.order)
+    tier.banks = MappedBanks(path, register=False, hot_per_layer=hot)
     tier.banks.registered_bytes = registered
     tier.banks.hot_blocks = blocks
     # every resident block registered unless the caller is asking for the partial case
@@ -324,7 +357,7 @@ def test_small_blocks_are_kept_whole(tmp_path):
     saved = mb._WHOLE_BLOCK_BYTES
     mb._WHOLE_BLOCK_BYTES = small  # whole for the narrow bank, split for the wide one
     try:
-        banks = MappedBanks(path, register=False)
+        banks = MappedBanks(path, register=False, hot_per_layer=5)
     finally:
         mb._WHOLE_BLOCK_BYTES = saved
     try:
@@ -341,7 +374,7 @@ def _bare_bank(libc=None, private=False):
     from freetoken.moe.mapped_bank import MappedBanks
 
     bank = MappedBanks.__new__(MappedBanks)
-    bank._base, bank._libc = 0x1000, libc
+    bank._base, bank._libc, bank._map_offset = 0x1000, libc, 0
     bank._map = _mmap.mmap(-1, 1 << 20)  # a real mapping: _settle advises it before locking
     bank.locked_bytes = bank.requested_bytes = bank.registered_bytes = 0
     bank.lock_errno = 0
@@ -511,14 +544,15 @@ def test_the_private_form_hands_back_the_same_bytes(tmp_path, monkeypatch):
     freq = {0: [0, 9, 8, 0, 7, 0], 1: [5, 0, 0, 6, 0, 7], 2: [1, 2, 3, 4, 5, 6]}
     src, p, _, path = _built(tmp_path, freq=freq)
     # register=True: copying without registering would be cost for nothing, so the form is
-    # only taken when something is going to be registered
-    banks = MappedBanks(path)
+    # only taken when something is going to be registered. Layers 1-2: the mapping starts
+    # mid-file, so the copy and the page-cache release must agree on where a block is.
+    banks = MappedBanks(path, layers=[1, 2], hot_per_layer=3)
     try:
         assert banks.private
         assert banks.fully_registered
         for name in src:
-            for layer in (0, 1, 2):
-                view = banks.sources[name][layer]
+            for i, layer in enumerate((1, 2)):
+                view = banks.sources[name][i]
                 for physical in range(6):
                     logical = p.order[layer][physical]
                     assert torch.equal(view[physical], src[name][layer][logical])

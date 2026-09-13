@@ -29,8 +29,11 @@ def load_freq(paths, first_k_dense: int = 0) -> dict[int, list[int]]:
     """{global bank-layer id: [count per expert]} from one or more ``--moe-stats-out`` files.
 
     A file's rows are its rank's MoE layers from the first one it owns, and its ``layer_range``
-    is that rank's window in DECODER layers, so the bank index subtracts the leading dense layers
-    (``first_k_dense``, 0 for every model --moe-bank-ram has run on so far).
+    is that rank's window in DECODER layers; the bank index subtracts the leading dense layers
+    (``first_k_dense``, 0 for every model --moe-bank-ram has run on so far). The keys are global,
+    and so is the placement solved from them: before the bank file covered every layer, the
+    placement was keyed by each rank's local index, so rank 1 of a --pp-size 2 run sorted its
+    experts by rank 0's histograms (keys 0..23) instead of its own (24..47).
 
     Counts for the same layer ADD. Files from one run are disjoint by layer (one per pipeline
     rank), so this only matters across runs -- which is the case that needs it. A placement
@@ -201,58 +204,20 @@ def cell_bytes_from_config(model_config) -> int | None:
     return per_expert(hidden, inter)
 
 
-def plan_from_config(model_config, ram_budget_bytes: int, layers, stats_paths=None,
-                     first_bank_layer: int = 0, first_k_dense: int = 0, warn=None):
-    """``(placement, cell_bytes)`` for a --moe-bank-ram run, before anything is loaded.
+def cell_bytes_of_layout(specs) -> int:
+    """Bytes one expert occupies across its host banks, from a kernel layout (exact)."""
+    import math
 
-    ``placement`` is None when the budget already covers every expert (nothing to do) or when
-    the format's per-expert size is unknown -- the feature declines rather than guessing how a
-    checkpoint splits.
+    import torch
 
-    ``layers`` are this rank's own bank indices (0..n-1, what the offload cache and the file
-    use); ``first_bank_layer`` is where they start in the whole model, which is how the
-    histograms are keyed. Under --pp-size, rank 1 of a 48-layer model owns bank layers 24..47:
-    it used to look its local 0..23 up directly and so sorted its experts by rank 0's layers.
-    """
-    cell_bytes = cell_bytes_from_config(model_config)
-    layers = list(layers)
-    if not cell_bytes or not layers:
-        return None, cell_bytes
-    num_experts = int(model_config.num_experts)
-    hot = hot_per_layer_for_budget(len(layers), num_experts, cell_bytes, ram_budget_bytes)
-    if hot >= num_experts:
-        return None, cell_bytes
-    if hot == 0:
-        raise ValueError(
-            f"--moe-bank-ram leaves room for no resident experts "
-            f"({cell_bytes / 2**20:.1f} MiB each x {len(layers)} layers). Raise the cap."
-        )
-    freq = None
-    if stats_paths:
-        every = load_freq(stats_paths, first_k_dense=first_k_dense)
-        freq = {layer: every[layer + first_bank_layer] for layer in layers
-                if layer + first_bank_layer in every}
-        if len(freq) < len(layers) and warn is not None:
-            lo, hi = first_bank_layer, first_bank_layer + len(layers)
-            warn(
-                f"--moe-bank-stats has histograms for {len(freq)} of this rank's {len(layers)} MoE "
-                f"layers ({lo}..{hi - 1}); the rest keep expert-id order. Under --pp-size pass "
-                f"every rank's file (moe-stats.rank0.json and moe-stats.rank1.json)."
-            )
-    return plan_placement(layers, num_experts, hot, freq), cell_bytes
+    return sum(
+        math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
+        for spec in specs.values() if not getattr(spec, "resident", False)
+    )
 
 
-def bank_file_path(model_path: str, rank: int, size: int, directory=None) -> str:
-    """Where this rank's mapped bank lives.
+def legacy_bank_files(directory: str) -> list[str]:
+    """Per-rank bank files an older build wrote (``bank.rankNofM.ftmb``); nothing reads them now."""
+    import glob
 
-    A cache directory by default, not the checkpoint: the checkpoint may be read-only or
-    shared, and this file is derived data that a different --moe-bank-ram invalidates. One
-    file per rank, since each rank's placement covers only its own layers.
-    """
-    if directory is None:
-        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-        directory = os.path.join(
-            base, "freetoken", "bankmap", os.path.basename(os.path.normpath(model_path))
-        )
-    os.makedirs(directory, exist_ok=True)
-    return os.path.join(directory, f"bank.rank{rank}of{size}.ftmb")
+    return sorted(glob.glob(os.path.join(glob.escape(directory), "bank.rank*of*.ftmb")))

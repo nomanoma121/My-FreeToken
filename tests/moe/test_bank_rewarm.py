@@ -15,9 +15,9 @@ import time
 
 import torch
 
-from freetoken.moe.bank_disk import plan_placement
+from freetoken.moe.bank_file import BankFile, layout_from_sample
 from freetoken.moe.bank_rewarm import BankRewarm
-from freetoken.moe.mapped_bank import MappedBankWriter, MappedBanks, layout_from
+from freetoken.moe.mapped_bank import MappedBanks
 
 
 def _built(tmp_path, num_layers=3, num_experts=64, hot=16, cols=131072):
@@ -26,18 +26,17 @@ def _built(tmp_path, num_layers=3, num_experts=64, hot=16, cols=131072):
     src = {"packed": [torch.full((num_experts, cols), layer + 1, dtype=torch.uint8)
                       for layer in range(num_layers)]}
     layers = list(range(num_layers))
-    lay = layout_from(src, layers, plan_placement(layers, num_experts, hot, None))
+    lay = layout_from_sample({"packed": src["packed"][0]}, layers, num_experts)
     path = str(tmp_path / "b.ftmb")
-    w = MappedBankWriter(path, lay)
-    for layer in layers:
-        w.write_layer(layer, {"packed": src["packed"][layer]})
-    w.close()
+    with BankFile.create(path, lay) as w:
+        for layer in layers:
+            w.write_layer(layer, {"packed": src["packed"][layer]}, list(range(num_experts)))
     return lay, path
 
 
 def test_cold_spans_are_the_rows_past_the_resident_prefix(tmp_path):
     lay, path = _built(tmp_path)
-    banks = MappedBanks(path, register=False)
+    banks = MappedBanks(path, register=False, hot_per_layer=16)
     try:
         row = 131072
         assert len(banks.cold_spans) == 3  # one per layer of the one bank
@@ -50,7 +49,7 @@ def test_cold_spans_are_the_rows_past_the_resident_prefix(tmp_path):
 
 def test_residency_is_a_share_and_a_full_walk_leaves_it_whole(tmp_path):
     _, path = _built(tmp_path)
-    banks = MappedBanks(path, register=False)
+    banks = MappedBanks(path, register=False, hot_per_layer=16)
     try:
         before = banks.cold_residency()
         assert 0.0 <= before <= 1.0
@@ -64,7 +63,7 @@ def test_residency_is_a_share_and_a_full_walk_leaves_it_whole(tmp_path):
 
 def test_a_request_stops_the_walk_before_it_reads_anything_more(tmp_path):
     _, path = _built(tmp_path)
-    banks = MappedBanks(path, register=False)
+    banks = MappedBanks(path, register=False, hot_per_layer=16)
     try:
         cancel = threading.Event()
         cancel.set()

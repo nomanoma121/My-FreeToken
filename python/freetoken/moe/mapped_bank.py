@@ -1,14 +1,14 @@
-"""Expert banks as one file-backed mapping per rank, with the resident rows locked down.
+"""Expert banks as a file-backed mapping, with the resident rows locked down.
 
 The explicit two-tier arrangement (compacted banks plus a cold file read on demand) ran into
 ``OffloadMoeCache``: its banks are ``[num_experts, ...]`` by contract, and prefill streams a
 whole layer by that count. Shrinking the bank means changing the copy machinery and the
 prefill path -- the hot paths -- for every quant format.
 
-This does the same job without touching any of that. Each rank writes its expert banks once
-to a file, rows reordered so the frequently routed experts come first, then maps the file and
-hands the cache ``[num_experts, ...]`` tensor views. The shape the cache sees never changes.
-What changes is which rows are guaranteed to be in RAM:
+This does the same job without touching any of that. The expert banks live in one file
+(moe/bank_file.py), rows reordered so the frequently routed experts come first; each rank maps
+the file and hands the cache ``[num_experts, ...]`` tensor views of its own layers. The shape
+the cache sees never changes. What changes is which rows are guaranteed to be in RAM:
 
 * rows ``[0, hot)`` of every block are held resident and ``cudaHostRegister``ed, so the
   prefill sweep -- which touches every expert of every layer on each chunk -- cannot evict
@@ -23,25 +23,33 @@ So the RAM the banks hold is the locked prefix, and the renumbering (bank_disk.p
 is what makes that prefix the experts worth keeping. Measured on Flash-Next: 77% of rows
 resident serves 87.5% of routed accesses on unseen work (docs/bank-ram.md).
 
-Cost: the file is a full copy of the banks (31.7 GiB per rank for Flash-Next), written once
-and reused for as long as the placement is unchanged.
+``hot`` is decided per run from ``--moe-bank-ram``; the file does not depend on it, nor on the
+layer split. When the file already holds this rank's layers the checkpoint's expert tensors are
+not read at all (``MappedTier.prepare``); a checkpoint packed with ``ft bank pack`` has none to
+read.
 """
 
 from __future__ import annotations
 
 import ctypes
-import json
 import mmap
 import os
-import struct
 import threading
 import time
 import warnings
 
 from freetoken.utils.torch_utils import clear_cuda_error
 
-MAGIC = b"FTMB"
-VERSION = 1
+from .bank_file import (  # noqa: F401  (re-exported: the on-disk format lives in bank_file)
+    ALIGN,
+    BankFile,
+    BankFileError,
+    MappedBankLayout,
+    dtype_of as _dtype_of,
+    file_lock,
+    free_bytes,
+    layout_from_sample,
+)
 
 
 # A block this small per layer is kept whole rather than split hot/cold. The global-scale
@@ -50,9 +58,6 @@ VERSION = 1
 # costs, for two blocks that fit entirely in 17 MB per rank. Residency is cheaper than
 # reading them.
 _WHOLE_BLOCK_BYTES = 4 * 2**20
-
-ALIGN = 4096
-_PREAMBLE = struct.Struct("<4sIQ")
 
 
 def _rss_gib() -> float:
@@ -112,156 +117,15 @@ def advise_range(start: int, length: int, limit: int) -> tuple[int, int] | None:
     return begin, end - begin
 
 
-def _dtype_name(dtype) -> str:
-    return str(dtype).rsplit(".", 1)[-1]
-
-
-def _dtype_of(name: str):
-    import torch
-
-    dt = getattr(torch, name, None)
-    if dt is None:
-        raise ValueError(f"unknown dtype {name!r} in mapped bank header")
-    return dt
-
-
-class MappedBankLayout:
-    """Where every (bank, layer) block sits in the file, and which rows are resident."""
-
-    def __init__(self, num_experts: int, hot_per_layer: int, layers, banks, order):
-        self.num_experts = int(num_experts)
-        self.hot_per_layer = int(hot_per_layer)
-        self.layers = [int(x) for x in layers]
-        # [(name, row shape, dtype name, bytes per row)]
-        self.banks = [(str(n), tuple(int(x) for x in s), str(d), int(b)) for n, s, d, b in banks]
-        self.order = {int(k): [int(x) for x in v] for k, v in order.items()}
-        self._block = {
-            name: _align_up(self.num_experts * row_bytes) for name, _, _, row_bytes in self.banks
-        }
-        head = _PREAMBLE.size + len(self._header_json())
-        self.data_offset = _align_up(head)
-
-    def _header_json(self) -> bytes:
-        return json.dumps({
-            "version": VERSION,
-            "num_experts": self.num_experts,
-            "hot_per_layer": self.hot_per_layer,
-            "layers": self.layers,
-            "banks": [[n, list(s), d, b] for n, s, d, b in self.banks],
-            "order": {str(k): v for k, v in self.order.items()},
-        }, separators=(",", ":")).encode("utf-8")
-
-    def block_bytes(self, name: str) -> int:
-        return self._block[name]
-
-    def offset_of(self, name: str, layer: int) -> int:
-        """Byte offset of one (bank, layer) block. Blocks are grouped by bank, then layer."""
-        pos = self.data_offset
-        for bank_name, _, _, _ in self.banks:
-            for other in self.layers:
-                if bank_name == name and other == layer:
-                    return pos
-                pos += self._block[bank_name]
-        raise KeyError((name, layer))
-
-    def total_bytes(self) -> int:
-        return self.data_offset + sum(
-            self._block[name] * len(self.layers) for name, _, _, _ in self.banks
-        )
-
-    def header_blob(self) -> bytes:
-        body = self._header_json()
-        head = _PREAMBLE.pack(MAGIC, VERSION, len(body)) + body
-        return head + b"\0" * (self.data_offset - len(head))
-
-    def same_as(self, other: "MappedBankLayout") -> bool:
-        """Layout equality including the row order.
-
-        A file built from a different histogram puts different experts in the resident
-        prefix while every shape and length still matches, so reusing it would feed the
-        model weights it never asked for and look healthy doing it.
-        """
-        return (
-            self.num_experts == other.num_experts
-            and self.hot_per_layer == other.hot_per_layer
-            and self.layers == other.layers
-            and self.banks == other.banks
-            and self.order == other.order
-        )
-
-    @classmethod
-    def from_json(cls, d: dict) -> "MappedBankLayout":
-        return cls(
-            d["num_experts"], d["hot_per_layer"], d["layers"],
-            [(n, tuple(s), t, b) for n, s, t, b in d["banks"]],
-            {int(k): v for k, v in d["order"].items()},
-        )
-
-    @classmethod
-    def read(cls, path: str) -> "MappedBankLayout":
-        with open(path, "rb") as f:
-            magic, version, body_len = _PREAMBLE.unpack(f.read(_PREAMBLE.size))
-            if magic != MAGIC:
-                raise ValueError(f"{path}: not a mapped bank file")
-            if version != VERSION:
-                raise ValueError(f"{path}: mapped bank version {version}, expected {VERSION}")
-            return cls.from_json(json.loads(f.read(body_len).decode("utf-8")))
-
-
-def layout_from(sources, layers, placement) -> MappedBankLayout:
-    """Layout for banks a loader is about to produce. ``sources``: {name: [tensor|HostBank]}."""
-    banks = []
-    for name, per_layer in sources.items():
-        t = getattr(per_layer[0], "tensor", per_layer[0])
-        row = t[0]
-        banks.append((name, tuple(row.shape), _dtype_name(t.dtype), row.numel() * t.element_size()))
-    return MappedBankLayout(
-        placement.num_experts, placement.hot_per_layer, layers, banks,
-        {layer: placement.order[layer] for layer in layers},
-    )
-
-
-class MappedBankWriter:
-    """Writes permuted per-layer blocks. Layers may arrive in any order, from any thread."""
-
-    def __init__(self, path: str, layout: MappedBankLayout):
-        self.path, self.layout = path, layout
-        self._f = open(path, "wb")
-        self._f.write(layout.header_blob())
-        self._f.truncate(layout.total_bytes())
-        self._lock = threading.Lock()
-        self._done: set[int] = set()
-
-    def write_layer(self, layer: int, banks) -> None:
-        """``banks``: {name: tensor or HostBank} for one layer, rows in LOGICAL order."""
-        import torch
-
-        idx = torch.as_tensor(self.layout.order[layer], dtype=torch.long)
-        for name, _, _, _ in self.layout.banks:
-            src = getattr(banks[name], "tensor", banks[name])
-            # permute out of line, then one sequential write per block
-            block = src.index_select(0, idx).contiguous()
-            raw = block.flatten().view(torch.uint8).numpy()
-            with self._lock:
-                self._f.seek(self.layout.offset_of(name, layer))
-                self._f.write(memoryview(raw))
-        with self._lock:
-            self._done.add(layer)
-
-    def close(self) -> None:
-        missing = [x for x in self.layout.layers if x not in self._done]
-        self._f.close()
-        if missing:
-            # an unwritten block reads as zeros, and a model fed zeroed experts produces
-            # fluent nonsense rather than failing, so refuse the file outright
-            os.unlink(self.path)
-            raise ValueError(f"{self.path}: layers {missing} were never written")
-
-
 class MappedBanks:
-    """An open mapped bank file: tensor views, resident prefix locked and registered."""
+    """An open mapped bank file: tensor views, resident prefix locked and registered.
 
-    def __init__(self, path: str, register: bool = True):
+    ``layers``: the global bank-layer ids to hand out, in order (default: every committed
+    layer). Each rank of a layer split maps the whole file and touches only its own blocks.
+    ``hot_per_layer``: rows ``[0, hot)`` of each block are the resident prefix (default: all).
+    """
+
+    def __init__(self, path: str, register: bool = True, layers=None, hot_per_layer: int | None = None):
         import torch
 
         # FREETOKEN_BANK_REGISTER: prefix (default) registers only the locked rows; "all"
@@ -280,7 +144,18 @@ class MappedBanks:
         if self.register_mode == "none":
             register = False
         self.path = path
-        self.layout = MappedBankLayout.read(path)
+        with BankFile.open(path, writable=False) as bank_file:
+            self.layout = bank_file.layout
+            present = set(bank_file.present_layers())
+        self.layers = sorted(present) if layers is None else [int(x) for x in layers]
+        absent = [x for x in self.layers if x not in present]
+        if absent:
+            raise BankFileError(f"{path}: layers {absent} are not committed in the file")
+        self.hot_per_layer = (
+            self.layout.num_experts if hot_per_layer is None
+            else max(0, min(int(hot_per_layer), self.layout.num_experts))
+        )
+        self.mapped_bytes = len(self.layers) * self.layout.layer_bytes()
         self._fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         self._libc = ctypes.CDLL("libc.so.6", use_errno=True) if os.name == "posix" else None
         self._buf = None
@@ -294,8 +169,15 @@ class MappedBanks:
             )
         self.private = self._pick_map_mode(register)
         self.probe_refused = self.private and self.map_mode == "auto"
+        if not self.layers:
+            raise BankFileError(f"{path}: no layers to map")
+        # Only this rank's layers, which the file keeps contiguous. A private mapping is charged
+        # against the commit limit for its whole length whether or not a page is ever copied, and
+        # the whole file is twice one rank's share on a two-rank split.
+        self._map_offset, map_end = self.layout.range_of(self.layers)
         self._map = mmap.mmap(
-            self._fd, 0, access=mmap.ACCESS_COPY if self.private else mmap.ACCESS_READ
+            self._fd, map_end - self._map_offset, offset=self._map_offset,
+            access=mmap.ACCESS_COPY if self.private else mmap.ACCESS_READ,
         )
         self._registered: list[int] = []
         self.hot_blocks = 0
@@ -306,7 +188,7 @@ class MappedBanks:
         self.whole_blocks = 0
         self.registered_bytes = 0
         self.sources: dict[str, list] = {}
-        # (offset, nbytes) of every block's file-backed remainder, in file order: what the
+        # (file offset, nbytes) of every block's file-backed remainder, in file order: what the
         # page cache may drop and --moe-bank-rewarm reads back (moe/bank_rewarm.py).
         self.cold_spans: list[tuple[int, int]] = []
         # FREETOKEN_BANK_PRELOAD: pull the non-resident rows into the page cache too. They
@@ -361,27 +243,29 @@ class MappedBanks:
         for name, row_shape, dtype_name, row_bytes in self.layout.banks:
             dtype = _dtype_of(dtype_name)
             per_layer = []
-            for layer in self.layout.layers:
+            for layer in self.layers:
                 off = self.layout.offset_of(name, layer)
+                rel = off - self._map_offset  # the mapping starts at this rank's first block
                 span = self.layout.num_experts * row_bytes
                 per_layer.append(
-                    buf[off:off + span].view(dtype).reshape(self.layout.num_experts, *row_shape)
+                    buf[rel:rel + span].view(dtype).reshape(self.layout.num_experts, *row_shape)
                 )
                 lock_rows = (
                     self.layout.num_experts
                     if self.register_mode == "all" or span <= _WHOLE_BLOCK_BYTES
-                    else self.layout.hot_per_layer
+                    else self.hot_per_layer
                 )
                 self.whole_blocks += span <= _WHOLE_BLOCK_BYTES
                 if span > lock_rows * row_bytes:
                     self.cold_spans.append(
                         (off + lock_rows * row_bytes, span - lock_rows * row_bytes)
                     )
-                self._settle(off, lock_rows * row_bytes, span, register)
-                self._advise(hint, off, span, len(self._map))
+                self._settle(rel, lock_rows * row_bytes, span, register)
+                self._advise(hint, rel, span, len(self._map))
                 if preload:
-                    self._touch(buf, off, span)
+                    self._touch(buf, rel, span)
             self.sources[name] = per_layer
+        self.cold_spans.sort()
         self.settle_seconds = time.perf_counter() - started
         self.preloaded = preload
 
@@ -477,7 +361,7 @@ class MappedBanks:
         # and the last page: hot_rows * row_bytes need not end on a page boundary
         buf[offset + nbytes - 1:offset + nbytes] |= 0
         try:
-            os.posix_fadvise(self._fd, offset, nbytes, os.POSIX_FADV_DONTNEED)
+            os.posix_fadvise(self._fd, self._map_offset + offset, nbytes, os.POSIX_FADV_DONTNEED)
         except (AttributeError, OSError):
             pass
 
@@ -594,7 +478,7 @@ class MappedBanks:
         limit = len(self._map)
         pages = present = 0
         for off, nbytes in self.cold_spans:
-            span = advise_range(off, nbytes, limit)
+            span = advise_range(off - self._map_offset, nbytes, limit)
             if span is None:
                 continue
             count = (span[1] + ALIGN - 1) // ALIGN
@@ -617,7 +501,8 @@ class MappedBanks:
         started = time.perf_counter()
         walked = 0
         for off, nbytes in self.cold_spans:
-            pos, end = off, off + nbytes
+            pos = off - self._map_offset
+            end = pos + nbytes
             while pos < end:
                 if cancel.is_set():
                     return walked, time.perf_counter() - started, False
@@ -649,54 +534,204 @@ class MappedBanks:
 
 
 class MappedTier:
-    """Assembles a ``--moe-bank-ram`` run: write the mapped bank, open it, hand over views.
+    """Assembles a ``--moe-bank-ram`` run for one rank: find, finish or write its layers, open them.
 
-    Attaches to the expert loader's per-layer sink. Writing per layer as the checkpoint
-    streams in is not an optimization: holding the full banks and a second copy at once needs
-    more RAM than the host that wants this feature has, so the overshoot has to stay at one
-    layer (~1.3 GiB for Flash-Next).
+    ``layers`` are this rank's global bank-layer ids; the loader's sink numbers them from zero.
 
-    When the file on disk already describes exactly this placement the write is skipped --
-    it is 31.7 GiB per rank, and a start that only changed the port should not pay it.
+    ``prepare`` runs before the loader and answers whether the loader needs to run at all:
+
+    * every layer committed -- in the wanted order, or reordered into it in place -- means the
+      checkpoint's expert tensors are never opened;
+    * otherwise the loader streams the checkpoint and ``sink`` writes the layers the file lacks.
+      Writing per layer as the checkpoint streams in is not an optimization: holding the full
+      banks and a second copy at once needs more RAM than the host that wants this feature has,
+      so the overshoot has to stay at one layer (~1.3 GiB for Flash-Next).
+
+    ``can_write`` False is a checkpoint without expert tensors (``ft bank pack``): a missing
+    layer, a missing file or a file for some other geometry is then an error that says so,
+    before anything is loaded.
+
+    ``wanted`` is the placement solved from ``--moe-bank-stats``; without one each layer keeps
+    the order already in the file, so a histogram only has to be passed when it changes.
     """
 
-    def __init__(self, placement, path: str, layers, log=None, warn=None):
-        self.placement = placement
+    def __init__(self, path: str, layers, *, num_experts: int, hot_per_layer: int,
+                 all_layers=None, wanted: dict | None = None, layout: MappedBankLayout | None = None,
+                 meta: dict | None = None, can_write: bool = True, log=None, warn=None):
         self.path = path
-        self.layers = list(layers)
+        self.layers = [int(x) for x in layers]
+        # every MoE layer of the model: the file's geometry, whichever of them this rank serves
+        self.all_layers = self.layers if all_layers is None else [int(x) for x in all_layers]
+        self.num_experts = int(num_experts)
+        self.hot_per_layer = int(hot_per_layer)
+        self.wanted = {int(k): [int(x) for x in v] for k, v in (wanted or {}).items()}
+        self.layout = layout
+        self.meta = dict(meta or {})
+        self.can_write = can_write
         self.log = log or (lambda _msg: None)
         self.warn = warn or self.log
-        self._writer: MappedBankWriter | None = None
-        self._layout: MappedBankLayout | None = None
-        self._reuse = False
+        self._file: BankFile | None = None
+        self._orders: dict[int, list[int]] = {}
+        self._committed: dict[int, list[int]] = {}
+        self._ready = False
         self._seen: set[int] = set()
         self._lock = threading.Lock()
+        self.reordered: list[int] = []
+        self.written: list[int] = []
         self.banks: MappedBanks | None = None
 
-    def _prepare(self, sample) -> None:
-        """Decide reuse-or-write on the first layer, when the bank shapes are finally known."""
-        layout = layout_from({k: [v] for k, v in sample.items()}, self.layers, self.placement)
-        self._layout = layout
-        try:
-            self._reuse = MappedBankLayout.read(self.path).same_as(layout)
-        except (OSError, ValueError):
-            self._reuse = False
-        if self._reuse:
-            self.log(f"--moe-bank-ram: reusing {self.path} (placement unchanged)")
-            return
+    # ----- what the file holds ------------------------------------------------------
+    @property
+    def placement(self):
+        from freetoken.moe.bank_disk import BankPlacement
+
+        return BankPlacement(self.num_experts, self.hot_per_layer, dict(self._orders))
+
+    @property
+    def ready(self) -> bool:
+        """True once ``prepare`` found every layer: the loader must not run."""
+        return self._ready
+
+    def _open(self, layout: MappedBankLayout) -> None:
+        """Open the file for this geometry, creating or (when allowed) starting it over."""
+        directory = os.path.dirname(os.path.abspath(self.path))
+        if self.can_write:
+            os.makedirs(directory, exist_ok=True)
+        with file_lock(self.path):
+            if os.path.exists(self.path):
+                try:
+                    existing = MappedBankLayout.read(self.path)
+                except ValueError as exc:
+                    existing, why = None, str(exc)
+                else:
+                    # a packed checkpoint has no expert shards to stamp: its fingerprint is
+                    # what ties it to the file
+                    why = existing.mismatch(layout, ignore=() if self.can_write else ("source_stamp",))
+                if why is None:
+                    # read-only is enough to serve; only a reorder or a journal needs to write
+                    self._file = BankFile.open(self.path, writable=os.access(self.path, os.W_OK))
+                    return
+                canonical = None
+                if existing is not None:
+                    with BankFile.open(self.path, writable=False) as other:
+                        canonical = other.canonical_for()
+                if canonical:
+                    raise BankFileError(
+                        f"--moe-bank-ram: {self.path} is the only copy of the experts of "
+                        f"{canonical}, and this run wants a different file ({why}). Serve that "
+                        f"checkpoint, or point --moe-bank-dir somewhere else"
+                    )
+                if not self.can_write:
+                    raise BankFileError(
+                        f"--moe-bank-ram: {self.path} does not match this run ({why}), and this "
+                        f"checkpoint has no expert tensors to write a new one from. The bank was "
+                        f"written for {self._describe(existing)}; this run binds "
+                        f"{self._describe(layout)}"
+                    )
+                self.log(f"--moe-bank-ram: {self.path} was written for a different run ({why}); starting it over")
+            elif not self.can_write:
+                raise BankFileError(
+                    f"--moe-bank-ram: no bank file at {self.path}, and this checkpoint has no expert "
+                    f"tensors (it was packed by `ft bank pack`); the bank file is the only copy of them"
+                )
+            self._file = BankFile.create(self.path, layout)
+
+    @staticmethod
+    def _describe(layout: MappedBankLayout | None) -> str:
+        if layout is None:
+            return "an unreadable geometry"
+        m = layout.meta
+        return f"{m.get('kind', '?')} / {m.get('kernel', '?')} experts"
+
+    def _plan(self, manifest) -> list[int]:
+        """Settle each layer's order; returns the layers the file does not hold."""
+        present = {}
+        for layer in self.layers:
+            state = self._file.layer_state(layer, manifest)
+            if state is not None:
+                present[layer] = state[0]
+        for layer in self.layers:
+            self._orders[layer] = (
+                self.wanted.get(layer) or present.get(layer) or list(range(self.num_experts))
+            )
+        self._committed = {l: o for l, o in present.items() if o == self._orders[l]}
+        return [l for l in self.layers if l not in present]
+
+    def prepare(self) -> bool:
+        """Before the loader: True when this rank's layers are all in the file (the loader is skipped).
+
+        Without a known geometry (a loader with no expert method) nothing can be decided before
+        the first layer, and this returns False.
+        """
+        if self.layout is None:
+            if not self.can_write:
+                raise BankFileError("--moe-bank-ram: the bank geometry is unknown before loading, so a "
+                                    "checkpoint without expert tensors cannot be served from it")
+            return False
+        self._open(self.layout)
+        self._file.recover_journals(self.layers, log=self.log)
+        manifest = self._file.manifest()
+        missing = self._plan(manifest)
+        gib = self.layout.layer_bytes() / 2**30
+        if missing:
+            if not self.can_write or self._file.canonical_for(manifest):
+                raise BankFileError(
+                    f"--moe-bank-ram: {self.path} has no layers {_ranges(missing)} of this rank's "
+                    f"{_ranges(self.layers)}, and {'this checkpoint has no expert tensors to write them from' if not self.can_write else 'it is the only copy of a packed checkpoint and is never written from one'}"
+                )
+            need = len(missing) * gib * 2**30
+            free = free_bytes(self.path)
+            if free is not None and need > free:
+                raise BankFileError(
+                    f"--moe-bank-ram: writing layers {_ranges(missing)} to {self.path} needs "
+                    f"{need / 2**30:.1f} GiB and the filesystem has {free / 2**30:.1f} GiB free"
+                )
+            self.log(
+                f"--moe-bank-ram: {self.path} lacks layers {_ranges(missing)}; reading the checkpoint's "
+                f"experts for layers {_ranges(self.layers)} and writing {len(missing) * gib:.1f} GiB "
+                f"({self.hot_per_layer}/{self.num_experts} experts resident per layer)"
+            )
+            return False
+        todo = [l for l in self.layers if l not in self._committed]
+        if todo:
+            free = free_bytes(self.path)
+            if free is not None and gib * 2**30 > free:
+                raise BankFileError(
+                    f"--moe-bank-ram: reordering {self.path} in place needs room for one layer's "
+                    f"journal ({gib:.1f} GiB) and the filesystem has {free / 2**30:.1f} GiB free"
+                )
+            self.log(
+                f"--moe-bank-ram: placement changed for layers {_ranges(todo)}; reordering "
+                f"{len(todo) * gib:.1f} GiB in place (one layer journaled at a time)"
+            )
+            started = time.perf_counter()
+            for layer in todo:
+                self._file.reorder_layer(layer, self._orders[layer])
+                self._file.drop_cache(layer)
+            self.reordered = todo
+            self.log(f"--moe-bank-ram: reordered {len(todo)} layers in {time.perf_counter() - started:.0f} s")
+        self._ready = True
         self.log(
-            f"--moe-bank-ram: writing {layout.total_bytes() / 2**30:.1f} GiB to {self.path} "
-            f"({layout.hot_per_layer}/{layout.num_experts} experts resident per layer)"
+            f"--moe-bank-ram: {self.path} holds layers {_ranges(self.layers)}; the checkpoint's "
+            f"expert tensors are not read"
         )
-        self._writer = MappedBankWriter(self.path, layout)
+        return True
 
     def sink(self, layer_id: int, banks) -> None:
-        """``layer_sink`` for the expert loader."""
+        """``layer_sink`` for the expert loader; ``layer_id`` counts from this rank's first layer."""
         with self._lock:
-            if self._layout is None:
-                self._prepare(banks)
-        if self._writer is not None:
-            self._writer.write_layer(layer_id, banks)
+            if self._file is None:
+                if self.layout is None:
+                    self.layout = layout_from_sample(banks, self.all_layers, self.num_experts, self.meta)
+                self._open(self.layout)
+                self._file.recover_journals(self.layers, log=self.log)
+                self._plan(self._file.manifest())
+        layer = self.layers[layer_id]
+        if self._committed.get(layer) != self._orders[layer]:
+            self._file.write_layer(layer, banks, self._orders[layer])
+            self._file.drop_cache(layer)
+            with self._lock:
+                self.written.append(layer)
         with self._lock:
             self._seen.add(layer_id)
         for bank in banks.values():
@@ -705,15 +740,18 @@ class MappedTier:
                 release()  # caps peak RAM at one layer's worth of the original banks
 
     def finish(self) -> None:
-        missing = [x for x in self.layers if x not in self._seen]
-        if missing:
-            raise RuntimeError(f"--moe-bank-ram: layers {missing} never reached the sink")
-        if self._writer is not None:
-            self._writer.close()
-            self._writer = None
-        self.log(f"--moe-bank-ram: source banks released, RSS now {_rss_gib():.1f} GiB")
+        if not self._ready:
+            missing = [x for x in range(len(self.layers)) if x not in self._seen]
+            if missing:
+                raise RuntimeError(f"--moe-bank-ram: layers {missing} never reached the sink")
+            if self.written:
+                self.log(f"--moe-bank-ram: wrote layers {_ranges(sorted(self.written))}")
+            self.log(f"--moe-bank-ram: source banks released, RSS now {_rss_gib():.1f} GiB")
+        if self._file is not None:
+            self._file.close()
+            self._file = None
         self.log("--moe-bank-ram: faulting in and locking the resident rows")
-        self.banks = MappedBanks(self.path)
+        self.banks = MappedBanks(self.path, layers=self.layers, hot_per_layer=self.hot_per_layer)
         b = self.banks
         if b.probe_refused:
             self.log(
@@ -745,7 +783,7 @@ class MappedTier:
             else:
                 self.log(note)
         self.log(
-            f"--moe-bank-ram: mapped {b.layout.total_bytes() / 2**30:.1f} GiB, "
+            f"--moe-bank-ram: mapped {b.mapped_bytes / 2**30:.1f} GiB, "
             f"{b.locked_bytes / 2**30:.1f} GiB locked resident, "
             f"{b.registered_bytes / 2**30:.1f} GiB registered for PCIe"
             + (", private pages" if b.private else ", shared page cache")
@@ -777,7 +815,6 @@ class MappedTier:
                 f"{b.requested_bytes / 2**30:.0f} GiB or lower --moe-bank-ram"
             )
 
-
     @property
     def sources(self) -> dict:
         assert self.banks is not None, "call finish() first"
@@ -787,8 +824,9 @@ class MappedTier:
         """Hand over the renumbering, and keep the GPU off the rows it cannot address."""
         from freetoken.moe.bank_disk import permutation_tensor
 
+        placement = self.placement
         perm = [
-            permutation_tensor(self.placement, layer, device=device) for layer in self.layers
+            permutation_tensor(placement, layer, device=device) for layer in self.layers
         ]
         # --spec-mtp appends the draft head's expert layer to the bank sources after the
         # placement was solved (engine._append_mtp_bank), so the cache can hold one layer
@@ -812,10 +850,10 @@ class MappedTier:
             # registered prefix ends lets the hybrid path keep its PCIe fetches inside it and
             # send the remaining misses to the CPU -- instead of the whole layer going to the
             # CPU, which is what LOCKED layers do and what costs the VRAM cache.
-            cache.prefix_pinned_rows = self.banks.layout.hot_per_layer
+            cache.prefix_pinned_rows = self.banks.hot_per_layer
             self.log(
                 f"--moe-bank-ram: PCIe fetches restricted to the resident "
-                f"{self.banks.layout.hot_per_layer}/{self.banks.layout.num_experts} experts "
+                f"{self.banks.hot_per_layer}/{self.banks.layout.num_experts} experts "
                 f"per layer; the rest decode on the CPU"
             )
             return
@@ -833,3 +871,19 @@ class MappedTier:
                 f"(was max_fetch={had[0]}, fraction={had[1]:.3f}); the GPU cannot address "
                 f"the non-resident rows"
             )
+
+
+def _ranges(ids) -> str:
+    """``[0, 1, 2, 5, 7, 8]`` -> ``"0-2, 5, 7-8"``: layer lists in messages stay one line."""
+    ids = sorted(int(x) for x in ids)
+    if not ids:
+        return "none"
+    out, start, prev = [], ids[0], ids[0]
+    for x in ids[1:]:
+        if x == prev + 1:
+            prev = x
+            continue
+        out.append(f"{start}-{prev}" if prev > start else f"{start}")
+        start = prev = x
+    out.append(f"{start}-{prev}" if prev > start else f"{start}")
+    return ", ".join(out)
