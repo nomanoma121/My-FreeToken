@@ -4,6 +4,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Deque, Final, List, Tuple
 
 import torch
+from freetoken.distributed.watchdog import rank_wait_watchdog
 from freetoken.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg
 from freetoken.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
 
@@ -123,8 +124,17 @@ class SchedulerIOMixin:
         # ensure all ranks have the same number of raw messages
         dst_length = self._await_msg_count()
 
-        for _ in range(dst_length):
-            pending_msgs.append(self._recv_from_rank0.get())
+        if dst_length:
+            # Rank 0 published these before its count, so each get() should return at once. PUB
+            # drops (does not block) for a subscriber past its high-water mark, and a dropped
+            # message leaves this rank here for good -- bracket it for the watchdog.
+            waits = rank_wait_watchdog()
+            for i in range(dst_length):
+                waits.begin("relayed request {detail} of this step from rank {peer}", 0, i + 1)
+                try:
+                    pending_msgs.append(self._recv_from_rank0.get())
+                finally:
+                    waits.end()
         return pending_msgs
 
     def _publish_msg_count(self, count: int) -> None:
@@ -150,12 +160,23 @@ class SchedulerIOMixin:
             self._pending_count_sends.append((count_t, work))
         while len(self._pending_count_sends) > _MAX_PENDING_COUNT_SENDS:
             _, oldest = self._pending_count_sends.popleft()
-            oldest.wait()
+            waits = rank_wait_watchdog()
+            waits.begin("another rank to take a message count sent {detail} sends ago", None,
+                        _MAX_PENDING_COUNT_SENDS)
+            try:
+                oldest.wait()
+            finally:
+                waits.end()
 
     def _await_msg_count(self) -> int:
         """Other ranks: this step's message count from rank 0 (blocks until rank 0 got there)."""
         buf = torch.tensor([-1], dtype=torch.int64)
-        self.tp_cpu_group.recv([buf], 0, _MSG_COUNT_TAG).wait()
+        waits = rank_wait_watchdog()
+        waits.begin("this step's message count from rank {peer}", 0)
+        try:
+            self.tp_cpu_group.recv([buf], 0, _MSG_COUNT_TAG).wait()
+        finally:
+            waits.end()
         return int(buf.item())
 
     def _reply_tokenizer_rank0(self, reply: List[BaseTokenizerMsg]) -> None:

@@ -12,6 +12,10 @@ chunk while the last rank is still computing this one. ``send_hidden`` blocks un
 posts its receive, which keeps the first rank at most one chunk ahead (and the single
 staging buffer safe). Hidden and token traffic use distinct gloo tags so the two directions
 never match each other's messages.
+
+Every send/recv here blocks without a timeout, and a peer that stopped leaves this rank inside
+one of them silently; each is bracketed for the rank-wait watchdog (distributed/watchdog), which
+logs the wait once it passes FREETOKEN_RANK_WAIT_WARN_SECONDS.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import torch
 import torch.distributed as dist
 
 from .info import PipelineInfo
+from .watchdog import rank_wait_watchdog
 
 # gloo has no int16/bf16 send path on every build; ship raw bytes instead
 _BYTE_VIEW = torch.uint8
@@ -36,6 +41,7 @@ class PipelineComm:
         self.hidden_width: int | None = None
         self.hidden_dtype: torch.dtype | None = None
         self._stage: dict[str, torch.Tensor] = {}
+        self._waits = rank_wait_watchdog()
 
     @property
     def is_first(self) -> bool:
@@ -66,14 +72,27 @@ class PipelineComm:
         flat = hidden.contiguous().view(-1).view(_BYTE_VIEW)
         buf = self._staging("send", flat.numel())
         buf.copy_(flat)  # synchronous D2H: the send below reads it on the host
-        dist.send(buf, dst=self.info.rank + 1, group=self.group, tag=_TAG_HIDDEN)
+        dst = self.info.rank + 1
+        # returns once the peer posts its recv, i.e. after it finishes its previous forward
+        self._waits.begin(
+            "rank {peer} to take the hidden states ({detail} rows)", dst, hidden.shape[0]
+        )
+        try:
+            dist.send(buf, dst=dst, group=self.group, tag=_TAG_HIDDEN)
+        finally:
+            self._waits.end()
 
     def recv_hidden(self, rows: int) -> torch.Tensor:
         assert not self.is_first
         assert self.hidden_width is not None and self.hidden_dtype is not None, "configure() first"
         nbytes = rows * self.hidden_width * self.hidden_dtype.itemsize
         buf = self._staging("recv", nbytes)
-        dist.recv(buf, src=self.info.rank - 1, group=self.group, tag=_TAG_HIDDEN)
+        src = self.info.rank - 1
+        self._waits.begin("the hidden states ({detail} rows) from rank {peer}", src, rows)
+        try:
+            dist.recv(buf, src=src, group=self.group, tag=_TAG_HIDDEN)
+        finally:
+            self._waits.end()
         # synchronous H2D so the staging buffer can be reused by the next recv
         return buf.to(self.device).view(self.hidden_dtype).view(rows, self.hidden_width)
 
@@ -82,12 +101,23 @@ class PipelineComm:
         assert self.is_last
         tokens_cpu = tokens_cpu.to(torch.int32).contiguous()
         for dst in range(self.info.size - 1):
-            dist.send(tokens_cpu, dst=dst, group=self.group, tag=_TAG_TOKENS)
+            self._waits.begin(
+                "rank {peer} to take the sampled tokens ({detail})", dst, tokens_cpu.numel()
+            )
+            try:
+                dist.send(tokens_cpu, dst=dst, group=self.group, tag=_TAG_TOKENS)
+            finally:
+                self._waits.end()
 
     def recv_tokens(self, count: int) -> torch.Tensor:
         assert not self.is_last
         buf = torch.empty(count, dtype=torch.int32)
-        dist.recv(buf, src=self.info.size - 1, group=self.group, tag=_TAG_TOKENS)
+        src = self.info.size - 1
+        self._waits.begin("the sampled tokens ({detail}) from rank {peer}", src, count)
+        try:
+            dist.recv(buf, src=src, group=self.group, tag=_TAG_TOKENS)
+        finally:
+            self._waits.end()
         return buf
 
 

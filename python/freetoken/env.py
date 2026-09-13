@@ -75,9 +75,12 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
-    # Stall diagnostic, in seconds (<= 0 turns it off): the head of the prefill queue has been
-    # refused this long. Repeats every max(threshold, 60 s) while the condition lasts.
+    # Stall diagnostics, in seconds (<= 0 turns one off). ADMISSION: the head of the prefill
+    # queue has been refused this long. RANK_WAIT: a gloo send/recv between ranks has blocked
+    # this long -- keep it above the longest prefill chunk, which the other rank may be running.
+    # Both repeat every max(threshold, 60 s) while the condition lasts.
     ADMISSION_WARN_SECONDS = EnvFloat(30.0)
+    RANK_WAIT_WARN_SECONDS = EnvFloat(60.0)
 
     def __new__(cls):
         # single instance
