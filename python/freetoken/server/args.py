@@ -652,9 +652,10 @@ def parse_args(
             "prefix reuse, per running request, on top of the 4 slots each request needs to "
             "run (floor 4). A prefix can only be resumed from a live snapshot, so this -- not "
             "the KV budget -- bounds how many conversations stay reusable: at the default 2.0 "
-            "with --max-running-req 1 that is 4, and switching between more conversations "
-            "re-prefills them. Each slot is one GDN state in VRAM (every GDN layer's "
-            "recurrent + conv state; about 62 MiB for a 30-GDN-layer model)."
+            "with --max-running-req 1 the cache holds 4 snapshots, and switching between more "
+            "conversations than that re-prefills them. How many snapshots a conversation "
+            "costs is per model; see docs/prefix-reuse.md. Each slot is one GDN state in VRAM "
+            "(every GDN layer's recurrent + conv state; about 62 MiB for 30 GDN layers)."
         ),
     )
     parser.add_argument(
