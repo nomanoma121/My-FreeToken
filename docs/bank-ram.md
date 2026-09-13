@@ -56,8 +56,9 @@ nothing else about the run:
 - **The row order is per layer and can change in place.** A start with a different
   `--moe-bank-stats` reorders the layers whose order changed, one layer at a time, without
   reading the checkpoint. A layer's old bytes go to a journal next to the file first
-  (`bank.ftmb.journal.L<n>`, one layer's worth of disk), and the next start finishes or rolls
-  back a reorder that was interrupted. A start *without* `--moe-bank-stats` keeps the order that
+  (`bank.ftmb.journal.L<n>`, one layer's worth of disk at a time), and the next start finishes or
+  rolls back a reorder that was interrupted. Every reordered byte is therefore written twice:
+  measured on an RTX 2060 with Ornith, 19 layers (8.0 GiB) took 123 s and 16 GiB of writes. A start *without* `--moe-bank-stats` keeps the order that
   is already in the file.
 - **A layer exists once it is committed**: blocks written and synced, then a manifest inside the
   file names the layer with its order and a SHA-256 per block. A start killed while writing
@@ -403,14 +404,31 @@ the server); the pack record is about the bytes of each expert, not where their 
 stays valid.
 
 What to keep in mind: **the bank file is now the only copy of the experts.** Back it up if the
-original is not kept anywhere else, and do not point a cache cleaner at it. `ft bank pack` needs
-free disk for the rewritten shards (the dry run prints how much) and reads the experts and the
-bank once each. It holds a few layers' worth of rows in RAM at a time -- about 5 GiB for
-Flash-Next by arithmetic.
+original is not kept anywhere else, and do not point a cache cleaner at it.
 
-So far `ft bank pack`, `verify` and `unpack` have run on the small synthetic NVFP4 and gpt-oss
-checkpoints of the test suite only; none of the timings or sizes above for real checkpoints has
-been measured.
+**Disk these steps write**, before you start one:
+
+| step | writes | Ornith-1.5-35B-A3B on an RTX 2060 host (16.9 GiB of experts) |
+|---|---|---|
+| first start with `--moe-bank-ram` | the whole bank file | 16.9 GiB, 74 s |
+| a new `--moe-bank-stats` | twice the reordered layers (journal, then in place) | 19 layers: 16 GiB, 123 s |
+| `ft bank pack` | the shards that mix dense and expert tensors, rewritten (the dry run prints it); nothing for hard-linked ones | 3 shards rewritten, 4.9 GiB; 129 s, 3.7 GiB peak RSS |
+| `ft bank verify` | nothing | 42 s |
+| `ft bank unpack` | the whole original checkpoint, less what can be hard-linked | up to the checkpoint's size (22 GiB here) |
+
+Measure the free space where the files actually land. **Under WSL2, `df` inside the distribution
+reports the virtual disk's own capacity, not the space left on the Windows drive that holds it**
+-- a 1 TB virtual disk said 855 GiB free while the drive under it ran out. Check the host
+drive (`df -h /mnt/c`, or Explorer). And the virtual disk grows as files are written but does not
+shrink when they are deleted: a reorder, a pack and an unpack in a row each take their share of the
+host drive for good, until the disk is compacted. When the host drive fills, the distribution
+stops and will not start until space is freed there.
+
+`pack` and `verify` have run on Ornith on an RTX 2060 host: the packed checkpoint served the same
+text at temperature 0 as the original. `unpack` has run on the synthetic checkpoints of the test
+suite only -- the run on Ornith was cut short by the full host drive above. Nothing has run on
+Flash-Next or gpt-oss-120b yet; the RAM figure for Flash-Next (a few layers' rows, about 5 GiB) is
+arithmetic.
 
 ### 6. Experimental: ask for the rows each step routes to (`--moe-bank-prefetch`)
 
