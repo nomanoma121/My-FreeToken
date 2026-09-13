@@ -177,28 +177,58 @@ native Linux, both of which affect this feature:
 
 ## Where it applies
 
-Only to models whose KV lives in the plain paged pool (`MHAKVCache`) or the Flash-Next pool
-(`QSAKVCache`), served by an attention backend that knows the layout — `triton` or
-`qsa_sparse`. Everything else is **refused at startup**, with a message naming the
-reason — a quantized slab read by code that does not know the layout returns plausible wrong
-numbers rather than an error, so none of these are left to chance.
+Only to models whose KV lives in the plain paged pool (`MHAKVCache`), the Flash-Next pool
+(`QSAKVCache`) or — for gpt-oss — the hybrid full/sliding-window pool (`HybridSWAKVCache`),
+served by an attention backend that knows the layout — `triton` or `qsa_sparse`. Everything
+else is **refused at startup**, with a message naming the reason — a quantized slab read by
+code that does not know the layout returns plausible wrong numbers rather than an error, so
+none of these are left to chance.
 
 | Model | Attention | KV pool | `--kv-cache-dtype` |
 |---|---|---|---|
 | Qwen3.5-MoE family (Ornith-1.5-35B-A3B, Qwen3.6-35B-A3B) | full | `MHAKVCache` | **supported** (measured) |
-| Qwen3 / Qwen2 dense, Llama, Mistral | full | `MHAKVCache` | supported (untested) |
+| Qwen3 / Qwen2 dense, Qwen3-MoE, Llama, Mistral, MiniMax-M2, GLM-4-MoE | full | `MHAKVCache` | supported (untested) |
 | **Qwen3.8-Flash-Next** | QSA (compressed-block sparse) | `QSAKVCache` | **supported** (measured; the case it suits best) |
-| gpt-oss-20b / gpt-oss-120b | full + sliding window | `HybridSWAKVCache` | refused |
-| GLM-5.3-Flash | DSA | `KpoolDSAKVCache` | refused |
+| gpt-oss-20b / gpt-oss-120b | full + sliding window, attention sinks | `HybridSWAKVCache` | **`q8_0` supported** (checked on an RTX 2060); **`q4_0` breaks its answers** |
+| Gemma 4, MuseGlimmer | full + sliding window | `HybridSWAKVCache` | refused |
+| GLM-5.3-Flash, GLM-MoE-DSA | DSA | `KpoolDSAKVCache` / `DSAKVCache` | refused |
 | DeepSeek-V4-Flash | DSV4 | `DSV4PagedKVCache` | refused |
 | MiniMax-M3 | BSA | `BSAKVCache` | refused |
 | MLA checkpoints | latent KV | `MLAKVCache` | refused |
 
-The refused families keep secondary tiers next to the paged slab — an SWA window pool, a
-latent KV — which stay 16-bit and are read by their own kernels. Supporting them is
-per-family work, not a flag.
+The refused families keep secondary tiers next to the paged slab — an index slab, a latent
+KV — which stay 16-bit and are read by their own kernels. Supporting them is per-family work,
+not a flag.
 
-QSA has such tiers too (the compressed index slab, the pending ring, the scratch rows) and
+**gpt-oss** quantizes both of its groups: the full-attention layers' paged slab and the
+sliding-window layers' window pool. The two cannot be split — the Triton backend reads one
+layout off the pool for every layer — and the Triton kernels already apply the window and
+the attention sinks while reading codes. Gemma 4 and MuseGlimmer build the same pool but
+bring their own attention geometry (per-group head_dim, K == V groups), which has not been
+checked against quantized slabs, so they stay refused.
+
+**On gpt-oss, use `q8_0`.** Checked on an RTX 2060 with gpt-oss-20b, all three at the same
+`--memory-ratio`, with `--kv-reserve-tokens` raised to what each one fits:
+
+| KV | tokens that fit | KV VRAM | answers (arithmetic, Japanese, code, a fact in the middle of a long document) |
+|---|---|---|---|
+| 16-bit | 7,130 | 0.21 GiB | all correct |
+| `q8_0` | 12,760 | 0.19 GiB | all correct; a 30-minute soak ran clean |
+| `q4_0` | 22,347 | 0.18 GiB | **all wrong**: the reasoning loops until `max_tokens` and no answer comes out |
+
+The `q4_0` failure is the format, not the implementation: the model-side path is identical
+to `q8_0`'s, and the 4-bit unpack matches a dequantized oracle with the window and the sinks
+applied. Ornith kept its answers at `q4_0`; gpt-oss does not.
+What it looks like from a chat client: a long wait, then an empty or cut-off reply (the
+reasoning used up `max_tokens`). It did not always happen -- the Japanese question came back
+right when asked again on its own -- so one good answer does not clear `q4_0`.
+
+As arithmetic, gpt-oss-120b's KV at 128k goes from 5.4 GiB to 2.9 GiB at `q8_0` (not measured
+on that model yet). Speed was not measured either. Decode should slow with context the way it does on Ornith (half of gpt-oss's layers read the
+whole context every step), and prefill should not speed up: calls with a sliding window or
+sinks never take the cuBLAS prefill path that makes `q8_0` fast on Ornith.
+
+QSA has secondary tiers too (the compressed index slab, the pending ring, the scratch rows) and
 they stay 16-bit here as well; what made it worth doing anyway is the next section.
 
 **Shared memory, on Flash-Next**: `q8_0` makes the sparse-attention tile ask for 104 KiB of
@@ -206,12 +236,15 @@ shared memory per block in its prefill profile, and a GA10x card has 99. The ker
 its pipelining there (`num_stages` 2 -> 1, the tile width unchanged) and logs the profile it
 settled on, once per shape.
 
-**Backend**: two backends read the code slabs — `triton` for the plain paged pool, and
-`qsa_sparse` for Flash-Next. Which one you need is decided by the checkpoint, not by you:
+**Backend**: two backends read the code slabs — `triton` for the plain paged pool and
+gpt-oss, and `qsa_sparse` for Flash-Next. Which one you need is decided by the checkpoint,
+not by you:
 
 - **Flash-Next** resolves to `qsa_sparse` on its own and there is nothing to pass. It
   *cannot* run on `triton`, which serves full and sliding-window attention but not QSA — so
   the two are not interchangeable, and asking for Triton here is an error.
+- **gpt-oss** resolves to `triton` on its own on every card, because nothing else serves
+  sliding-window attention. There is nothing to pass here either.
 - **Everything else** wants `--attention-backend triton` spelled out, because `auto` picks
   Triton on Turing but flashinfer on sm_80 and newer:
 

@@ -38,9 +38,10 @@ The fork adds nine things upstream does not have:
    context reaches ~30k. **Not on Flash-Next**, whose attention reads a fixed token budget
    regardless of context: measured on two RTX 3060s, `q4_0` decode runs 18.47 tok/s at 8k and
    18.21 at 125k (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank and the expert
-   slots go 1180 to 1598. Plain paged-attention models on the Triton backend and Flash-Next
-   on `qsa_sparse`; gpt-oss (sliding window), GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3
-   and MLA checkpoints are refused at startup. See
+   slots go 1180 to 1598. Plain paged-attention models on the Triton backend, Flash-Next
+   on `qsa_sparse`, and gpt-oss at `q8_0` (window pool included; `q4_0` breaks its answers); Gemma 4,
+   MuseGlimmer, GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3 and MLA checkpoints are refused
+   at startup. See
    [kv-cache-quant.md](kv-cache-quant.md), and [vram-and-speed.md](vram-and-speed.md) for why
    the VRAM it frees did not make this machine faster -- and how to tell whether it would
    make yours faster.
@@ -360,8 +361,10 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
   head_dim 256.
 - `--kv-cache-dtype` covers the plain paged KV pool (Triton backend; `auto` picks flashinfer
   on sm_80+, so ask for Triton explicitly there) and Flash-Next's `QSAKVCache` (its own
-  `qsa_sparse` backend, which resolves by itself and cannot be swapped for Triton). The SWA
-  window pool, the DSA index tiers and MLA latents are still 16-bit, so gpt-oss,
+  `qsa_sparse` backend, which resolves by itself and cannot be swapped for Triton) and
+  gpt-oss's `HybridSWAKVCache`, both groups (Triton, which every sliding-window model resolves
+  to by itself). Gemma 4 and MuseGlimmer build that same pool but are refused until their
+  attention geometry is checked. The DSA index tiers and MLA latents are still 16-bit, so
   GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3 and MLA checkpoints are refused. Flash-Next's
   own index tiers stay 16-bit too, but only its paged K/V is quantized, so it is supported.
   `q4_0` has not been measured on a benchmark suite.
