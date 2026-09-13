@@ -644,6 +644,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=float,
+        default=ServerArgs.linear_state_cache_ratio,
+        help=(
+            "Hybrid GDN models (Qwen3.5-MoE, Qwen3.8-Flash-Next): GDN-state snapshots kept for "
+            "prefix reuse, per running request, on top of the 4 slots each request needs to "
+            "run (floor 4). A prefix can only be resumed from a live snapshot, so this -- not "
+            "the KV budget -- bounds how many conversations stay reusable: at the default 2.0 "
+            "with --max-running-req 1 that is 4, and switching between more conversations "
+            "re-prefills them. Each slot is one GDN state in VRAM (every GDN layer's "
+            "recurrent + conv state; about 62 MiB for a 30-GDN-layer model)."
+        ),
+    )
+    parser.add_argument(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
