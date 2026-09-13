@@ -45,7 +45,7 @@ def test_auto_without_the_flag_is_untouched(monkeypatch):
     assert config.attention_backend == "fa,fi"
 
 
-@pytest.mark.parametrize("kind", ["swa", "bsa", "mla"])
+@pytest.mark.parametrize("kind", ["bsa", "mla"])
 def test_other_pool_families_are_refused_when_the_pool_is_built(kind):
     """The backend gate fires first for these, so the pool gate is checked directly."""
     from freetoken.kvcache import create_kvcache_pool
@@ -61,6 +61,54 @@ def test_other_pool_families_are_refused_when_the_pool_is_built(kind):
             device=torch.device("cpu"),
             kv_quant=Q4_0,
         )
+
+
+def test_a_sliding_window_model_other_than_gpt_oss_is_refused():
+    """Gemma 4 and MuseGlimmer build the same HybridSWAKVCache; only gpt-oss is enabled."""
+    from freetoken.kvcache import create_kvcache_pool
+    from freetoken.kvcache.kv_quant import Q4_0
+    from tests.engine.test_attention_backend_matrix import _model_config
+
+    mc = _model_config("swa")
+    mc.model_type = "gemma4"
+    with pytest.raises(ValueError, match="only enabled for gpt_oss"):
+        create_kvcache_pool(
+            model_config=mc,
+            num_pages=8,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            kv_quant=Q4_0,
+        )
+
+
+def test_gpt_oss_with_a_head_dim_the_block_does_not_divide_is_refused():
+    from freetoken.kvcache import create_kvcache_pool
+    from freetoken.kvcache.kv_quant import Q4_0
+    from tests.kvcache.test_hybrid_swa_kv_quant import _gpt_oss_model_config
+
+    with pytest.raises(ValueError, match="not a multiple"):
+        create_kvcache_pool(
+            model_config=_gpt_oss_model_config(head_dim=100),
+            num_pages=8,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            kv_quant=Q4_0,
+        )
+
+
+@pytest.mark.parametrize("dtype_name", ["q8_0", "q4_0"])
+def test_a_sliding_window_model_resolves_to_triton_and_keeps_the_flag(monkeypatch, dtype_name):
+    """SWA resolves auto to triton on every card (nothing else serves it), so gpt-oss needs
+    no --attention-backend on Ampere either -- unlike the plain paged models above."""
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)  # sm90, where a FULL-only model would get "fa,fi"
+    config = _config("swa", attention_backend="auto", kv_cache_dtype=dtype_name)
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
+    assert config.kv_cache_dtype == dtype_name
 
 
 def test_a_head_dim_the_block_does_not_divide_is_refused():
