@@ -40,6 +40,31 @@ DSV4_SPECIAL_TOKENS: List[str] = [
     THINK_END_TOKEN,
 ]
 
+# Qwen (2.5 / 3 / 3.5 / 4-exp) transport and multimodal-placeholder special tokens.
+# Same decode path as above: a generated <|im_end|> (ignore_eos, or a stop past the
+# turn), <|endoftext|>, or a vision/audio placeholder lands in the text verbatim.
+# None of them carries meaning in model output. Deliberately absent: <think>,
+# </think>, <tool_call>, </tool_call> (parser tags, and literal text when the
+# matching parser is off), the grounding markers (<|object_ref_*|>, <|box_*|>,
+# <|quad_*|>) and the FIM / repo markers, which are output a client may want.
+QWEN_SPECIAL_TOKENS: List[str] = [
+    "<|endoftext|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+    "<|audio_start|>",
+    "<|audio_end|>",
+    "<|audio_pad|>",
+    "<tts_pad>",
+    "<tts_text_bos>",
+    "<tts_text_eod>",
+    "<tts_text_bos_single>",
+]
+
 
 def strip_special_tokens(text: str, tokens: List[str]) -> str:
     """Remove special-token strings that leaked through the decode.

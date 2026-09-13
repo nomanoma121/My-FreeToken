@@ -4,6 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken.message import TokenizeMsg, UserReply
@@ -590,6 +591,154 @@ def test_dsv4_stream_emits_reasoning_then_tool_calls():
         if choice.get("finish_reason")
     ]
     assert finish_reasons == ["tool_calls"]
+
+
+# --------------------------------------------------------------- qwen special tokens
+from freetoken.server.generation import _leaked_special_tokens  # noqa: E402
+from freetoken.server.reasoning_parser import QWEN_SPECIAL_TOKENS  # noqa: E402
+
+_QWEN_TOOL_BLOCK = (
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+    "</function>\n</tool_call>"
+)
+
+
+def _stream_text(events, key):
+    return "".join(
+        choice["delta"][key]
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        if choice.get("delta", {}).get(key)
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_call_parser", "reasoning_parser", "expected"),
+    [
+        ("deepseekv32", "deepseekv32", "dsv4"),
+        ("qwen3_coder", "qwen3", "qwen"),
+        ("qwen25", None, "qwen"),  # reasoning parser turned off
+        ("llama3", "qwen3", "qwen"),  # tool parser overridden
+        ("gpt_oss", "gpt_oss", "none"),  # Harmony tokens are parsed, never stripped
+        ("llama3", None, "none"),
+        ("glm47", "glm", "none"),
+    ],
+)
+def test_leaked_special_tokens_selected_per_family(tool_call_parser, reasoning_parser, expected):
+    state = FakeState([], tool_call_parser=tool_call_parser, reasoning_parser=reasoning_parser)
+    tokens = _leaked_special_tokens(state)
+    if expected == "dsv4":
+        assert "<｜end▁of▁sentence｜>" in tokens
+    elif expected == "qwen":
+        assert tokens == QWEN_SPECIAL_TOKENS
+    else:
+        assert tokens == []
+
+
+def test_qwen_special_token_list_keeps_parser_markers():
+    for marker in ("<think>", "</think>", "<tool_call>", "</tool_call>", "<|box_start|>"):
+        assert marker not in QWEN_SPECIAL_TOKENS
+
+
+def test_qwen_non_stream_strips_leaked_special_tokens():
+    # ignore_eos-style run-on: the turn end and the next turn's header leak after
+    # the tool call, and a vision placeholder leaks into reasoning and content.
+    output = (
+        f"Need<|vision_pad|> the weather.</think>Checking<|image_pad|>.\n\n{_QWEN_TOOL_BLOCK}"
+        "<|im_end|>\n<|im_start|>assistant<|endoftext|>"
+    )
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=output, finished=True)],
+        tool_call_parser="qwen3_coder",
+        reasoning_parser="qwen3",
+    )
+
+    response = run(handle_chat_completion(chat_request(), request=None, state=state, model_sampling={}))
+
+    message = response["choices"][0]["message"]
+    assert message["reasoning_content"] == "Need the weather."
+    assert message["content"].startswith("Checking.")
+    for token in QWEN_SPECIAL_TOKENS:
+        assert token not in message["content"]
+    tool_call = message["tool_calls"][0]
+    assert tool_call["function"]["name"] == "get_weather"
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": "Paris"}
+
+
+def test_qwen_stream_strips_leaked_special_tokens():
+    chunks = [
+        "Need", "<|vision_pad|>", " the weather.", "</think>", "Checking", "<|image_pad|>", ".",
+        "\n\n", "<tool_call>", "\n<function=get_weather>\n", "<parameter=city>\nParis\n",
+        "</parameter>\n</function>\n", "</tool_call>", "<|im_end|>", "\n", "<|im_start|>",
+        "assistant", "<|endoftext|>",
+    ]
+    replies = [
+        UserReply(uid=42, incremental_output=c, finished=(i == len(chunks) - 1))
+        for i, c in enumerate(chunks)
+    ]
+    state = FakeState(replies, tool_call_parser="qwen3_coder", reasoning_parser="qwen3")
+
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, chat_request(stream=True), state))))
+
+    assert _stream_text(events, "reasoning_content") == "Need the weather."
+    content = _stream_text(events, "content")
+    assert content.startswith("Checking.")
+    for token in QWEN_SPECIAL_TOKENS:
+        assert token not in content
+    names = [
+        tc["function"]["name"]
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        for tc in choice.get("delta", {}).get("tool_calls", [])
+        if tc.get("function", {}).get("name")
+    ]
+    assert names == ["get_weather"]
+
+
+def test_qwen_stream_bare_special_token_emits_no_empty_delta():
+    chunks = ["Hi.", "<|im_end|>", "\n", "<|im_start|>", "user", "<|endoftext|>"]
+    replies = [
+        UserReply(uid=42, incremental_output=c, finished=(i == len(chunks) - 1))
+        for i, c in enumerate(chunks)
+    ]
+    state = FakeState(replies, tool_call_parser="qwen3_coder", reasoning_parser=None)
+    req = ChatCompletionRequest(
+        model="client-model", messages=[{"role": "user", "content": "hi"}], stream=True, max_tokens=8
+    )
+
+    events = parse_sse(run(_collect(stream_chat_completion_chunks(42, req, state))))
+
+    deltas = [
+        choice["delta"]["content"]
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        if "content" in choice.get("delta", {}) and "role" not in choice["delta"]
+    ]
+    assert "".join(deltas) == "Hi.\nuser"
+    assert "" not in deltas
+
+
+def test_qwen_strip_keeps_think_and_tool_call_text_when_parsers_do_not_consume_them():
+    # No tools and no reasoning parser: the tags are literal output and must survive.
+    output = "a </think> b <tool_call> c <|box_start|>(1,2)<|box_end|><|im_end|>"
+    state = FakeState(
+        [UserReply(uid=42, incremental_output=output, finished=True)],
+        tool_call_parser="qwen3_coder",
+        reasoning_parser=None,
+    )
+    req = ChatCompletionRequest(
+        model="client-model", messages=[{"role": "user", "content": "hi"}], max_tokens=8
+    )
+
+    response = run(handle_chat_completion(req, request=None, state=state, model_sampling={}))
+
+    assert (
+        response["choices"][0]["message"]["content"]
+        == "a </think> b <tool_call> c <|box_start|>(1,2)<|box_end|>"
+    )
 
 
 # --------------------------------------------------------------- gpt-oss harmony
