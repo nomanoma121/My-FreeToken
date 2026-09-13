@@ -701,3 +701,38 @@ def test_trailing_text_parity_with_non_stream(family):
 
     assert norm(_content(events)) == norm(full.content)
     assert [c.name for c in _calls(events)] == [c.name for c in full.tool_calls] == ["read"]
+
+
+# --------------------------------------------------------------------------- #
+# qwen3_coder + qwen3 reasoning: Hermes JSON body and leaked special tokens
+# --------------------------------------------------------------------------- #
+_QWEN_JSON_BLOCK = '<tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}\n</tool_call>'
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_qwen35_json_tool_call_streams_like_non_stream(seed):
+    text = f"{THINKING}</think>{ANSWER}\n\n{_QWEN_JSON_BLOCK}"
+    # A special token is one token, so it arrives as its own delta (never split).
+    events = _stream_events(
+        _random_chunks(text, seed) + ["<|im_end|>"], "qwen3_coder", reasoning="qwen3"
+    )
+    _assert_stream_invariants(events, "qwen3_coder")
+    full = _full_result(text + "<|im_end|>", "qwen3_coder", reasoning="qwen3")
+
+    stream_calls = [(c.name, json.loads(c.parameters)) for c in _calls(events)]
+    full_calls = [(c.name, json.loads(c.parameters)) for c in full.tool_calls]
+    assert stream_calls == full_calls == [("read", READ_ARGS)]
+    assert events[-1].finish_reason == full.finish_reason == "tool_calls"
+    assert _reasoning(events) == full.reasoning == THINKING
+    assert _content(events).strip() == full.content == ANSWER
+
+
+def test_qwen35_invalid_json_tool_call_is_content_in_both_paths():
+    block = '<tool_call>\n{"name": "read", "arguments": {"filePath": }\n</tool_call>'
+    text = f"{THINKING}</think>{ANSWER}\n\n{block}"
+    events = _stream_events(_random_chunks(text, 9), "qwen3_coder", reasoning="qwen3")
+    full = _full_result(text, "qwen3_coder", reasoning="qwen3")
+
+    assert _calls(events) == [] and full.tool_calls == []
+    assert events[-1].finish_reason == full.finish_reason == "stop"
+    assert _content(events) == full.content == f"{ANSWER}\n\n{block}"
