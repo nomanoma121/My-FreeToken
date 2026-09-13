@@ -195,6 +195,61 @@ echo 256 > /sys/block/$B/queue/read_ahead_kb
 The startup line names the value and the file it came from, and complains when the window is
 wider than the widest block. Being under that threshold does not mean it is optimal -- measure.
 
+### 4. Optional: read the cold rows back while idle (`--moe-bank-rewarm`)
+
+The non-resident rows are ordinary page cache, and anything may take it: another process that
+needs memory for a while, a large build, or WSL2 with `autoMemoryReclaim=gradual`, which hands
+file cache back to Windows while the VM is quiet. The server keeps working. The next request
+pays for every page it touches, one fault at a time -- and the request that meets it is usually
+the next turn of a conversation, after a pause.
+
+```bash
+ft serve ... --moe-bank-ram 48G --moe-bank-rewarm 5
+```
+
+Once the scheduler has been idle for that many seconds, each rank checks how much of its own
+bank's non-resident rows the page cache still holds (`mincore` on its mapping). Below 95% it
+reads them back in file order, 64 MiB at a time, and stops at the next step boundary when a
+request arrives; that request then pays only for what was not read yet. If a complete pass ends
+with *less* cached than it started with, something is still pressing on memory and reading
+again would only fight it, so the next check waits four times longer, up to ten minutes.
+
+```
+--moe-bank-rewarm: cold rows were 36% in page cache; walked 7.7 GiB of them in 11.6 s -> 92%
+--moe-bank-rewarm: cold rows were 92% in page cache; walked 7.7 GiB of them in 8.0 s -> 100%
+--moe-bank-rewarm: cold rows were 66% in page cache; walked 7.7 GiB of them in 9.1 s -> 60%
+--moe-bank-rewarm: memory is still under pressure; next check in 20 s
+```
+
+Measured by taking the page cache away on purpose: allocate and touch anonymous memory up to
+6 GiB short of `MemAvailable`, hold it 8 s, release it, wait, then send a prompt that the prefix
+cache cannot answer. Time to first token:
+
+| | warm | right after, without | right after, with `--moe-bank-rewarm 5` |
+|---|---|---|---|
+| RTX 2060, Ornith-1.5-35B-A3B, `--moe-bank-ram 6G` (16.9 GiB of banks), 45 s idle: short prompt | 1.0 s | **30.9 s** | **3.1 s** |
+| same, ~2k-token prompt | 3.9 s | 13.5 s | 9.4 s |
+| 2x RTX 3060, Qwen3.8-Flash-Next, `--pp-size 2 --moe-bank-ram 48G` (63.5 GiB), 90 s idle: short prompt | 3.0 s | **16.2 s** | **5.8 s** |
+| same, ~2k-token prompt | 9.2 s | 12.6 s | 10.7 s |
+
+Without the flag, the cold rows were still out of the cache after the idle wait (36% on the 2060,
+76-80% of the whole bank on the 3060s); with it, back at 100% on every rank. The 3060 figures
+come from the 128 GB host without the balloon described above.
+
+**The short prompt is the one that suffers.** A long prompt's prefill streams whole layers, so
+its faults are sequential and readahead covers them. A short one is prefilled and decoded on the
+CPU executor, which touches expert rows out of order: 4 KiB random faults.
+
+The flag does not bring the warm figures all the way back. Part of what is left on the long
+prompts is the server's own memory: the pressure before those runs also pushed 2.4 GiB (2060)
+and 4.7 GiB (3060) of it into swap, and this flag only deals with the bank's page cache. The
+2-3 s left on the short prompts had almost no swap behind it and is not explained.
+
+It is off by default because it reads the disk while nothing is running: 7.7 GiB per rank took
+1-12 s per pass on the Gen4 NVMe above. 5 s is the only delay that was measured. How fast
+`autoMemoryReclaim` actually empties the cache on its own was not measured either -- the
+pressure here was made by hand.
+
 ## Measured
 
 Two RTX 3060 12 GB, a Core i5-12600KF, 128 GB of DDR5-4000, a Gen4 NVMe on the CPU-direct M.2,

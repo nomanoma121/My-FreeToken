@@ -27,8 +27,11 @@ The fork adds nine things upstream does not have:
    served from the page cache. Qwen3.8-Flash-Next runs on two 12 GB cards with 64 GB of RAM
    instead of 128, and gpt-oss-120b on a single 12 GB card with 64 GB. Two things the flag
    alone will not do for you: one profiling run to learn which experts to keep resident
-   (`--moe-stats-out`), and one `read_ahead_kb` setting that is worth 2.5x by itself. See
-   [bank-ram.md](bank-ram.md).
+   (`--moe-stats-out`), and one `read_ahead_kb` setting that is worth 2.5x by itself. When
+   something takes the page cache away while the server sits idle -- WSL2's
+   `autoMemoryReclaim` does -- `--moe-bank-rewarm` reads the cold rows back before the next
+   request has to fault them in one by one (a short prompt's first token: 16 s → 6 s on two 3060s,
+   31 s → 3 s on a 2060). See [bank-ram.md](bank-ram.md).
 7. **A quantized KV cache** (`--kv-cache-dtype q8_0` / `q4_0`), 1.88x / 3.56x smaller than
    16-bit: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB 2060. It is a VRAM trade, not a speed
    one -- measured on that card, `q4_0` costs about a third of the decode rate once the
@@ -57,8 +60,11 @@ The fork adds nine things upstream does not have:
    and re-solves the chunk before every prefill, so a desktop that grabs 300 MB mid-request
    shrinks the chunk instead of breaking the run. Under `--pp-size` it is settled once at
    startup instead, from the tightest numbers any rank measured: the chunk sizes the residual
-   stream the ranks hand each other, so it cannot be a per-rank answer. See
-   [prefill-chunk.md](prefill-chunk.md).
+   stream the ranks hand each other, so it cannot be a per-rank answer. `--prefill-mixer-pieces`
+   then makes the chunk itself wider: the GDN and attention run over pieces of it, which is
+   where the transient comes from, while the MoE runs once over the whole chunk, so an offloaded
+   bank crosses the bus fewer times per prompt (a 20k-token prompt: 490 → 722 tok/s on a 2060,
+   437 → 546 on two 3060s). See [prefill-chunk.md](prefill-chunk.md).
 
 Everything else is upstream FreeToken. The feature sets are independent: image input, the MTP
 head, the host embedding, the layer split and the bank mapping also apply to a plain upstream

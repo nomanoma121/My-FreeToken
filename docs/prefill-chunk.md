@@ -83,6 +83,79 @@ in gloo with `Received data size doesn't match expected size`.
 So the re-solve before each prefill is a single-GPU feature. A two-card run keeps the boot
 value, and a desktop that takes 300 MB mid-session no longer shrinks the chunk to match.
 
+## Wider chunks: `--prefill-mixer-pieces`
+
+With the experts in host RAM, every prefill chunk streams every layer's expert bank to the GPU.
+The number of chunks a prompt is cut into is the number of full bank transfers it pays, so a
+wider chunk is faster even when the arithmetic per token is the same.
+
+What caps the width is the transient, and the transient is not the experts. Measured per part
+of one layer on the 2060 (Ornith, 1024 tokens):
+
+| part | KiB per token |
+|---|---|
+| GatedDeltaNet | **116.5** |
+| full attention | 79.8 |
+| MoE | 16.7 |
+
+The parts of a layer run one after another, so the layer's peak is its largest part: the GDN.
+
+`--prefill-mixer-pieces N` runs each layer's sequence mixer (GDN or attention) over N
+consecutive pieces of the chunk inside one forward, and the MoE -- together with everything
+else that works token by token -- over the whole chunk, so its bank still crosses the bus once
+per layer. Each piece continues the one before it exactly as a chunk continues the previous
+chunk, with its own attention and GDN metadata built by the same code the scheduler uses. The
+startup measurement runs a real forward, so it sees the smaller peak by itself, and the solver
+above picks a wider chunk.
+
+**Raise `--max-prefill-length` with it.** The measured width is still capped by the ceiling, and
+the default 8192 is reached quickly. Raising the ceiling alone does nothing: the transient was
+the limit, and it is unchanged.
+
+RTX 2060 6 GB, Ornith-1.5-35B-A3B, a 19,869-token prompt:
+
+| | transient | chunks | first token | prefill |
+|---|---|---|---|---|
+| default | 124.5 KiB/token | about 3072 x 7 | 40.5 s | 490 tok/s |
+| `--max-prefill-length 16384` only | 124.5 | about 3072 x 7 | 37.2 s | 534 tok/s |
+| `--prefill-mixer-pieces 2` | 68.3 | 4864 / 5888 / 5888 / 3229 | 30.6 s | 649 tok/s |
+| `--prefill-mixer-pieces 4 --max-prefill-length 16384` | 40.2 | 6912 / 9984 / 2973 | **27.5 s** | **722 tok/s** |
+
+A later run of the same four settings read 430 / 473 / 602 / 649 tok/s: the absolute numbers move
+with what the desktop is doing, the order does not.
+
+2x RTX 3060 12 GB, Qwen3.8-Flash-Next, `--pp-size 2 --spec-mtp 5`, a 19,904-token prompt:
+
+| | transient | chunk | chunks | first token | prefill |
+|---|---|---|---|---|---|
+| `--max-prefill-length 4096` | 270.0 KiB/token | 3072 | 7 | 45.6 s | 437 tok/s |
+| `--max-prefill-length 16384` only | 270.0 | 2816 | 8 | 48.8 s | 408 tok/s |
+| `--prefill-mixer-pieces 2 --max-prefill-length 8192` | 195.7 | 4352 | 5 | **36.5 s** | **546 tok/s** |
+| `--prefill-mixer-pieces 4 --max-prefill-length 16384` | 195.7 | 4352 | 5 | 36.6 s | 544 tok/s |
+
+**On Flash-Next, 2 is the setting; 4 adds nothing.** If the mixers still set the peak, four
+pieces would have gone below two. They did not, so at two pieces the peak has already moved to
+something outside the mixers, about 196 KiB per token, which has not been broken down yet.
+
+Where it applies: Qwen3.8-Flash-Next, on one GPU or under `--pp-size` (a piece never leaves its
+rank; what crosses to the next rank is the whole chunk, as before), including the `--spec-mtp`
+draft head, which fills its own KV over the same rows and reuses the same pieces; and the
+Qwen3.5-MoE family on one GPU. Other models ignore it. A chunk runs whole when pieces cannot
+describe it: more than one request prefilling in the same step, an image prompt (M-RoPE), an
+MTP verify window, or a chunk too short to split.
+
+The part that took care is the hybrid prefix cache. The scheduler picks the GDN snapshot slot
+for a chunk before the forward starts, so only the last piece takes the snapshot, into the slot
+already chosen, and the pieces are cut on the 64-token grid the snapshot boundaries live on so
+that the last piece's deepest boundary is the chunk's. In every measured run the follow-up
+question resumed the whole document from the prefix cache.
+
+On correctness: at the shipping QSA geometry and a reduced width, Flash-Next's QSA layer, GDN
+layer (including the state the next chunk resumes from) and a pair of full decoder layers with
+hyper-connections and a real MoE are bit-identical in 2, 3 and 4 pieces and whole. Served
+temperature-0 outputs are not a usable check: a different chunk width alone, with no pieces,
+makes them diverge after a few dozen characters.
+
 ## Where this matters less
 
 A card with room to spare will measure, find that the configured chunk fits, and keep it —
