@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import TYPE_CHECKING, Deque, Final, List, Tuple
 
@@ -19,6 +20,16 @@ _MSG_COUNT_TAG = 7
 # ahead of the last rank (one prefill chunk); this bounds how far. Retiring is a wait() on
 # the oldest, which returns as soon as the peer has taken that message.
 _MAX_PENDING_COUNT_SENDS: Final = 64
+
+# The relay join (_join_rank_relay). 0xc1 is the one byte msgpack never emits, so neither frame
+# can be taken for a relayed request, which is always a msgpack map.
+_RELAY_HELLO: Final = bytes([0xC1]) + b"relay-hello"
+_RELAY_JOINED: Final = bytes([0xC1]) + b"relay-joined"
+_RELAY_POLL_MS: Final = 50
+# How long rank 0 keeps publishing hellos before every rank gives up together. Each round waits
+# in a collective for all ranks, so this only counts time they are all here; a subscription lands
+# in well under a second (upstream #364 measured 100-200 ms), so a minute means it never will.
+_RELAY_JOIN_TIMEOUT_S: Final = 60.0
 
 
 class SchedulerIOMixin:
@@ -73,6 +84,80 @@ class SchedulerIOMixin:
 
         self.receive_msg = recv
         self.send_result = send
+        if tp_info.size > 1:
+            self._join_rank_relay(tp_info)
+
+    def _join_rank_relay(self, tp_info) -> None:
+        """Return only once every other rank's SUB is receiving what rank 0's PUB publishes.
+
+        Rank 0 relays each request to the other ranks over ZeroMQ PUB/SUB, and a PUB drops every
+        frame no registered subscription matches. A SUB's connect and SUBSCRIBE reach the PUB on
+        ZeroMQ's I/O thread, some time after the socket exists, and nothing waited for it: a
+        request published in that window was dropped, rank 1 waited in the SUB for a frame that
+        was never coming, rank 0 went on into the forward and waited for rank 1, and the server
+        answered /v1/models while serving nothing (upstream #364; under --pp-size the same relay
+        carries every request). A client that sends its first request the moment the server says
+        ready is exactly the one that lands in that window.
+
+        So rank 0 publishes hellos until every rank has received one, the ranks agreeing each round
+        over the gloo group: rank 0 contributes 1, or -1 once it gives up; the others 1 once a hello
+        has arrived, else 0. The MIN is 1 when all have heard, and -1 makes every rank raise
+        together, rather than rank 0 raising while the others wait on. Then rank 0 publishes one
+        joined frame and each rank drains the surplus hellos up to it -- a registered
+        subscription delivers in order, so nothing of the join can be read as a request later.
+        """
+        t0 = time.monotonic()
+        primary = tp_info.is_primary()
+        heard = 0
+        rounds = 0
+        while True:
+            rounds += 1
+            if primary:
+                self._send_into_ranks.socket.send(_RELAY_HELLO)
+                mine = -1 if time.monotonic() - t0 > _RELAY_JOIN_TIMEOUT_S else 1
+            else:
+                sub = self._recv_from_rank0.socket
+                if not heard and sub.poll(timeout=_RELAY_POLL_MS):
+                    self._expect_relay_frame(sub.recv(), _RELAY_HELLO)
+                    heard = 1
+                mine = heard
+            state = torch.tensor([mine], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                state, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            agreed = int(state.item())
+            if agreed == 1:
+                break
+            if agreed < 0:
+                raise RuntimeError(
+                    f"rank relay: after {time.monotonic() - t0:.0f}s and {rounds} hellos not every "
+                    "rank's SUB was receiving rank 0's PUB "
+                    f"({'rank 0 gave up' if primary else 'this rank heard one' if heard else 'this rank heard none'})"
+                )
+        if primary:
+            self._send_into_ranks.socket.send(_RELAY_JOINED)
+            logger.info(
+                f"rank relay: {tp_info.size - 1} rank(s) subscribed after {rounds} hello(s) "
+                f"in {(time.monotonic() - t0) * 1000:.0f} ms"
+            )
+            return
+        sub = self._recv_from_rank0.socket
+        while True:
+            # rank 0 sent the joined frame right after the round that agreed, so it is already on
+            # its way; a bounded wait turns a lost one into an error rather than a silent stall
+            if not sub.poll(timeout=int(_RELAY_JOIN_TIMEOUT_S * 1000)):
+                raise RuntimeError("rank relay: rank 0 agreed but its joined frame never arrived")
+            frame = sub.recv()
+            if frame == _RELAY_JOINED:
+                return
+            self._expect_relay_frame(frame, _RELAY_HELLO)
+
+    @staticmethod
+    def _expect_relay_frame(frame: bytes, expected: bytes) -> None:
+        if frame != expected:
+            raise RuntimeError(
+                f"rank relay: expected {expected!r} while joining, got {bytes(frame[:32])!r}"
+            )
 
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
