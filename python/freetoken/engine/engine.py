@@ -563,6 +563,7 @@ class Engine:
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
         self.ctx = Context(config.page_size)
+        self.ctx.prefill_mixer_pieces = int(getattr(config, "prefill_mixer_pieces", 1) or 1)
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)

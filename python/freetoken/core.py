@@ -252,12 +252,27 @@ class Context:
     # diagnostics (FT_SPEC_CHECK_STEP): when a list, the model appends (layer_id, residual
     # stream) after every local decoder layer of the active forward
     debug_layer_outs: list | None = None
+    # --prefill-mixer-pieces (models/prefill_pieces.py); set by the engine, 1 = off
+    prefill_mixer_pieces: int = 1
     _batch: Batch | None = field(default=None, init=False)
 
     @property
     def batch(self) -> Batch:
         assert self._batch is not None, "No active batch in context"
         return self._batch
+
+    @contextmanager
+    def piece_batch(self, piece: Batch):
+        """Inside an active forward, present ``piece`` as the batch for the duration -- the
+        prefill-pieces path (models/prefill_pieces.py) runs a chunk's mixers over consecutive
+        pieces, each with its own metadata, and restores the chunk's batch after each."""
+        assert self._batch is not None, "piece_batch needs an active forward_batch"
+        outer = self._batch
+        try:
+            self._batch = piece
+            yield
+        finally:
+            self._batch = outer
 
     @contextmanager
     def forward_batch(self, batch: Batch):

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.models.prefill_pieces import plan_prefill_pieces
 from freetoken.layers import (
     BaseOP,
     GemmaRMSNorm,
@@ -64,6 +65,28 @@ class Qwen3_5DecoderLayer(BaseOP):
         )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward_pieces(self, hidden: torch.Tensor, residual: torch.Tensor | None, pieces, ctx):
+        """forward() with the sequence mixer run over consecutive pieces of the chunk and the
+        MoE over all of it (models/prefill_pieces.py). The norms are per token, so splitting
+        them with the mixer and joining before the MoE changes no arithmetic."""
+        outs, resids = [], []
+        for start, end, piece in pieces:
+            h = hidden[start:end]
+            if residual is None:
+                r = h
+                h = self.input_layernorm.forward(h)
+            else:
+                h, r = self.input_layernorm.forward_add_residual(h, residual[start:end])
+            with ctx.piece_batch(piece):
+                h = self.linear_attn.forward(h) if self._is_linear else self.self_attn.forward(h)
+            outs.append(h)
+            resids.append(r)
+        hidden = torch.cat(outs)
+        residual = torch.cat(resids)
+        hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
+        hidden = self.mlp.forward(hidden)
+        return hidden, residual
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
@@ -203,9 +226,21 @@ class Qwen3_5Model(BaseOP):
         # residual-stream form: the first local layer folds x into the residual itself
         residual: torch.Tensor | None = None
         layers = self.layers.op_list
-        dbg = get_global_ctx().debug_layer_outs
+        ctx = get_global_ctx()
+        dbg = ctx.debug_layer_outs
+        # --prefill-mixer-pieces: mixers in pieces, MoE whole (models/prefill_pieces.py). One
+        # process only for now -- a pipeline rank hands on the stream at chunk granularity.
+        pieces = None
+        n_pieces = ctx.prefill_mixer_pieces
+        if n_pieces >= 2 and self._window.first and self._window.last:
+            pieces = plan_prefill_pieces(
+                ctx.batch, n_pieces, ctx.attn_backend, x.device, ctx.linear_state_pool
+            )
         for i in self._local_ids:
-            x, residual = layers[i].forward(x, residual)
+            if pieces is not None:
+                x, residual = layers[i].forward_pieces(x, residual, pieces, ctx)
+            else:
+                x, residual = layers[i].forward(x, residual)
             if dbg is not None:  # FT_SPEC_CHECK_STEP: the residual stream after layer i
                 dbg.append((i, (residual + x).detach().clone()))
         if not self._window.last:

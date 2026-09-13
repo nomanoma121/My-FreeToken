@@ -695,6 +695,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-mixer-pieces",
+        type=int,
+        default=ServerArgs.prefill_mixer_pieces,
+        help=(
+            "Run each prefill chunk's GDN / attention over this many consecutive pieces and its "
+            "MoE over the whole chunk (default 1 = off). The mixers are what cap a chunk's width "
+            "on a small card, so with pieces the chunk-budget probe measures less and picks wider "
+            "chunks, and an offloaded MoE streams its expert banks fewer times per prompt. "
+            "Measured on an RTX 2060 (Ornith, 19.9k-token prompt): 490 -> 649 tok/s at 2, "
+            "722 tok/s at 4 with --max-prefill-length 16384. Single-GPU Qwen3.5-MoE only for now."
+        ),
+    )
+    parser.add_argument(
         "--prefill-chunk-budget",
         type=float,
         default=ServerArgs.prefill_chunk_budget,

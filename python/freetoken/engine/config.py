@@ -44,6 +44,11 @@ class EngineConfig:
     # fit, then re-solves before each prefill against the VRAM free at that moment. 0 turns
     # the whole thing off and max_extend_tokens is used exactly as given.
     prefill_chunk_budget: float = 0.55
+    # --prefill-mixer-pieces: run each prefill chunk's sequence mixers (GDN / attention) over
+    # this many consecutive pieces and its MoE over the whole chunk (models/prefill_pieces.py).
+    # The mixers set the transient that caps the chunk width, so the probe measures less and
+    # the solver picks wider chunks: fewer chunks, fewer expert-bank transfers. 1 = off.
+    prefill_mixer_pieces: int = 1
     # --kv-cache-dtype: "auto" (16-bit), "q8_0" or "q4_0". Narrows the paged KV slab so
     # --moe-cache-auto can hand the difference to the expert cache (see kvcache/kv_quant.py).
     kv_cache_dtype: str | None = None
