@@ -25,6 +25,11 @@ request then pays only for what was not read yet.
 It never runs while the engine is busy and never holds the GIL across I/O (the walk is a
 torch op over the mapping), so the only cost is disk reads during idle time, which is why it
 is opt-in (``--moe-bank-rewarm``).
+
+The same pressure can push the server's own anonymous memory to swap, which the walk does not
+touch. Every walk line reports this process's ``VmSwap`` so a run shows whether that happened,
+and ``FREETOKEN_REWARM_SWAP=1`` also pages it back in after the walk (moe/swap_back.py) --
+experimental until ``guides/33`` §7 has measured whether it is what the remainder is.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from __future__ import annotations
 import threading
 import time
 
+from freetoken.moe import swap_back as _swap
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -42,8 +48,15 @@ class BankRewarm:
     from the scheduler thread; the reading happens on a daemon thread of its own."""
 
     def __init__(self, banks, delay_s: float, threshold: float = 0.95, log=None,
-                 max_backoff_s: float = 600.0):
+                 max_backoff_s: float = 600.0, swap=None, min_swap_bytes: int = 256 << 20):
         self.banks = banks
+        # ``swap``: an object with swapped_bytes() / swap_back(cancel), or None to leave this
+        # process's swap alone. Default: moe.swap_back.SelfSwap when FREETOKEN_REWARM_SWAP=1.
+        if swap is None and _swap.enabled_from_env():
+            swap = _swap.SelfSwap()
+        self.swap = swap
+        self.min_swap_bytes = int(min_swap_bytes)
+        self.last_swap: dict | None = None
         self.delay_s = float(delay_s)
         self.threshold = float(threshold)
         self.max_backoff_s = float(max_backoff_s)
@@ -69,6 +82,9 @@ class BankRewarm:
         """A request arrived. The walk stops at its next step boundary."""
         self._cancel.set()
 
+    def _process_swap(self) -> int:
+        return self.swap.swapped_bytes() if self.swap is not None else _swap.swapped_bytes()
+
     def _watch(self, cancel: threading.Event) -> None:
         wait = self.delay_s
         while not cancel.wait(wait):
@@ -77,27 +93,56 @@ class BankRewarm:
             except Exception as exc:  # noqa: BLE001 -- a measurement must not kill the thread's owner
                 self._log(f"--moe-bank-rewarm: cannot read page-cache residency ({exc}); stopping")
                 return
-            if share >= self.threshold:
-                wait = self.delay_s
-                continue
-            walked, seconds, finished = self.banks.rewarm(cancel)
-            after = self.banks.cold_residency()
-            self.last = {"before": share, "after": after, "bytes": walked,
-                         "seconds": seconds, "finished": finished}
-            self._log(
-                f"--moe-bank-rewarm: cold rows were {share:.0%} in page cache; walked "
-                f"{walked / 2**30:.1f} GiB of them in {seconds:.1f} s -> {after:.0%}"
-                + ("" if finished else " (stopped early: a request arrived)")
-            )
-            # A full walk that ends with less in the cache than it started with means something
-            # is still pressing on memory and taking pages as fast as they come back. Measured:
-            # a walk during held pressure took 49 s and went from 77% to 25%. Walking again at
-            # once only fights it, so wait longer each time until the cache starts holding.
-            if finished and after < share:
+            losing = False
+            if share < self.threshold:
+                walked, seconds, finished = self.banks.rewarm(cancel)
+                after = self.banks.cold_residency()
+                self.last = {"before": share, "after": after, "bytes": walked,
+                             "seconds": seconds, "finished": finished}
+                self._log(
+                    f"--moe-bank-rewarm: cold rows were {share:.0%} in page cache; walked "
+                    f"{walked / 2**30:.1f} GiB of them in {seconds:.1f} s -> {after:.0%}"
+                    + ("" if finished else " (stopped early: a request arrived)")
+                    + f"; this process has {self._process_swap() / 2**30:.2f} GiB in swap"
+                )
+                # A full walk that ends with less in the cache than it started with means
+                # something is still pressing on memory and taking pages as fast as they come
+                # back. Measured: a walk during held pressure took 49 s and went from 77% to 25%.
+                # Walking again at once only fights it, so wait longer each time until the cache
+                # starts holding.
+                losing = finished and after < share
+            if self.swap is not None and not cancel.is_set() and not losing:
+                losing = self._swap_back(cancel)
+            if losing:
                 wait = min(max(wait, self.delay_s) * 4, self.max_backoff_s)
                 self._log(f"--moe-bank-rewarm: memory is still under pressure; next check in {wait:g} s")
             else:
                 wait = self.delay_s
+
+    def _swap_back(self, cancel: threading.Event) -> bool:
+        """Page this process's swap back in when there is enough of it to matter. Returns True
+        when a finished pass left no less in swap than it found (pressure still holding)."""
+        before = self.swap.swapped_bytes()
+        if before < self.min_swap_bytes:
+            return False
+        requested, seconds, finished = self.swap.swap_back(cancel)
+        after = self.swap.swapped_bytes()
+        failed = getattr(self.swap, "failed_bytes", 0)
+        self.last_swap = {"before": before, "after": after, "bytes": requested,
+                          "failed": failed, "seconds": seconds, "finished": finished}
+        note = ""
+        if getattr(self.swap, "unsupported", False):
+            note = " (MADV_POPULATE_READ refused: needs Linux 5.14; not trying again)"
+            self.swap = None
+        elif not finished:
+            note = " (stopped early: a request arrived)"
+        elif failed:
+            note = f" ({failed / 2**30:.2f} GiB of it was gone by the time it was reached)"
+        self._log(
+            f"--moe-bank-rewarm: this process had {before / 2**30:.2f} GiB in swap; paged "
+            f"{requested / 2**30:.2f} GiB back in {seconds:.1f} s -> {after / 2**30:.2f} GiB" + note
+        )
+        return finished and after >= before
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:

@@ -244,6 +244,8 @@ The flag does not bring the warm figures all the way back. Part of what is left 
 prompts is the server's own memory: the pressure before those runs also pushed 2.4 GiB (2060)
 and 4.7 GiB (3060) of it into swap, and this flag only deals with the bank's page cache. The
 2-3 s left on the short prompts had almost no swap behind it and is not explained.
+Each pass's line now ends with the rank's own swap (`; this process has N.NN GiB in swap`), so a
+log shows whether the pressure that emptied the cache also reached the server itself.
 
 It is off by default because it reads the disk while nothing is running: 7.7 GiB per rank took
 1-12 s per pass on the Gen4 NVMe above. 5 s is the only delay that was measured. How fast
