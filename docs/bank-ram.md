@@ -156,7 +156,7 @@ kinds and pass them all; pooling is cheap insurance, not a decisive gain (1-2 po
 ```bash
 ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
   --moe-strategy hybrid --ple-backend disk --dense-quant fp8 \
-  --moe-bank-ram 48G --moe-bank-stats ~/moe-stats.rank0.json ~/moe-stats2.rank0.json
+  --moe-bank-ram 48G --moe-bank-stats ~/moe-stats.rank0.json ~/moe-stats.rank1.json
 ```
 
 `--moe-bank-ram` is a **whole-host** cap, not per rank: two ranks on one machine each get half

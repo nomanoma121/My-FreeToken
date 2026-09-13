@@ -170,3 +170,55 @@ def test_bank_file_path_defaults_outside_the_checkpoint(tmp_path, monkeypatch):
     p = bank_file_path("/models/Flash-Next", 0, 1, None)
     assert str(tmp_path) in p and "Flash-Next" in p
     assert "/models/" not in p.replace("\\", "/")
+
+
+def _rank_files(tmp_path, width=4):
+    # rank 0 owns decoder layers 0..1, rank 1 owns 2..3; every layer's histogram is distinct,
+    # hottest expert = the global layer id, so a placement shows which layer it was sorted by
+    paths = []
+    for rank, start in ((0, 0), (1, 2)):
+        rows = [[100 if e == start + i else e for e in range(width)] for i in range(2)]
+        p = tmp_path / f"moe-stats.rank{rank}.json"
+        p.write_text(json.dumps({"layer_range": [start, start + 2], "decode_freq": rows}),
+                     encoding="utf-8")
+        paths.append(str(p))
+    return paths
+
+
+class _Cfg:
+    num_experts = 4
+    hidden_size = 8
+    moe_intermediate_size = 4
+
+
+def test_a_later_pipeline_rank_sorts_by_its_own_layers(tmp_path, monkeypatch):
+    from freetoken.moe import bank_disk
+
+    monkeypatch.setattr(bank_disk, "cell_bytes_from_config", lambda _cfg: 100)
+    paths = _rank_files(tmp_path)
+    # rank 1: local layers 0..1 are the model's 2..3
+    placement, _ = bank_disk.plan_from_config(_Cfg(), 200, [0, 1], paths, first_bank_layer=2)
+    assert placement.order[0][0] == 2 and placement.order[1][0] == 3
+    # rank 0 is unchanged
+    placement, _ = bank_disk.plan_from_config(_Cfg(), 200, [0, 1], paths, first_bank_layer=0)
+    assert placement.order[0][0] == 0 and placement.order[1][0] == 1
+
+
+def test_missing_histograms_for_a_rank_are_said(tmp_path, monkeypatch):
+    from freetoken.moe import bank_disk
+
+    monkeypatch.setattr(bank_disk, "cell_bytes_from_config", lambda _cfg: 100)
+    rank0_only = _rank_files(tmp_path)[:1]
+    said = []
+    placement, _ = bank_disk.plan_from_config(
+        _Cfg(), 200, [0, 1], rank0_only, first_bank_layer=2, warn=said.append
+    )
+    assert placement.order[0] == [0, 1, 2, 3]  # no histogram: expert-id order, not rank 0's
+    assert said and "0 of this rank's 2 MoE layers (2..3)" in said[0]
+
+
+def test_leading_dense_layers_are_not_bank_layers(tmp_path):
+    p = tmp_path / "moe-stats.rank1.json"
+    p.write_text(json.dumps({"layer_range": [3, 5], "decode_freq": [[1, 2], [3, 4]]}),
+                 encoding="utf-8")
+    assert sorted(load_freq([str(p)], first_k_dense=1)) == [2, 3]

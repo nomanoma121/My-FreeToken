@@ -25,8 +25,12 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------------------
 # measured routing
 # ---------------------------------------------------------------------------------------
-def load_freq(paths) -> dict[int, list[int]]:
-    """{global layer id: [count per expert]} from one or more ``--moe-stats-out`` files.
+def load_freq(paths, first_k_dense: int = 0) -> dict[int, list[int]]:
+    """{global bank-layer id: [count per expert]} from one or more ``--moe-stats-out`` files.
+
+    A file's rows are its rank's MoE layers from the first one it owns, and its ``layer_range``
+    is that rank's window in DECODER layers, so the bank index subtracts the leading dense layers
+    (``first_k_dense``, 0 for every model --moe-bank-ram has run on so far).
 
     Counts for the same layer ADD. Files from one run are disjoint by layer (one per pipeline
     rank), so this only matters across runs -- which is the case that needs it. A placement
@@ -45,7 +49,7 @@ def load_freq(paths) -> dict[int, list[int]]:
                 f"{p}: no decode_freq. Collect with --moe-stats-out and --disable-cuda-graph "
                 "(under a captured graph the histogram counts the warmup routing instead)."
             )
-        start = (d.get("layer_range") or [0])[0]
+        start = max(0, int((d.get("layer_range") or [0])[0]) - int(first_k_dense))
         for i, row in enumerate(rows):
             layer = start + i
             have = freq.get(layer)
@@ -197,12 +201,18 @@ def cell_bytes_from_config(model_config) -> int | None:
     return per_expert(hidden, inter)
 
 
-def plan_from_config(model_config, ram_budget_bytes: int, layers, stats_paths=None):
+def plan_from_config(model_config, ram_budget_bytes: int, layers, stats_paths=None,
+                     first_bank_layer: int = 0, first_k_dense: int = 0, warn=None):
     """``(placement, cell_bytes)`` for a --moe-bank-ram run, before anything is loaded.
 
     ``placement`` is None when the budget already covers every expert (nothing to do) or when
     the format's per-expert size is unknown -- the feature declines rather than guessing how a
     checkpoint splits.
+
+    ``layers`` are this rank's own bank indices (0..n-1, what the offload cache and the file
+    use); ``first_bank_layer`` is where they start in the whole model, which is how the
+    histograms are keyed. Under --pp-size, rank 1 of a 48-layer model owns bank layers 24..47:
+    it used to look its local 0..23 up directly and so sorted its experts by rank 0's layers.
     """
     cell_bytes = cell_bytes_from_config(model_config)
     layers = list(layers)
@@ -217,7 +227,18 @@ def plan_from_config(model_config, ram_budget_bytes: int, layers, stats_paths=No
             f"--moe-bank-ram leaves room for no resident experts "
             f"({cell_bytes / 2**20:.1f} MiB each x {len(layers)} layers). Raise the cap."
         )
-    freq = load_freq(stats_paths) if stats_paths else None
+    freq = None
+    if stats_paths:
+        every = load_freq(stats_paths, first_k_dense=first_k_dense)
+        freq = {layer: every[layer + first_bank_layer] for layer in layers
+                if layer + first_bank_layer in every}
+        if len(freq) < len(layers) and warn is not None:
+            lo, hi = first_bank_layer, first_bank_layer + len(layers)
+            warn(
+                f"--moe-bank-stats has histograms for {len(freq)} of this rank's {len(layers)} MoE "
+                f"layers ({lo}..{hi - 1}); the rest keep expert-id order. Under --pp-size pass "
+                f"every rank's file (moe-stats.rank0.json and moe-stats.rank1.json)."
+            )
     return plan_placement(layers, num_experts, hot, freq), cell_bytes
 
 

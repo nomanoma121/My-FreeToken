@@ -2329,8 +2329,15 @@ class Engine:
         ranks = max(1, config.tp_info.size)
         budget = total // ranks
         layers = list(range(config.model_config.num_moe_layers))
+        # The histograms are keyed by the layer's place in the whole model; this rank's banks
+        # are indexed from 0. Under --pp-size the two differ by where the rank's window starts.
+        first_k_dense = int(getattr(config.full_model_config, "first_k_dense_replace", 0) or 0)
+        pp_range = getattr(config, "pp_layer_range", None)
+        first_bank_layer = max(0, int(pp_range[0]) - first_k_dense) if pp_range else 0
         placement, cell_bytes = bank_disk.plan_from_config(
-            config.model_config, budget, layers, config.moe_bank_stats
+            config.model_config, budget, layers, config.moe_bank_stats,
+            first_bank_layer=first_bank_layer, first_k_dense=first_k_dense,
+            warn=logger.warning,
         )
         bank_gib = (cell_bytes or 0) * len(layers) * config.model_config.num_experts / 2**30
         if placement is None:
