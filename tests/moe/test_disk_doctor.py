@@ -161,3 +161,23 @@ def test_ft_doctor_is_wired_into_the_cli(capsys):
     assert main(["doctor", "--help"]) == 0
     assert "disk" in capsys.readouterr().out
     assert main(["doctor", "nope"]) == 2
+
+
+def test_under_wsl_the_report_shows_the_windows_drive_and_flags_a_short_one():
+    from types import SimpleNamespace
+
+    from freetoken.moe import disk_probe as dp
+
+    storage = SimpleNamespace(mount=SimpleNamespace(mountpoint="/"))
+    host = dp.WslHostDisk("Ubuntu", r"C:\wsl\ext4.vhdx", "C:", "/mnt/c", 30 * GiB, 953 * GiB, 133 * GiB, False)
+    rep = dd.Report()
+    dd._wsl_host(rep, "Bank storage", storage, "/proc", 16 * GiB, host=host)
+    text = "\n".join(rep.lines)
+    assert r"C:\wsl\ext4.vhdx, 133.0 GiB, not sparse" in text
+    assert "C: has 30.0 GiB free of 953 GiB" in text and "not returned to Windows" in text
+    (level, msg), = rep.findings
+    assert level == "warn" and "16.0 GiB the bank file still needs" in msg
+    rep = dd.Report()
+    dd._wsl_host(rep, "Bank storage", storage, "/proc", 0, host=dp.WslHostDisk(
+        "Ubuntu", r"C:\wsl\ext4.vhdx", "C:", "/mnt/c", 200 * GiB, 953 * GiB, None, True))
+    assert rep.findings == [] and "not returned" not in "\n".join(rep.lines)

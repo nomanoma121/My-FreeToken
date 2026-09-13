@@ -213,7 +213,14 @@ def test_meminfo_and_memlock(tree, tmp_path):
     assert dp.memlock_limit(proc) == (None, None)
 
 
-def test_auto_matches_the_measured_64gb_configuration():
+@pytest.fixture
+def native(monkeypatch):
+    """A host whose CUDA does not cap pinning (plain Linux), whatever this test runs on."""
+    monkeypatch.setattr(dp, "is_wsl", lambda proc="/proc": False)
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
+
+
+def test_auto_matches_the_measured_64gb_configuration(native):
     """48G on a 64 GB host with --pp-size 2 was the configuration docs/bank-ram.md measured."""
     mem = {"MemTotal": 62 * GiB, "MemAvailable": 60 * GiB}
     auto = dp.auto_bank_ram(mem, 2)
@@ -225,13 +232,13 @@ def test_auto_matches_the_measured_64gb_configuration():
     assert abs(parse_size(auto.as_flag()) - auto.total_bytes) < 0.01 * GiB
 
 
-def test_auto_leaves_the_headroom_floor_on_a_small_host():
+def test_auto_leaves_the_headroom_floor_on_a_small_host(native):
     auto = dp.auto_bank_ram({"MemTotal": 23 * GiB, "MemAvailable": 20 * GiB}, 1)
     assert auto.headroom == 2 * GiB
     assert auto.total_bytes == int(20 * GiB - 4.5 * GiB - 2 * GiB)
 
 
-def test_auto_refuses_when_nothing_is_left():
+def test_auto_refuses_when_nothing_is_left(native):
     with pytest.raises(ValueError, match="pass a size"):
         dp.auto_bank_ram({"MemTotal": 16 * GiB, "MemAvailable": 7 * GiB}, 1)
     with pytest.raises(ValueError, match="not readable"):
@@ -294,3 +301,92 @@ def test_physical_cores_counts_core_pairs(tmp_path):
         _write(os.path.join(sys, f"devices/system/cpu/cpu{cpu}/topology/physical_package_id"), f"{pkg}\n")
         _write(os.path.join(sys, f"devices/system/cpu/cpu{cpu}/topology/core_id"), f"{core}\n")
     assert dp.physical_cores(sys) == 3
+
+
+# ----- WSL2: the Windows drive under the virtual disk ---------------------------------
+REG = (
+    "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\r\n"
+    "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{1bd2}\r\n"
+    "    DistributionName    REG_SZ    Ubuntu\r\n"
+    "    BasePath    REG_SZ    \\\\?\\D:\\wsl\\{1bd2}\r\n"
+    "    VhdFileName    REG_SZ    ext4.vhdx\r\n"
+    "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{1eef}\r\n"
+    "    DistributionName    REG_SZ    rancher-desktop\r\n"
+    "    BasePath    REG_SZ    C:\\Users\\u\\rd\r\n"
+)
+
+
+def test_the_registry_names_this_distros_virtual_disk():
+    assert dp.parse_reg_lxss(REG, "ubuntu") == (r"D:\wsl\{1bd2}", "ext4.vhdx")
+    assert dp.parse_reg_lxss(REG, "rancher-desktop") == (r"C:\Users\u\rd", "ext4.vhdx")
+    assert dp.parse_reg_lxss(REG, "Debian") is None
+
+
+def _wsl_proc(tmp_path, drive_dir):
+    proc = tmp_path / "proc"
+    _write(str(proc / "sys/kernel/osrelease"), "6.18.33.2-microsoft-standard-WSL2\n")
+    _write(str(proc / "self/mountinfo"),
+           "1 0 8:80 / / rw - ext4 /dev/sdf rw\n"
+           f"2 1 0:84 / {drive_dir} rw - 9p D:\\134 rw,aname=drvfs;path=D:\\\n")
+    return str(proc)
+
+
+def test_wsl_host_disk_reads_the_drive_under_the_vhdx(tmp_path, monkeypatch):
+    drive = tmp_path / "mnt_d"
+    (drive / "wsl" / "{1bd2}").mkdir(parents=True)
+    (drive / "wsl" / "{1bd2}" / "ext4.vhdx").write_bytes(b"x" * 4096)
+    proc = _wsl_proc(tmp_path, drive)
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    monkeypatch.setattr(dp, "_windows_exe", lambda name: "/fake/" + name)
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd[0])
+        out = REG if cmd[0].endswith("reg.exe") else "Archive, SparseFile\r\n"
+        return type("R", (), {"stdout": out})()
+
+    host = dp.wsl_host_disk(proc, run=run)
+    assert (host.vhdx, host.drive, host.mount) == (r"D:\wsl\{1bd2}\ext4.vhdx", "D:", str(drive))
+    assert host.free_bytes > 0 and host.vhdx_bytes == 4096 and host.sparse is None
+    assert calls == ["/fake/reg.exe"]  # the startup path asks no PowerShell
+    assert dp.wsl_host_disk(proc, run=run, attributes=True).sparse is True
+    assert dp.wsl_host_disk(str(tmp_path / "proc_native"), run=run) is None  # not WSL
+
+
+def test_host_space_warning_counts_the_windows_drive_not_df(tmp_path):
+    drive = tmp_path / "mnt_d"
+    drive.mkdir()
+    proc = _wsl_proc(tmp_path, drive)
+    host = dp.WslHostDisk("Ubuntu", r"D:\wsl\ext4.vhdx", "D:", str(drive), 30 * GiB, 900 * GiB)
+    msg = dp.host_space_warning(str(tmp_path / "bankmap" / "bank.ftmb"), 16 * GiB, proc, host=host)
+    assert "D: has 30.0 GiB free" in msg and "`df /`" in msg and "--moe-bank-dir" in msg
+    assert dp.host_space_warning(str(tmp_path / "bankmap"), 5 * GiB, proc, host=host) is None
+    # a path on the drive itself is checked by the ordinary free-space test, not this one
+    assert dp.host_space_warning(str(drive / "bank.ftmb"), 16 * GiB, proc, host=host) is None
+
+
+def test_a_new_bank_is_refused_on_drvfs_and_tmpfs_but_not_on_ext4(tree, tmp_path):
+    sys, proc = tree
+    assert dp.refuses_new_bank(str(tmp_path / "bankmap"), proc, sys) is None
+    _write(os.path.join(proc, "self/mountinfo"),
+           MOUNTINFO + f"50 29 0:84 / {tmp_path} rw - 9p C:\\134 rw,aname=drvfs;path=C:\\\n")
+    msg = dp.refuses_new_bank(str(tmp_path / "bankmap"), proc, sys)
+    assert "not creating a bank file" in msg and "drvfs" in msg
+    _write(os.path.join(proc, "self/mountinfo"), MOUNTINFO + f"50 29 0:90 / {tmp_path} rw - tmpfs tmpfs rw\n")
+    assert "RAM" in dp.refuses_new_bank(str(tmp_path / "bankmap"), proc, sys)
+
+
+def test_under_wsl_auto_stays_inside_the_cuda_pin_budget(monkeypatch):
+    """Measured on the 2060 host: MemAvailable alone chose 15.6 GiB of 23.5, 141 of 240 resident
+    blocks registered, and the boot died in a CUDA allocation."""
+    monkeypatch.setattr(dp, "is_wsl", lambda proc="/proc": True)
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
+    mem = {"MemTotal": int(23.5 * GiB), "MemAvailable": int(22.1 * GiB)}
+    auto = dp.auto_bank_ram(mem, 1)
+    assert auto.total_bytes == int(23.5 * GiB * 0.4) - 2 * GiB  # 7.4 GiB, not 15.6
+    assert "CUDA pin budget 9.4 GiB" in auto.reason() and "RAM alone would allow 15.6 GiB" in auto.reason()
+    # where RAM is the tighter of the two, RAM decides and says so
+    small = dp.auto_bank_ram({"MemTotal": int(23.5 * GiB), "MemAvailable": 12 * GiB}, 1)
+    assert small.total_bytes == int(12 * GiB - 4.5 * GiB - 2 * GiB) and "MemAvailable 12.0" in small.reason()
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "12")
+    assert dp.auto_bank_ram(mem, 1).total_bytes == 10 * GiB

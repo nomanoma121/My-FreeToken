@@ -567,13 +567,15 @@ class MappedTier:
     def __init__(self, path: str, layers, *, num_experts: int, hot_per_layer: int,
                  all_layers=None, wanted: dict | None = None, layout: MappedBankLayout | None = None,
                  meta: dict | None = None, can_write: bool = True, log=None, warn=None,
-                 readahead: str = "off", report_readahead: bool = True):
+                 readahead: str = "off", report_readahead: bool = True, first_rank: bool = True):
         self.path = path
         # --moe-bank-readahead: "off" (report only), "auto" (the recommended window) or kB. Every
         # rank maps the same file, so one device: each rank sets it before opening its own
         # mapping, and only the first says anything about it.
         self.readahead = str(readahead or "off").strip().lower()
         self.report_readahead = report_readahead
+        # the one rank that speaks for the whole file (the space it still needs, say)
+        self.first_rank = first_rank
         self.layers = [int(x) for x in layers]
         # every MoE layer of the model: the file's geometry, whichever of them this rank serves
         self.all_layers = self.layers if all_layers is None else [int(x) for x in all_layers]
@@ -701,6 +703,15 @@ class MappedTier:
                     f"--moe-bank-ram: writing layers {_ranges(missing)} to {self.path} needs "
                     f"{need / 2**30:.1f} GiB and the filesystem has {free / 2**30:.1f} GiB free"
                 )
+            if self.first_rank:
+                # Under WSL2 the check above sees the virtual disk, not the Windows drive it grows
+                # on. Counted for the whole file: every rank writes its own missing layers at once.
+                from freetoken.moe import disk_probe
+
+                absent = [l for l in self.all_layers if self._file.layer_state(l, manifest) is None]
+                line = disk_probe.host_space_warning(self.path, len(absent) * gib * 2**30)
+                if line:
+                    self.warn(line)
             self.log(
                 f"--moe-bank-ram: {self.path} lacks layers {_ranges(missing)}; reading the checkpoint's "
                 f"experts for layers {_ranges(self.layers)} and writing {len(missing) * gib:.1f} GiB "

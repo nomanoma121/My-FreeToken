@@ -315,3 +315,20 @@ def test_build_tier_warns_about_the_bank_directory_once_and_passes_the_readahead
     seen.clear()
     tier = build_tier(_config(tmp_path, tp_info=SimpleNamespace(rank=1, size=2)), _Method(), log=lines.append)
     assert seen == [] and tier.readahead == "off" and not tier.report_readahead
+
+
+def test_build_tier_refuses_to_create_a_bank_on_a_filesystem_that_cannot_hold_one(tmp_path, monkeypatch):
+    from freetoken.moe import disk_probe
+    from freetoken.moe.bank_tier import build_tier
+
+    asked = []
+    monkeypatch.setattr(disk_probe, "refuses_new_bank", lambda d: asked.append(d) or "not creating a bank file: drvfs")
+    with pytest.raises(ValueError, match="not creating a bank file"):
+        build_tier(_config(tmp_path, tp_info=SimpleNamespace(rank=1, size=2)), _Method(), log=lambda _m: None)
+    assert asked == [str(tmp_path / "bankmap")] and not (tmp_path / "bankmap").exists()
+    # a file somebody already put there is served (with the warning)
+    os.makedirs(tmp_path / "bankmap")
+    (tmp_path / "bankmap" / "bank.ftmb").write_bytes(b"")
+    asked.clear()
+    build_tier(_config(tmp_path), _Method(), log=lambda _m: None)
+    assert asked == []

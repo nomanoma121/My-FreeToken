@@ -449,6 +449,26 @@ HEADROOM_FRACTION = 0.05
 HEADROOM_MIN_BYTES = 2 * GiB
 
 
+# The resident rows are cudaHostRegistered, and WSL2's CUDA caps page-locked host memory near half
+# of the VM's RAM, shared by every process (engine._pin_budget_bytes budgets 40%; the same
+# FREETOKEN_PIN_BUDGET_GB overrides it). MemAvailable alone does not see that cap: measured on the
+# 2060 host (23.5 GiB), auto took 15.6 GiB, 141 of 240 resident blocks registered and the boot died
+# in a CUDA allocation. PIN_RESERVE_BYTES stays out of the budget for what else the server pins
+# (a host embedding, staging buffers).
+PIN_BUDGET_FRACTION = 0.4
+PIN_RESERVE_BYTES = 2 * GiB
+
+
+def pin_budget_bytes(mem: dict[str, int], proc: str = "/proc") -> int | None:
+    """Page-locked host bytes the platform allows, or None where it does not cap them (plain Linux)."""
+    env = os.environ.get("FREETOKEN_PIN_BUDGET_GB")
+    if env:
+        return int(float(env) * GiB)
+    if not is_wsl(proc) or not mem.get("MemTotal"):
+        return None
+    return int(mem["MemTotal"] * PIN_BUDGET_FRACTION)
+
+
 @dataclass
 class AutoBankRam:
     total_bytes: int
@@ -457,26 +477,41 @@ class AutoBankRam:
     nonbank: int
     headroom: int
     ranks: int
+    pin_cap: int | None = None  # the pin budget less its reserve, when it is what decided
 
     def as_flag(self) -> str:
         """A ``--moe-bank-ram`` value parse_size reads back to (nearly) the same bytes."""
         return f"{self.total_bytes / GiB:.2f}G"
 
     def reason(self) -> str:
-        return (
+        text = (
             f"--moe-bank-ram auto: {self.total_bytes / GiB:.1f} GiB for the banks across "
-            f"{self.ranks} rank{'s' if self.ranks != 1 else ''} = MemAvailable "
-            f"{self.available / GiB:.1f} GiB - {self.nonbank / GiB:.1f} GiB for the rest of the "
-            f"server ({NONBANK_PER_RANK_BYTES / GiB:.1f} per rank) - {self.headroom / GiB:.1f} GiB "
-            f"left as page cache for the non-resident rows; pass a size to override"
+            f"{self.ranks} rank{'s' if self.ranks != 1 else ''}"
         )
+        by_ram = self.available - self.nonbank - self.headroom
+        if self.pin_cap is not None and self.pin_cap < by_ram:
+            text += (
+                f" = the CUDA pin budget {(self.pin_cap + PIN_RESERVE_BYTES) / GiB:.1f} GiB "
+                f"({PIN_BUDGET_FRACTION:.0%} of MemTotal under WSL2, FREETOKEN_PIN_BUDGET_GB overrides) - "
+                f"{PIN_RESERVE_BYTES / GiB:.1f} GiB for other pinned buffers, since the resident rows are "
+                f"registered with CUDA; RAM alone would allow {by_ram / GiB:.1f} GiB"
+            )
+        else:
+            text += (
+                f" = MemAvailable {self.available / GiB:.1f} GiB - {self.nonbank / GiB:.1f} GiB for the "
+                f"rest of the server ({NONBANK_PER_RANK_BYTES / GiB:.1f} per rank) - "
+                f"{self.headroom / GiB:.1f} GiB left as page cache for the non-resident rows"
+            )
+        return text + "; pass a size to override"
 
 
-def auto_bank_ram(mem: dict[str, int], ranks: int) -> AutoBankRam:
-    """``--moe-bank-ram auto``: MemAvailable, less the rest of the server, less a page cache margin.
+def auto_bank_ram(mem: dict[str, int], ranks: int, proc: str = "/proc") -> AutoBankRam:
+    """``--moe-bank-ram auto``: MemAvailable, less the rest of the server, less a page cache margin --
+    and no more than the platform lets CUDA register, since the resident rows are registered.
 
     MemAvailable rather than MemTotal so that whatever else is running right now is left
-    alone, and read once in the launcher so every rank splits the same number.
+    alone, and read once in the launcher so every rank splits the same number. The pin budget is
+    host-wide too (shared by every process), so it caps the total, not each rank.
     """
     avail, total = mem.get("MemAvailable"), mem.get("MemTotal")
     if not avail or not total:
@@ -485,14 +520,19 @@ def auto_bank_ram(mem: dict[str, int], ranks: int) -> AutoBankRam:
     nonbank = NONBANK_PER_RANK_BYTES * ranks
     headroom = max(HEADROOM_MIN_BYTES, int(total * HEADROOM_FRACTION))
     budget = avail - nonbank - headroom
+    pin = pin_budget_bytes(mem, proc)
+    pin_cap = None if pin is None else pin - PIN_RESERVE_BYTES
+    if pin_cap is not None:
+        budget = min(budget, pin_cap)
     if budget < GiB:
         raise ValueError(
-            f"--moe-bank-ram auto: MemAvailable is {avail / GiB:.1f} GiB, which leaves "
-            f"{budget / GiB:.1f} GiB for the banks after {nonbank / GiB:.1f} GiB for the rest of "
-            f"the server and {headroom / GiB:.1f} GiB of page cache margin. Free some memory or "
-            f"pass a size"
+            f"--moe-bank-ram auto: MemAvailable is {avail / GiB:.1f} GiB"
+            + (f" and the CUDA pin budget {pin / GiB:.1f} GiB" if pin is not None else "")
+            + f", which leaves {budget / GiB:.1f} GiB for the banks after {nonbank / GiB:.1f} GiB for "
+            f"the rest of the server and {headroom / GiB:.1f} GiB of page cache margin. Free some "
+            f"memory or pass a size"
         )
-    return AutoBankRam(budget, avail, total, nonbank, headroom, ranks)
+    return AutoBankRam(budget, avail, total, nonbank, headroom, ranks, pin_cap)
 
 
 # ---------------------------------------------------------------------------------------
@@ -624,6 +664,151 @@ def probe_storage(path: str, proc: str = "/proc", sys: str = "/sys") -> Storage:
     return Storage(real, mount, verdict, device, dev, is_wsl(proc))
 
 
+# ---------------------------------------------------------------------------------------
+# WSL2: the Windows drive under the virtual disk
+# ---------------------------------------------------------------------------------------
+#
+# Inside WSL2, `df /` reports the free space of the ext4 filesystem in ext4.vhdx -- its declared
+# size (1 TB by default), not the Windows drive the vhdx lives on. A dynamically growing vhdx takes
+# host space as blocks are first written, so a 16-64 GiB bank can fill the Windows drive while
+# `df /` still shows hundreds of GiB free; when it does, the VM stops. Space freed inside is not
+# given back to Windows either, unless the vhdx is sparse. Measured once the hard way on the 2060
+# host: C: reached zero and WSL went down mid-write.
+
+_REG_LXSS = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
+
+
+@dataclass
+class WslHostDisk:
+    distro: str
+    vhdx: str  # Windows path of the distro's virtual disk
+    drive: str  # "C:"
+    mount: str | None  # where that drive is mounted inside WSL (/mnt/c), None when it is not
+    free_bytes: int | None  # of the Windows drive
+    total_bytes: int | None
+    vhdx_bytes: int | None = None
+    sparse: bool | None = None  # None: not asked (it takes PowerShell)
+
+
+def parse_reg_lxss(text: str, distro: str) -> tuple[str, str] | None:
+    """``(BasePath, VhdFileName)`` of ``distro`` from ``reg.exe query`` of the Lxss key with ``/s``."""
+    blocks, cur = [], {}
+    for line in text.splitlines():
+        if line.startswith("HKEY_"):
+            cur = {}
+            blocks.append(cur)
+            continue
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[1].startswith("REG_"):
+            cur[parts[0]] = parts[2].strip()
+    for b in blocks:
+        if b.get("DistributionName", "").lower() == distro.lower() and b.get("BasePath"):
+            base = b["BasePath"]
+            if base.startswith("\\\\?\\"):
+                base = base[4:]
+            return base, b.get("VhdFileName") or "ext4.vhdx"
+    return None
+
+
+def _windows_exe(name: str) -> str | None:
+    import shutil
+
+    for cand in (shutil.which(name), f"/mnt/c/Windows/System32/{name}",
+                 f"/mnt/c/Windows/System32/WindowsPowerShell/v1.0/{name}"):
+        if cand and os.path.exists(cand):
+            return cand
+    return None
+
+
+def drive_mount(drive: str, proc: str = "/proc") -> str | None:
+    """Where Windows drive ``C:`` is mounted inside WSL, from mountinfo (drvfs shows as 9p)."""
+    letter = drive[:1].upper()
+    for m in parse_mountinfo(_read(os.path.join(proc, "self/mountinfo")) or ""):
+        if m.fstype in ("9p", "drvfs") and m.source.upper().startswith(f"{letter}:"):
+            return m.mountpoint
+    return None
+
+
+def wsl_host_disk(proc: str = "/proc", *, attributes: bool = False, timeout: float = 10.0,
+                  run=None) -> WslHostDisk | None:
+    """The Windows drive holding this distro's ext4.vhdx and its free space, or None outside WSL2
+    or when Windows interop cannot say. ``attributes`` also asks PowerShell whether the vhdx is
+    sparse (about a second); the startup check does not. ``run``: a subprocess.run stand-in."""
+    import subprocess
+
+    if not is_wsl(proc):
+        return None
+    distro = os.environ.get("WSL_DISTRO_NAME")
+    run = run or subprocess.run
+    reg = _windows_exe("reg.exe")
+    if not distro or not reg:
+        return None
+    try:
+        out = run([reg, "query", _REG_LXSS, "/s"], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = parse_reg_lxss(getattr(out, "stdout", "") or "", distro)
+    if found is None:
+        return None
+    base, name = found
+    vhdx = base.rstrip("\\") + "\\" + name
+    drive = vhdx[:2] if vhdx[1:2] == ":" else ""
+    mount = drive_mount(drive, proc) if drive else None
+    free = total = size = None
+    if mount:
+        try:
+            st = os.statvfs(mount)
+            free, total = st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+        except OSError:
+            pass
+        try:
+            size = os.stat(os.path.join(mount, *vhdx[3:].split("\\"))).st_size
+        except OSError:
+            pass
+    host = WslHostDisk(distro, vhdx, drive, mount, free, total, size)
+    ps = _windows_exe("powershell.exe") if attributes else None
+    if ps:
+        try:
+            got = run([ps, "-NoProfile", "-NonInteractive", "-Command",
+                       f"(Get-Item -LiteralPath '{vhdx}').Attributes.ToString()"],
+                      capture_output=True, text=True, timeout=timeout)
+            attrs = (getattr(got, "stdout", "") or "").strip()
+            if attrs:
+                host.sparse = "SparseFile" in attrs
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return host
+
+
+def host_space_warning(path: str, need_bytes: int, proc: str = "/proc", host=None) -> str | None:
+    """Under WSL2, a warning when writing ``need_bytes`` to ``path`` inside the virtual disk could
+    fill the Windows drive under it; None when it fits, outside WSL2, or on a drvfs path (whose
+    own free space is already the Windows drive's)."""
+    if need_bytes <= 0 or not is_wsl(proc):
+        return None
+    mounts = parse_mountinfo(_read(os.path.join(proc, "self/mountinfo")) or "")
+    m = mount_of(os.path.realpath(nearest_existing(path)), mounts)
+    if m is None or m.fstype in ("9p", "drvfs", "tmpfs", "ramfs"):
+        return None
+    host = host if host is not None else wsl_host_disk(proc)
+    if host is None or host.free_bytes is None:
+        return None
+    if need_bytes + HOST_FREE_FLOOR_BYTES <= host.free_bytes:
+        return None
+    return (
+        f"--moe-bank-ram: writing {need_bytes / GiB:.1f} GiB into {path} can grow this WSL2 distro's "
+        f"virtual disk ({host.vhdx}) by that much, and {host.drive} has {host.free_bytes / GiB:.1f} GiB "
+        f"free -- `df /` inside WSL shows the virtual disk's size, not the drive's. When the drive "
+        f"fills, WSL stops mid-write; space freed inside later is not returned to Windows. Free space "
+        f"on {host.drive} or move the bank with --moe-bank-dir"
+    )
+
+
+# A margin under which the Windows drive is treated as full: the vhdx grows in 32 MiB blocks,
+# its metadata and Windows itself need room, and swap may live on the same drive.
+HOST_FREE_FLOOR_BYTES = 20 * GiB
+
+
 def storage_warnings(path: str, proc: str = "/proc", sys: str = "/sys") -> list[str]:
     """One line per thing about where ``path`` is that makes --moe-bank-ram slow. Empty = nothing
     known to be wrong (not the same as measured to be right)."""
@@ -655,3 +840,24 @@ def storage_warnings(path: str, proc: str = "/proc", sys: str = "/sys") -> list[
             f"adds about 300 ms per decode step even at 64 GB. An NVMe is what this was built for"
         )
     return out
+
+
+def refuses_new_bank(path: str, proc: str = "/proc", sys: str = "/sys") -> str | None:
+    """Why a bank file must not be created under ``path``, or None.
+
+    Only the filesystems the verdict calls bad (9p/drvfs, network, tmpfs, FAT): creating the file
+    there costs what the flag exists to save or fills a drive the server cannot see -- a 16-64 GiB
+    file on a WSL2 /mnt/c path lands on the Windows drive through a file server, at a speed no
+    decode survives. A file somebody already put there is served, with the warning.
+    """
+    if not os.path.isdir(os.path.join(proc, "self")):
+        return None
+    s = probe_storage(path, proc, sys)
+    level, why = s.fs_verdict
+    if level != "bad":
+        return None
+    return (
+        f"--moe-bank-ram: not creating a bank file under {os.path.abspath(os.path.expanduser(path))}: it "
+        f"is on {why}. Point --moe-bank-dir at a local Linux filesystem (under WSL2, somewhere in the "
+        f"distro, such as the default ~/.cache/freetoken/bankmap)"
+    )

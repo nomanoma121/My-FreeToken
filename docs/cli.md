@@ -101,7 +101,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
-| `--moe-bank-ram` | off | Half the RAM: keep only the frequently routed experts resident, map the rest from disk. Whole-host cap (`48G`), split across ranks. `auto` = MemAvailable at startup − 4.5 GiB per rank − a page cache margin (5% of MemTotal, at least 2 GiB), with the arithmetic logged. Needs `RLIMIT_MEMLOCK` (`ulimit -l`) at least as large as one rank's share, or the resident half is quietly smaller than asked. See [bank-ram.md](bank-ram.md) |
+| `--moe-bank-ram` | off | Half the RAM: keep only the frequently routed experts resident, map the rest from disk. Whole-host cap (`48G`), split across ranks. `auto` = MemAvailable at startup − 4.5 GiB per rank − a page cache margin (5% of MemTotal, at least 2 GiB), and under WSL2 no more than the CUDA pin budget (40% of MemTotal, `FREETOKEN_PIN_BUDGET_GB`) − 2 GiB, with the arithmetic logged. Needs `RLIMIT_MEMLOCK` (`ulimit -l`) at least as large as one rank's share, or the resident half is quietly smaller than asked. See [bank-ram.md](bank-ram.md) |
 | `--moe-bank-stats` | — | Routing histograms (from `--moe-stats-out`, every rank's file) that decide which experts stay resident. A change reorders the bank file in place; without the flag the order already in the file is kept |
 | `--moe-bank-dir` | `~/.cache/freetoken/bankmap/<model>` | Where the bank file (`bank.ftmb`, one for every rank) lives. A checkpoint packed by `ft bank pack` keeps its own inside it. The startup log warns when that is a 9p/drvfs, network or tmpfs mount, a USB, SATA or rotating disk |
 | `--moe-bank-readahead` | off | With `--moe-bank-ram`: `auto` writes the recommended device `read_ahead_kb` for the model's block geometry, a number writes that many kB; `off` only logs the current window and the command to change it. Each rank sets it before opening its mapping, since an open mapping keeps the window it was opened with. Device-wide and left set after exit. See [bank-ram.md](bank-ram.md#3-set-the-device-readahead) |
@@ -214,8 +214,9 @@ and no root; reads `/proc` and `/sys` and nothing else unless it benchmarks.
 - **Storage** of the bank file (and of the checkpoint when it is elsewhere): filesystem,
   the block device under it through dm/partitions, transport (NVMe/SATA/USB/virtual), the NVMe
   PCIe link, and an estimate of whether the drive sits behind the chipset -- and shares that
-  uplink with a GPU. Inside WSL2 the drive is behind a virtual disk; the report says so and
-  prints the PowerShell to look it up from Windows.
+  uplink with a GPU. Inside WSL2 the drive is behind a virtual disk: the report names the
+  `ext4.vhdx`, the Windows drive it grows on and that drive's free space (which `df` inside the
+  distribution does not show), and whether the virtual disk is sparse.
 - **Readahead**: the current window against the one recommended for this model's widest
   expert-row block, and the exact command to set it (before starting the server).
 - **Memory**: MemTotal/MemAvailable, swap, `ulimit -l`, and what `--moe-bank-ram auto` would choose.

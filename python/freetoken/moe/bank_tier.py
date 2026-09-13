@@ -129,6 +129,13 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
         )
 
     path = bank_path_for(config.model_path, packed, config.moe_bank_dir)
+    if not os.path.exists(path):
+        # before anything creates the directory or the file: every rank, since any of them could
+        from . import disk_probe
+
+        why = disk_probe.refuses_new_bank(os.path.dirname(os.path.abspath(path)))
+        if why:
+            raise ValueError(why)
     if first_rank:
         # Before anything is written there or mapped from it: a bank on /mnt/c under WSL2, a
         # network share, tmpfs, a USB or SATA disk all start and serve, just at a fraction of the
@@ -148,4 +155,5 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
         path, layers, all_layers=range(total_layers), num_experts=num_experts, hot_per_layer=hot,
         wanted=wanted, layout=layout, meta=meta, can_write=packed is None, log=log, warn=warn,
         readahead=getattr(config, "moe_bank_readahead", "off") or "off", report_readahead=first_rank,
+        first_rank=first_rank,
     )

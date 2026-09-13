@@ -290,7 +290,35 @@ class Report:
         return "\n".join(out).lstrip("\n")
 
 
-def _storage(rep: Report, label: str, path: str, proc: str, sys: str, gpus) -> dp.Storage:
+def _wsl_host(rep: Report, label: str, s: dp.Storage, proc: str, need: int, host=None) -> None:
+    """Under WSL2: the Windows drive under the virtual disk, which `df` inside cannot show."""
+    host = host if host is not None else dp.wsl_host_disk(proc, attributes=True)
+    if host is None:
+        rep.say("WSL2: this is a file (ext4.vhdx) on a Windows drive; which one could not be read from the "
+                "registry (Windows interop off?). `df /` here is the virtual disk's size, not that drive's free space")
+        rep.find("warn", "WSL2: the free space of the Windows drive under the virtual disk is unknown; check it "
+                         "before writing a bank file")
+        return
+    size = f", {host.vhdx_bytes / GiB:.1f} GiB" if host.vhdx_bytes else ""
+    sparse = {True: "sparse", False: "not sparse", None: "sparse or not unknown"}[host.sparse]
+    rep.say(f"WSL2: the virtual disk is {host.vhdx}{size}, {sparse}")
+    if host.free_bytes is None:
+        rep.say(f"  {host.drive} is not mounted inside WSL, so its free space is unknown")
+    else:
+        rep.say(f"  {host.drive} has {host.free_bytes / GiB:.1f} GiB free of {host.total_bytes / GiB:.0f} GiB -- "
+                f"that, not `df /` ({s.mount.mountpoint} shows the virtual disk's own size), is what a bank "
+                f"write grows into")
+    if host.sparse is not True:
+        rep.say("  space freed inside the distro is not returned to Windows (the vhdx only grows)")
+    if host.free_bytes is not None and need + dp.HOST_FREE_FLOOR_BYTES > host.free_bytes:
+        what = f"the {need / GiB:.1f} GiB the bank file still needs" if need else "anything large"
+        rep.find("bad" if need > host.free_bytes else "warn",
+                 f"{host.drive} has {host.free_bytes / GiB:.1f} GiB free, under {what} plus a "
+                 f"{dp.HOST_FREE_FLOOR_BYTES / GiB:.0f} GiB margin: when the Windows drive fills, WSL stops "
+                 f"mid-write")
+
+
+def _storage(rep: Report, label: str, path: str, proc: str, sys: str, gpus, need: int = 0) -> dp.Storage:
     s = dp.probe_storage(path, proc, sys)
     rep.section(f"{label}: {s.path}")
     if s.mount is None:
@@ -316,10 +344,9 @@ def _storage(rep: Report, label: str, path: str, proc: str, sys: str, gpus) -> d
     if d.virtual:
         rep.say("rotational flag and transport of the drive behind a virtual disk are not visible from here")
         if s.wsl:
-            rep.say("WSL2: this is a file (ext4.vhdx) on a Windows drive. To see which drive, in PowerShell:")
-            rep.say("  Get-ChildItem HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss | "
-                    "ForEach-Object { Get-ItemProperty $_.PSPath } | Select-Object DistributionName,BasePath")
-            rep.say("  Get-PhysicalDisk | Select-Object FriendlyName,BusType,MediaType")
+            _wsl_host(rep, label, s, proc, need)
+            rep.say("  Get-PhysicalDisk | Select-Object FriendlyName,BusType,MediaType   (PowerShell: which drive "
+                    "type that is)")
             rep.say("PCIe link and chipset placement cannot be seen from inside WSL2 either")
     else:
         rep.say(f"rotational: {'yes' if d.rotational else 'no' if d.rotational is not None else 'unknown'}")
@@ -409,7 +436,12 @@ def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
     # ---- storage
     gpus = dp.nvidia_gpus(sys)
     target = bank_dir or (ns.model or os.path.expanduser("~"))
-    s = _storage(rep, "Bank storage", target, proc, sys, gpus)
+    # what a start would still write into the bank file: all of it without one, the missing layers with one
+    if bank is not None and not bank.error and bank.all_layers and shape.bank_bytes:
+        need = shape.bank_bytes * (bank.all_layers - len(bank.layers)) // bank.all_layers
+    else:
+        need = shape.bank_bytes or 0
+    s = _storage(rep, "Bank storage", target, proc, sys, gpus, need)
     if ns.model and os.path.exists(ns.model):
         m = dp.probe_storage(ns.model, proc, sys)
         if not (m.mount and s.mount and m.mount.mountpoint == s.mount.mountpoint and m.dev == s.dev):
@@ -453,7 +485,7 @@ def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
             f"{_gib(swap_total)}")
     auto = None
     try:
-        auto = dp.auto_bank_ram(mem, ranks)
+        auto = dp.auto_bank_ram(mem, ranks, proc)
         rep.say(auto.reason().replace("--moe-bank-ram auto: ", "--moe-bank-ram auto would choose ", 1))
     except ValueError as exc:
         rep.say(str(exc))

@@ -230,6 +230,14 @@ MemAvailable, so whatever else is running at startup is left alone -- and a serv
 something large is running gets a smaller cap than it would otherwise. A model that keeps more in
 host RAM than Flash-Next (a host embedding, PLE tables in RAM) needs an explicit size.
 
+Under WSL2 it also stays inside the CUDA pin budget, because the resident rows are registered with
+CUDA and WSL2 caps page-locked memory near half of the VM's RAM: the budget is 40% of MemTotal
+(`FREETOKEN_PIN_BUDGET_GB` overrides it, as it does for the rest of the server), less 2 GiB for
+the other buffers the server pins. On an RTX 2060 host with 23.5 GiB, RAM alone chose 15.6 GiB of
+Ornith's 16.9; 141 of 240 resident blocks registered and the boot died in a CUDA allocation. With
+the cap it chose 7.4 GiB, started, and the server's own anonymous and shared memory came to
+3.4 GiB -- inside the 4.5 GiB it budgets.
+
 The first run reads the checkpoint's experts and writes the file (63.4 GiB for Flash-Next, each
 rank its half). Later runs read no expert tensor from the checkpoint; a new `--moe-bank-stats`
 reorders the file in place, and a new budget or layer split changes nothing on disk
@@ -423,6 +431,13 @@ drive (`df -h /mnt/c`, or Explorer). And the virtual disk grows as files are wri
 shrink when they are deleted: a reorder, a pack and an unpack in a row each take their share of the
 host drive for good, until the disk is compacted. When the host drive fills, the distribution
 stops and will not start until space is freed there.
+
+`ft doctor disk` prints that drive, its free space and whether the virtual disk is sparse (it asks
+the registry and PowerShell through WSL interop). A start that is about to write layers into the
+bank file warns first when the whole file's missing layers, plus a 20 GiB margin, exceed the
+Windows drive's free space. And a bank file is never *created* on a 9p/drvfs path (`/mnt/c/...`), a
+network filesystem or tmpfs: the start stops before anything is written there and says where to
+point `--moe-bank-dir` instead. A file already placed there is served, with a warning.
 
 `pack` and `verify` have run on Ornith on an RTX 2060 host: the packed checkpoint served the same
 text at temperature 0 as the original. `unpack` has run on the synthetic checkpoints of the test

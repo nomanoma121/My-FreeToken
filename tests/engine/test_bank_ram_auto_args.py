@@ -33,6 +33,9 @@ def host(monkeypatch):
 
     mem = {"MemTotal": 62 * GiB, "MemAvailable": 60 * GiB}
     monkeypatch.setattr(disk_probe, "meminfo", lambda proc="/proc": dict(mem))
+    # a host that does not cap CUDA pinning, even when the tests run under WSL2
+    monkeypatch.setattr(disk_probe, "is_wsl", lambda proc="/proc": False)
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
     return mem
 
 
