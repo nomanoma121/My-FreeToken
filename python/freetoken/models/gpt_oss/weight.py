@@ -288,6 +288,39 @@ def _source_slices(config, tp_info) -> dict[str, tuple[str, tuple[slice, ...]]]:
     }
 
 
+def expert_sources(model_path: str, config, kind: QuantKind, *, weight_map=None):
+    """``{name: ExpertSource}`` for the stacked HF expert tensors (``ft bank pack``): one per layer
+    and source, the whole ``[E, ...]`` tensor. Only at TP=1, where a piece is the tensor unsliced."""
+    if kind is not QuantKind.MXFP4:
+        return None
+    from freetoken.distributed import DistributedInfo, try_get_tp_info
+    from freetoken.models.loader import safetensors_weight_map
+    from freetoken.moe.expert_pieces import ExpertSource
+    from freetoken.utils import download_hf_weight
+
+    tp_info = try_get_tp_info() or DistributedInfo(0, 1)
+    if tp_info.size != 1:
+        raise NotImplementedError("gpt-oss expert sources are the unsliced tensors: TP=1 only")
+    if weight_map is None:
+        weight_map = safetensors_weight_map(download_hf_weight(model_path))
+    roles = {source: role for source, (role, _) in _source_slices(config, tp_info).items()}
+    out = {}
+    for name in weight_map:
+        info = _expert_layer_and_name(name)
+        if info is None:
+            continue
+        layer_id, source = info
+        if source not in roles:
+            raise ValueError(f"Unexpected GPT-OSS expert source: {name}")
+        if not 0 <= layer_id < config.num_layers:
+            raise ValueError(f"Unexpected GPT-OSS expert layer in checkpoint: {name}")
+        out[name] = ExpertSource(name, layer_id, 0, config.num_experts, roles[source], stacked=True)
+    expected = config.num_layers * len(_EXPERT_SOURCES)
+    if len(out) != expected:
+        raise ValueError(f"GPT-OSS: found {len(out)} expert tensors, expected {expected}")
+    return out
+
+
 def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20):
     """gpt-oss experts as HF ships them, one piece per layer: stacked ``[E, ...]`` mxfp4
     ``_blocks`` / ``_scales`` / ``_bias`` tensors sliced to this rank's intermediate range."""

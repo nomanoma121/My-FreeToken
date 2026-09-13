@@ -67,6 +67,17 @@ class TritonNvfp4MoEKernel(MoEKernel):
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))
         return {}
 
+    def unpack(self, rows, cfg: MoEConfig):
+        # codes and fp8 block scales are concatenated as stored; the globals went through fp16
+        # (and a reciprocal for quant-side dialects), so they are not recoverable byte for byte
+        i = cfg.intermediate
+        return {
+            "gate_up": rows["gate_up"], "gate_up_scale": rows["gate_up_scale"],
+            "gate": rows["gate_up"][:, :i], "up": rows["gate_up"][:, i:],
+            "gate_scale": rows["gate_up_scale"][:, :i], "up_scale": rows["gate_up_scale"][:, i:],
+            "down": rows["down"], "down_scale": rows["down_scale"],
+        }
+
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4
 

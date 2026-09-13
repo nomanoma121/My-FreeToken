@@ -145,4 +145,46 @@ def iter_nvfp4_expert_pieces(
     return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
 
 
-__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
+def nvfp4_expert_sources(model_path: str, config, spec: Nvfp4ExpertSourceSpec, *, weight_map: dict[str, str] | None = None):
+    """``{name: ExpertSource}`` for every per-expert NVFP4 tensor, by global bank layer.
+
+    The same matching ``iter_nvfp4_expert_pieces`` does, without the pipeline window and without
+    reading a byte: ``config`` is the full model's.
+    """
+    from freetoken.models.loader import safetensors_weight_map
+    from freetoken.moe.expert_pieces import ExpertSource
+
+    if weight_map is None:
+        weight_map = safetensors_weight_map(download_hf_weight(model_path))
+    num_layers = _num_moe_layers(config)
+    out: dict[str, ExpertSource] = {}
+    for name in weight_map:
+        match = spec.key_pattern.match(name)
+        if match is None:
+            continue
+        layer = int(match.group("layer"))
+        bank_layer = spec.layer_to_bank(layer, config)
+        if bank_layer is None:
+            continue
+        if not 0 <= bank_layer < num_layers:
+            raise ValueError(f"{spec.desc}: bank layer {bank_layer} for checkpoint layer {layer} is outside [0, {num_layers})")
+        proj = match.group("proj")
+        if proj not in spec.proj_to_role:
+            raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
+        kind = _canon_kind(spec, match.group("kind"))
+        if kind not in ("weight", "weight_scale", "weight_scale_2"):
+            raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
+        role = spec.proj_to_role[proj] + _kind_suffix(kind)
+        convert = None
+        if role.endswith("_global"):
+            def convert(t, _spec=spec):
+                return _ingest_global(_spec, t).reshape(1, -1)
+        expert = int(match.group("expert"))
+        out[name] = ExpertSource(name, bank_layer, expert, expert + 1, role, stacked=False, convert=convert)
+    expected = num_layers * config.num_experts * 9
+    if len(out) != expected:
+        raise ValueError(f"{spec.desc}: found {len(out)} expert tensors, expected {expected}")
+    return out
+
+
+__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces", "nvfp4_expert_sources"]
