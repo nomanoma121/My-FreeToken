@@ -59,7 +59,7 @@ cost where acceptance runs long. [docs/kai.md](docs/kai.md) has the per-step tim
 
 | GPU | Host RAM | Model | Context | Decode |
 |---|---|---|---|---|
-| 1× RTX 2060 6 GB | 32 GB | `openai/gpt-oss-20b` (21B MoE, MXFP4) | not recorded | 13–14 tok/s |
+| 1× RTX 2060 6 GB | 32 GB | `openai/gpt-oss-20b` (21B MoE, MXFP4) | 20k | 14–16 tok/s |
 | 1× RTX 2060 6 GB | 32 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **64k** | **25–39 tok/s** |
 | 2× RTX 3060 12 GB, one card used | 128 GB | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B-A3B, vision) | **256k** | **39–47 tok/s** near the start, **25** at 250k |
 | 2× RTX 3060 12 GB, one card used | 64 GB* | `openai/gpt-oss-120b` (117B MoE, MXFP4) | 32k | **15 tok/s** (`--moe-bank-ram 48G`) |
