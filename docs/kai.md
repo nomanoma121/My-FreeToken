@@ -328,11 +328,16 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 | `FT_SPEC_CHECK_STEP` | `0` | Cross-check the first n one-row verify windows against the plain decode path from the same state (per-layer residual, final logits, GDN state) |
 | `FT_SPEC_NO_GRAPH` / `FT_SPEC_NO_MTP_GRAPH` | off | Keep the verify window / the draft head eager (A/B runs) |
 | `FT_SPEC_GRAPH_MIN_FREE_MB` | `256` | Drop the verify-window graphs when less VRAM than this is left after capture (`0` keeps them) |
+| `FREETOKEN_ADMISSION_WARN_SECONDS` | `30` | Warn when the request at the head of the prefill queue has been refused admission this long -- counting only time in which the requests it waits behind made no progress, or none is running -- with the reason and its numbers (request slots, KV, GDN state slots, sliding-window pool). Repeats every 60 s; `0` disables |
+| `FREETOKEN_RANK_WAIT_WARN_SECONDS` | `60` | Multi-rank: warn when a blocking send or receive between ranks has waited this long, naming what for; repeats every 60 s, nothing times out (see [pipeline.md](pipeline.md)); `0` disables |
 | `FREETOKEN_PREMAP_VRAM` | off | Pre-map the remaining VRAM into the allocator cache at startup; an experiment that did not help on the 2060 (per-stream pools), left as a knob |
 
 ## Known limitations
 
 - Video and the Anthropic / Responses adapters (still text-only) are not covered.
+- Token log probabilities are not available. `/v1/chat/completions` and `/v1/completions`
+  answer a request for `logprobs` / `top_logprobs` with a 400 rather than a response without
+  them (on chat, `logprobs: false` and `top_logprobs: 0` are accepted).
 - `--spec-mtp` serves one request at a time and needs a checkpoint that ships an MTP head; its
   CUDA graphs need the Triton attention backend (eager otherwise).
 - Image prompts bypass the shared prefix cache (by upstream design), so a conversation with images

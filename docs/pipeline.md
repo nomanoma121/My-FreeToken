@@ -37,13 +37,19 @@ Ornith-1.5-35B-A3B; `qwen3_5_moe`) and gpt-oss (`gpt_oss`). Others raise
   step.
 - Each rank allocates only its own layers' KV pages, GDN state slots, expert cache and pinned
   host banks. The cache budget (`--memory-ratio`) is solved per rank, so cards of different
-  sizes get different cache sizes automatically.
+  sizes get different expert-cache sizes automatically. The KV page count is the exception:
+  every rank's scheduler reads it when it admits requests and evicts cached prefixes, so all
+  ranks take the smallest count any rank solved (`--pp-size: KV pool 2050 -> 2048 pages` on the
+  two 3060s, where the expert fill had left rank 0 two pages more).
 - CUDA graphs: the first rank's decode graph outputs the residual stream instead of logits;
   the others capture their graphs against a static input buffer the received stream is
   copied into. `--spec-mtp`'s verify-window graphs work the same way.
 - The prefill chunk (`--prefill-chunk-budget`) is one number for the whole pipeline: the ranks
   agree on the tightest measurement at startup and keep it, because the residual stream they
-  hand each other is sized from it. See [prefill-chunk.md](prefill-chunk.md#two-gpus).
+  hand each other is sized from it. The `--spec-mtp` graphs are captured after that measurement
+  and keep their pools, so the ranks check the chunk once more when the boot is done and narrow
+  it if the tightest rank no longer has the room (2816 -> 2560 on the 3060s). See
+  [prefill-chunk.md](prefill-chunk.md#two-gpus).
 - Prefill chunks overlap across the ranks: for a chunk whose sampled token nobody reads (every
   chunk but the last), the first rank hands the stream on and starts the next chunk without
   waiting, so a long prompt costs about the slower rank's time per chunk, not the sum.
@@ -54,6 +60,18 @@ Ornith-1.5-35B-A3B; `qwen3_5_moe`) and gpt-oss (`gpt_oss`). Others raise
   a send completed only inside `wait()`, so `is_completed()` is False even for a message the
   peer took long ago, and a backlog filtered that way never shrinks. Every iteration walks that
   backlog, so an unbounded one turns into a per-step cost proportional to the steps served.
+- The client messages themselves go from the first rank to the others over a ZeroMQ PUB/SUB
+  socket, which drops whatever arrives before the receiving side's subscription has registered
+  -- a few hundred milliseconds after the socket exists. Before reporting ready, the ranks
+  exchange hellos over it until every rank has received one (`rank relay: 1 rank(s) subscribed
+  after N hello(s)`), so a request sent the instant the server is ready is not lost. If a rank
+  never hears one within a minute, every rank stops with an error rather than one of them
+  waiting forever.
+- Every blocking send and receive between the ranks is watched. A wait longer than
+  `FREETOKEN_RANK_WAIT_WARN_SECONDS` (60) logs which rank is waiting for what, again every
+  minute while it lasts, and how long it took once it ends. Nothing times out. A wait of tens of
+  seconds can be a long prefill chunk on the other rank; one that keeps growing means that rank
+  has stopped, and its own log (or `py-spy dump`) says where.
 
 ## Running
 
@@ -165,6 +183,11 @@ cache than this one did.
   held flat across 175,000 decode steps of live serving over 4.8 hours -- 19.2 tok/s at the point
   where the old build had fallen to 2.3, and a residual drift of 0.05 us per step against the old
   build's 2.5, which is to say none that this measurement can separate from load.
+- Builds of this fork published before 2026-09-13 have neither the relay handshake nor the
+  shared KV page count described under "How it works": a request sent right at readiness could
+  be dropped between the ranks, leaving both waiting on each other with nothing in the log, and
+  the ranks' schedulers could disagree about the KV pool once the prefix cache filled up.
+  Neither was observed failing on the 3060s; both were found by reading the code. Update.
 
 When reporting a problem, include `nvidia-smi -L`, the first 60 lines of the server log (both
 ranks) and the exact `--pp-size` / `--pp-layers` / `--gpu` values.

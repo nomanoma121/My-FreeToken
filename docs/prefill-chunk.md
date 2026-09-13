@@ -83,6 +83,13 @@ in gloo with `Received data size doesn't match expected size`.
 So the re-solve before each prefill is a single-GPU feature. A two-card run keeps the boot
 value, and a desktop that takes 300 MB mid-session no longer shrinks the chunk to match.
 
+The boot value is checked once more at the end of startup. The measurement has to come before
+the prefill warmup, which runs at the chunk it chose, and so before `--spec-mtp` captures its
+verify-window and draft-head graphs, which keep their memory pools. Once those are in, the ranks
+agree again on the least VRAM any of them has usable and narrow the chunk if it no longer fits
+the same budget share; it never widens. On the two RTX 3060s with `--spec-mtp 5` that took 2816
+to 2560 (`--prefill-chunk-budget: 2816 -> 2560 after the boot`).
+
 ## Wider chunks: `--prefill-mixer-pieces`
 
 With the experts in host RAM, every prefill chunk streams every layer's expert bank to the GPU.

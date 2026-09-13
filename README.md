@@ -30,6 +30,21 @@ at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 > the head died on a bare `IndexError` -- while the other rank came up and reported its banks
 > mapped and registered.
 
+> **2026-09-13 — pull if you run `--pp-size`, or serve a Qwen model to a client that uses tool
+> calls.** Two ways a two-card server could stop serving without an error, both found by reading
+> the code rather than by a failure here: a request sent the moment the server reported ready
+> could be dropped on its way from the first rank to the others, leaving both waiting on each
+> other; and the ranks sized their KV pools separately (2050 and 2048 pages on the two RTX
+> 3060s) while each rank's scheduler reads its own pool when it evicts cached prefixes. The
+> prefill chunk is also checked again once the `--spec-mtp` graphs have taken their VRAM. See
+> [docs/pipeline.md](docs/pipeline.md).
+>
+> On any card: Qwen output could carry `<|im_end|>` and other special tokens in the text, and a
+> Qwen3.5-family tool call written as JSON inside `<tool_call>` reached the client as plain text
+> (non-streaming) or not at all (streaming). The startup log now also says how much context the
+> KV pool actually holds, which for an offloaded MoE left at the default `--kv-reserve-tokens 8192`
+> is far below what `/v1/models` advertises.
+
 Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer, text only.
 This fork adds nine things on top of it. They are independent — take one, ignore the rest.
 
