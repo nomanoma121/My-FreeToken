@@ -133,9 +133,14 @@ with what the desktop is doing, the order does not.
 | `--prefill-mixer-pieces 2 --max-prefill-length 8192` | 195.7 | 4352 | 5 | **36.5 s** | **546 tok/s** |
 | `--prefill-mixer-pieces 4 --max-prefill-length 16384` | 195.7 | 4352 | 5 | 36.6 s | 544 tok/s |
 
-**On Flash-Next, 2 is the setting; 4 adds nothing.** If the mixers still set the peak, four
-pieces would have gone below two. They did not, so at two pieces the peak has already moved to
-something outside the mixers, about 196 KiB per token, which has not been broken down yet.
+**On Flash-Next, 2 is the setting; 4 adds nothing.** Measured by part, at two pieces the peak is
+no longer a mixer: it is PLE on the first pipeline rank (170.5 KiB per token of its own) and the
+routed experts on the second (98.7). Running those over the pieces as well was tried. It worked
+for memory -- four pieces came down to 108.1 KiB per token and a 7,936-token chunk -- and made
+prefill slower: 562 tok/s at two pieces, 507 at four held to the same 5,376-token chunk, 493 at
+four with the wider chunk, the same on a second prompt of each boot. Each extra piece costs a fixed
+amount in every layer, and on these two cards a chunk fewer did not win that back. That change is
+not in this fork.
 
 Where it applies: Qwen3.8-Flash-Next, on one GPU or under `--pp-size` (a piece never leaves its
 rank; what crosses to the next rank is the whole chunk, as before), including the `--spec-mtp`
