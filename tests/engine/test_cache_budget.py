@@ -20,20 +20,20 @@ def test_moe_priority_fills_experts_up_to_total():
         kv_reserve_pages=5, max_slots=8,
     )
     assert size == 8  # capped at full residency
-    assert pages == (2000 - 8 * 100) // 10  # == 120, remainder to KV
+    assert pages == (2000 - 8 * 100) // 10 - 1  # == 119, remainder to KV less the dummy page
     assert overlap is True
 
 
 def test_offload_case_experts_take_most_kv_gets_reserve_floor():
     # budget too small for full residency: experts take what they can, KV keeps its floor.
     size, pages, overlap = plan_cache_budget(
-        budget_bytes=1000, per_expert_bytes=100, cache_per_page=10,
+        budget_bytes=1010, per_expert_bytes=100, cache_per_page=10,
         num_experts=2, total_experts=50, prefill_overlap=True,
         kv_reserve_pages=10, max_slots=50,
     )
-    # raw = (1000 - 10*10) // 100 = 9 ; clamped to [4, 50] -> 9
+    # raw = (1010 - (10 + 1 dummy)*10) // 100 = 9 ; clamped to [4, 50] -> 9
     assert size == 9
-    assert pages == max((1000 - 9 * 100) // 10, 10)  # remainder 10 pages, == floor
+    assert pages == max((1010 - 9 * 100) // 10 - 1, 10)  # remainder 10 usable pages, == floor
     assert overlap is True
 
 
@@ -45,7 +45,7 @@ def test_marlin_cap_clamps_count_and_rolls_bytes_to_kv():
         kv_reserve_pages=0, max_slots=992,
     )
     assert size == 992
-    assert pages == (200_000 - 992 * 100) // 10
+    assert pages == (200_000 - 992 * 100) // 10 - 1
 
 
 def test_small_cache_disables_prefill_overlap():
@@ -89,7 +89,7 @@ def test_prefill_overlap_false_is_honored():
     )
     assert size == 8
     assert overlap is False
-    assert pages == (2000 - 8 * 100) // 10
+    assert pages == (2000 - 8 * 100) // 10 - 1
 
 
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
@@ -108,8 +108,31 @@ def test_resolve_auto_applies_ratio_once():
         num_experts=4, total_experts=8, prefill_overlap=True,
         kv_reserve_tokens=0, page_size=1,
     )
-    # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 = 40 pages
-    assert size == 8 and pages == 40 and overlap is True
+    # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 = 40 pages, one of them the dummy
+    assert size == 8 and pages == 39 and overlap is True
+
+
+def test_the_plan_pays_for_the_pools_dummy_page():
+    """create_kv_pool allocates num_pages + 1: the plan's usable pages plus a dummy page that
+    padded rows write into. The plan used to price only the usable pages, so a plan that filled
+    the budget exactly allocated one page past it (upstream #340)."""
+    from freetoken.engine.cache_budget import required_bytes
+
+    # 4 expert slots (400 B) + 10 usable pages + the dummy (110 B) = 510 B
+    size, pages, _ = plan_cache_budget(
+        budget_bytes=510, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=4, prefill_overlap=False,
+        kv_reserve_pages=10, max_slots=4,
+    )
+    assert (size, pages) == (4, 10)
+    assert required_bytes(size, pages, 100, 10) == 510
+
+    with pytest.raises(AssertionError, match="budget too small"):
+        plan_cache_budget(
+            budget_bytes=509, per_expert_bytes=100, cache_per_page=10,
+            num_experts=4, total_experts=4, prefill_overlap=False,
+            kv_reserve_pages=10, max_slots=4,
+        )
 
 
 def test_resolve_auto_caps_slots_at_the_kernel_limit():
@@ -266,7 +289,7 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
-def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
+def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
     import torch
 
     from freetoken.engine.engine import Engine
@@ -336,6 +359,24 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
+
+    # An explicit --num-pages / --num-tokens stays the KV size (the caller keeps it over the
+    # plan's pages), so the plan has to reserve it: the experts may only fill what it leaves.
+    # Reserving --kv-reserve-tokens instead let them take the difference, and the KV pool
+    # OOMed at boot (upstream #383).
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return 8, 64, True
+
+    monkeypatch.setattr("freetoken.engine.cache_budget.resolve_moe_cache_auto", _capture)
+
+    class Explicit(StubConfig):
+        num_page_override = 64
+
+    engine._resolve_auto_moe_cache_size(Explicit(), StubBanks())
+    assert captured["kv_reserve_tokens"] == 64 * 16
 
 
 # ---------------------------------------------------------------------------

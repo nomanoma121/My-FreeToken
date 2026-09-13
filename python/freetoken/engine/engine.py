@@ -1028,6 +1028,11 @@ class Engine:
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         per_expert = expert_bytes_per_slot(banks.sources)
+        # An explicit --num-pages / --num-tokens is kept as the KV size (the caller does not
+        # overwrite it with the plan's pages), so the experts may only fill what that leaves.
+        # Reserving the smaller --kv-reserve-tokens instead let them take the difference, and
+        # the KV pool then OOMed at boot (upstream #383).
+        explicit_tokens = (getattr(config, "num_page_override", None) or 0) * page_tokens
         size, pages, overlap = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -1038,7 +1043,7 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve, explicit_tokens),
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
             fixed_parts=fixed_parts,

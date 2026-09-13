@@ -38,11 +38,23 @@ def net_cache_budget_bytes(
     return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
+# Every KV pool allocates one page past the usable ones for padded / dummy rows to write into
+# (create_kv_pool and rebuild_from_config: num_pages + 1). DSV4's solver already takes it off;
+# the generic arithmetic below used to price only the usable pages.
+_DUMMY_PAGES = 1
+
+
+def pool_pages(num_pages: int) -> int:
+    """Pages a pool of ``num_pages`` usable pages actually allocates."""
+    return num_pages + _DUMMY_PAGES
+
+
 def required_bytes(
     moe_cache_size: int, num_pages: int, per_expert_bytes: int, cache_per_page: int
 ) -> int:
-    """GPU bytes a ``(moe_cache_size, num_pages)`` geometry occupies (MoE slots + KV pages)."""
-    return moe_cache_size * per_expert_bytes + num_pages * cache_per_page
+    """GPU bytes a ``(moe_cache_size, num_pages)`` geometry occupies: MoE slots, plus the
+    ``num_pages`` usable KV pages and the pool's dummy page."""
+    return moe_cache_size * per_expert_bytes + pool_pages(num_pages) * cache_per_page
 
 
 class CacheBudgetTooSmall(AssertionError):
@@ -117,12 +129,12 @@ def shortfall_fixes(
       down to num_experts) alone makes it fit.
     """
     expert_floor = exc.moe_slots * exc.per_expert_bytes
-    kv_now = exc.kv_pages * exc.cache_per_page
+    kv_now = pool_pages(exc.kv_pages) * exc.cache_per_page
 
     kv_tokens = None
     left_for_kv = exc.budget_bytes - expert_floor
     if left_for_kv > 0:
-        pages = left_for_kv // exc.cache_per_page
+        pages = left_for_kv // exc.cache_per_page - _DUMMY_PAGES
         tokens = pages * page_size
         if pages > 1 and tokens >= min_reserve_tokens:
             kv_tokens = int(tokens)
@@ -178,7 +190,7 @@ def explain_shortfall(
     )
     parts = "  ".join(f"- {name} {_gib(b)}" for name, b in fixed_parts.items() if b) or "- fixed 0"
     expert_floor = exc.moe_slots * exc.per_expert_bytes
-    kv_now = exc.kv_pages * exc.cache_per_page
+    kv_now = pool_pages(exc.kv_pages) * exc.cache_per_page
     short = exc.need_bytes - exc.budget_bytes
     lines = [
         f"cache budget too small: the smallest plan needs {_mib(exc.need_bytes)}, the budget is "
@@ -235,7 +247,7 @@ def describe_plan(
     """One line for a plan that fit: what the budget was spent on, so a later OOM or a slow
     decode can be read against it without re-deriving the arithmetic."""
     experts = moe_cache_size * per_expert_bytes
-    kv = num_pages * cache_per_page
+    kv = pool_pages(num_pages) * cache_per_page
     fixed = ", ".join(f"{name} {_gib(b)}" for name, b in fixed_parts.items() if b) or "none"
     return (
         f"cache plan: weights {_gib(weights_bytes)}; fixed {fixed}; "
@@ -261,6 +273,9 @@ def plan_cache_budget(
     Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV, clamped
     to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
     overlap is feasible else ``num_experts``); KV pages take whatever remains.
+
+    ``num_pages`` is the usable count. The pool allocates one dummy page on top of it
+    (``create_kv_pool``: ``num_pages + 1``), so that page is charged to the budget here too.
     """
     assert per_expert_bytes > 0, "per_expert_bytes must be positive"
     assert cache_per_page > 0, "cache_per_page must be positive (owned-KV models unsupported here)"
@@ -272,7 +287,7 @@ def plan_cache_budget(
     lo = 2 * num_experts if overlap else num_experts
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
-    kv_reserve_bytes = kv_reserve_pages * cache_per_page
+    kv_reserve_bytes = pool_pages(kv_reserve_pages) * cache_per_page
     # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
     raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))
@@ -280,11 +295,11 @@ def plan_cache_budget(
     overlap = overlap and moe_cache_size >= 2 * num_experts
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
-    num_pages = max(remaining // cache_per_page, kv_reserve_pages)
+    num_pages = max(remaining // cache_per_page - _DUMMY_PAGES, kv_reserve_pages)
     # A tiny budget can floor num_pages at kv_reserve_pages even when ``remaining`` is below
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
-    total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
+    total = required_bytes(moe_cache_size, num_pages, per_expert_bytes, cache_per_page)
     if total > budget_bytes:
         raise CacheBudgetTooSmall(
             f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
