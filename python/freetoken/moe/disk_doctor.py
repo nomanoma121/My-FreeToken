@@ -431,7 +431,8 @@ def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
             rep.say(f"recommended: {rec} kB for a widest row block of {widest} kB (measured optimum: a quarter "
                     f"to a sixth of it, on two models)")
             if kb != rec:
-                rep.say(f"set until reboot: {dp.readahead_command(rec, where)}")
+                rep.say(f"set until reboot, before starting the server (a running one keeps the window its "
+                        f"mapping was opened with): {dp.readahead_command(rec, where)}")
                 rep.say(f"or: ft serve ... --moe-bank-readahead auto (writes it where the server may)")
             if kb > max(widest, 1):
                 rep.find("bad", f"read_ahead_kb {kb} is wider than the widest expert row block ({widest} kB): "

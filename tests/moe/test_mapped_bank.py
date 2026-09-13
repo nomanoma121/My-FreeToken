@@ -580,3 +580,74 @@ def test_a_short_mlock_is_reported_not_swallowed():
     assert bank.requested_bytes == 4096, "what the placement wanted"
     assert bank.locked_bytes == 0, "what the OS gave"
     assert bank.lock_errno == 12
+
+
+# ----- --moe-bank-readahead -------------------------------------------------------------
+def _tier_with_window(tmp_path, monkeypatch, mode, kb=8192, writable=True, report=True):
+    """A MappedTier whose bank's widest row block is 1600 kB (Flash-Next), on a device whose
+    read_ahead_kb is a plain file under tmp_path."""
+    import freetoken.moe.mapped_bank as mb
+
+    ra = tmp_path / "queue" / "read_ahead_kb"
+    if writable:
+        ra.parent.mkdir()
+        ra.write_text(f"{kb}\n")
+    where = str(ra)
+    monkeypatch.setattr(mb, "readahead_kb", lambda path: (kb, where))
+    logs, warns = [], []
+    layout = MappedBankLayout(8, [0], [("gate_up", (1,), "uint8", 1600 * 1024),
+                                       ("scale", (1,), "uint8", 200 * 1024)], {})
+    tier = mb.MappedTier(str(tmp_path / "bank.ftmb"), [0], num_experts=8, hot_per_layer=4, layout=layout,
+                         log=logs.append, warn=warns.append, readahead=mode, report_readahead=report)
+    return tier, ra, logs, warns
+
+
+def test_readahead_off_only_reports_and_names_the_recommended_window(tmp_path, monkeypatch):
+    tier, ra, logs, warns = _tier_with_window(tmp_path, monkeypatch, "off")
+    tier._apply_readahead()
+    assert ra.read_text().strip() == "8192"
+    (msg,) = warns
+    assert "widest expert-row block (1600 kB)" in msg
+    assert f"echo 256 | sudo tee {ra}" in msg
+    assert "--moe-bank-readahead auto" in msg
+
+
+def test_readahead_auto_writes_the_recommended_window(tmp_path, monkeypatch):
+    tier, ra, logs, warns = _tier_with_window(tmp_path, monkeypatch, "auto")
+    tier._apply_readahead()
+    assert ra.read_text().strip() == "256"
+    assert not warns
+    assert any("8192 -> 256 kB" in m and "left set after exit" in m for m in logs)
+
+
+def test_readahead_value_is_written_as_given(tmp_path, monkeypatch):
+    tier, ra, logs, warns = _tier_with_window(tmp_path, monkeypatch, "2048")
+    tier._apply_readahead()
+    assert ra.read_text().strip() == "2048"
+
+
+def test_readahead_that_cannot_be_written_logs_the_command_once(tmp_path, monkeypatch):
+    tier, ra, logs, warns = _tier_with_window(tmp_path, monkeypatch, "auto", writable=False)
+    tier._apply_readahead()
+    (msg,) = warns
+    assert "could not write" in msg and "echo 256 | sudo tee" in msg
+
+
+def test_a_window_inside_the_widest_block_is_one_info_line(tmp_path, monkeypatch):
+    tier, ra, logs, warns = _tier_with_window(tmp_path, monkeypatch, "off", kb=256)
+    tier._apply_readahead()
+    assert not warns
+    assert logs == [f"--moe-bank-ram: device readahead 256 kB ({ra})"]
+
+
+def test_a_later_rank_sets_the_window_for_its_own_mapping_and_says_nothing(tmp_path, monkeypatch):
+    """One bank file for every rank, so one device: each rank opens its own mapping, which takes
+    the window at open, so each sets it -- and only the first reports."""
+    tier, ra, logs, warns = _tier_with_window(tmp_path, monkeypatch, "auto", report=False)
+    tier._apply_readahead()
+    assert ra.read_text().strip() == "256"
+    assert logs == [] and warns == []
+    (tmp_path / "later").mkdir()
+    tier, ra, logs, warns = _tier_with_window(tmp_path / "later", monkeypatch, "off", report=False)
+    tier._apply_readahead()  # 8192 is too wide, but the first rank has already said so
+    assert ra.read_text().strip() == "8192" and logs == [] and warns == []

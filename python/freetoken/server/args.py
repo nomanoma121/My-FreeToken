@@ -25,6 +25,20 @@ class _DeprecatedAlias(argparse.Action):
         setattr(namespace, self.dest, self.convert(values) if self.convert else values)
 
 
+def _parse_bank_readahead(value: str) -> str:
+    """--moe-bank-readahead: off, auto, or a positive number of kB."""
+    v = str(value).strip().lower()
+    if v in ("off", "auto"):
+        return v
+    try:
+        kb = int(v)
+    except ValueError:
+        kb = 0
+    if kb <= 0:
+        raise argparse.ArgumentTypeError(f"expected off, auto or a positive kB value, got {value!r}")
+    return str(kb)
+
+
 def _nvfp4_entry(value: str) -> str:
     """The --quant-backend entry an old --nvfp4-backend value stands for; auto stands for none."""
     if value == "auto":
@@ -769,7 +783,9 @@ def parse_args(
             "Cap host RAM for the expert banks (e.g. 50G), across the whole host: a "
             "--pp-size 2 run splits it between the two ranks. Experts past the cap move to "
             "a cold bank file on disk, chosen by measured routing frequency. Needs an NVMe: "
-            "the cold half is read per token."
+            "the cold half is read per token. 'auto' takes MemAvailable at startup less "
+            "4.5 GiB per rank for the rest of the server and a page cache margin, and logs "
+            "the arithmetic. 'ft doctor disk' says whether this host suits it."
         ),
     )
     parser.add_argument(
@@ -784,7 +800,24 @@ def parse_args(
     parser.add_argument(
         "--moe-bank-dir",
         default=ServerArgs.moe_bank_dir,
-        help="Directory for the cold bank file. Defaults beside the checkpoint.",
+        help=(
+            "Directory for the bank file (bank.ftmb, every MoE layer in one file). Defaults to "
+            "the one a packed checkpoint names, else ~/.cache/freetoken/bankmap/<model>."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-readahead",
+        type=_parse_bank_readahead,
+        default=ServerArgs.moe_bank_readahead,
+        help=(
+            "With --moe-bank-ram: the device readahead window, which decides how much a fault "
+            "on a non-resident row reads (measured 2.5x on decode). 'off' (default) only logs it "
+            "against the model's block geometry; 'auto' writes the recommended window to sysfs "
+            "and a number writes that many kB. Needs permission to write "
+            "/sys/block/<dev>/queue/read_ahead_kb (otherwise the exact command is logged once); "
+            "applies to the whole device and stays set after the server exits. An open mapping "
+            "keeps the window it was opened with, so a change by hand needs a restart."
+        ),
     )
     parser.add_argument(
         "--moe-bank-rewarm",
@@ -1006,6 +1039,17 @@ def parse_args(
     if kwargs.get("moe_bank_ram"):
         from freetoken.moe.bank_disk import parse_size
 
+        if str(kwargs["moe_bank_ram"]).strip().lower() == "auto":
+            # Resolved here, once, in the launcher: the ranks start together, and each reading
+            # MemAvailable while the others allocate would split different numbers.
+            from freetoken.moe import disk_probe
+
+            try:
+                auto = disk_probe.auto_bank_ram(disk_probe.meminfo(), kwargs["tensor_parallel_size"])
+            except ValueError as exc:
+                parser.error(str(exc))
+            logger.info(auto.reason())
+            kwargs["moe_bank_ram"] = auto.as_flag()
         parse_size(kwargs["moe_bank_ram"])
 
     # Offload-family backends (offload/cpu/hybrid) need a slot cache; if the user gave no

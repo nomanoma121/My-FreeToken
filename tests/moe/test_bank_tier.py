@@ -284,3 +284,34 @@ def test_old_per_rank_files_are_pointed_out(tmp_path):
     lines = []
     build_tier(_config(tmp_path), _Method(), log=lines.append)
     assert any("no longer read" in line and "bank.rank0of2.ftmb" in line for line in lines)
+
+
+def test_build_tier_resolves_auto_when_parse_args_did_not(tmp_path, monkeypatch):
+    from freetoken.moe import disk_probe
+    from freetoken.moe.bank_tier import build_tier
+
+    # 14 B per expert x 6 x 4 layers = 336 B of banks; auto takes 120 B -> 2 resident per layer
+    monkeypatch.setattr(disk_probe, "auto_bank_ram", lambda mem, ranks: SimpleNamespace(
+        total_bytes=120, as_flag=lambda: "120", reason=lambda: "--moe-bank-ram auto: 120 B"))
+    monkeypatch.setattr(disk_probe, "meminfo", lambda proc="/proc": {})
+    lines = []
+    cfg = _config(tmp_path, moe_bank_ram="auto")
+    tier = build_tier(cfg, _Method(), log=lines.append)
+    assert cfg.moe_bank_ram == "120" and "--moe-bank-ram auto: 120 B" in lines
+    assert tier.hot_per_layer == 2
+
+
+def test_build_tier_warns_about_the_bank_directory_once_and_passes_the_readahead_flag(tmp_path, monkeypatch):
+    from freetoken.moe import disk_probe
+    from freetoken.moe.bank_tier import build_tier
+
+    seen = []
+    monkeypatch.setattr(disk_probe, "storage_warnings", lambda d: seen.append(d) or [f"slow: {d}"])
+    lines = []
+    tier = build_tier(_config(tmp_path, moe_bank_readahead="auto"), _Method(), log=lines.append)
+    assert seen == [str(tmp_path / "bankmap")] and f"slow: {tmp_path / 'bankmap'}" in lines
+    assert tier.readahead == "auto" and tier.report_readahead
+
+    seen.clear()
+    tier = build_tier(_config(tmp_path, tp_info=SimpleNamespace(rank=1, size=2)), _Method(), log=lines.append)
+    assert seen == [] and tier.readahead == "off" and not tier.report_readahead

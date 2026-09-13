@@ -41,8 +41,17 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
     # layer split lives on the same machine -- so the per-rank share is what the resident count
     # is solved against. Taking the flag per rank instead would silently double the RAM a
     # two-GPU run uses.
-    total = bank_disk.parse_size(config.moe_bank_ram)
     ranks = max(1, int(config.tp_info.size))
+    first_rank = int(getattr(config.tp_info, "rank", 0) or 0) == 0
+    if str(config.moe_bank_ram).strip().lower() == "auto":
+        # parse_args resolves it once for ft serve; a config built some other way gets the same
+        # arithmetic here, per rank, which only agrees across ranks if they start quietly
+        from . import disk_probe
+
+        auto = disk_probe.auto_bank_ram(disk_probe.meminfo(), ranks)
+        log(auto.reason())
+        object.__setattr__(config, "moe_bank_ram", auto.as_flag())
+    total = bank_disk.parse_size(config.moe_bank_ram)
     budget = total // ranks
     resident_specs = method is not None and any(s.resident for s in method.layout().values())
     cell_bytes = (
@@ -120,6 +129,14 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
         )
 
     path = bank_path_for(config.model_path, packed, config.moe_bank_dir)
+    if first_rank:
+        # Before anything is written there or mapped from it: a bank on /mnt/c under WSL2, a
+        # network share, tmpfs, a USB or SATA disk all start and serve, just at a fraction of the
+        # speed, and nothing else says why. One file for every rank, so one rank says it.
+        from . import disk_probe
+
+        for line in disk_probe.storage_warnings(os.path.dirname(os.path.abspath(path))):
+            warn(line)
     old = bank_disk.legacy_bank_files(os.path.dirname(path))
     if old:
         gib = sum(os.path.getsize(p) for p in old) / 2**30
@@ -130,4 +147,5 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
     return MappedTier(
         path, layers, all_layers=range(total_layers), num_experts=num_experts, hot_per_layer=hot,
         wanted=wanted, layout=layout, meta=meta, can_write=packed is None, log=log, warn=warn,
+        readahead=getattr(config, "moe_bank_readahead", "off") or "off", report_readahead=first_rank,
     )

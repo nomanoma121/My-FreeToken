@@ -68,14 +68,23 @@ class EngineConfig:
     moe_stats_out: str | None = None
     # --moe-bank-ram: cap on host RAM for the expert banks. Experts beyond the cap are
     # renumbered out of the resident range and read from a cold bank file instead (see
-    # moe/bank_disk.py). Unset = every expert resident, which is today's behaviour.
+    # moe/bank_disk.py). Unset = every expert resident, which is today's behaviour. "auto" is
+    # turned into a size when the arguments are parsed (moe/disk_probe.auto_bank_ram), so every
+    # rank splits the same number.
     moe_bank_ram: str | None = None
     # --moe-bank-stats: --moe-stats-out histogram(s) that order the placement. Without one
     # the ordering falls back to logical id, i.e. it ignores routing entirely and the cold
     # half is an arbitrary fifth of the experts.
     moe_bank_stats: list[str] | None = None
-    # --moe-bank-dir: where the cold bank file lives. Defaults beside the checkpoint.
+    # --moe-bank-dir: the directory of the bank file (bank.ftmb, every MoE layer). Defaults to
+    # the one a packed checkpoint names, else ~/.cache/freetoken/bankmap/<model>
+    # (bank_pack.bank_path_for).
     moe_bank_dir: str | None = None
+    # --moe-bank-readahead: "off" reports the device readahead window against the model's
+    # block geometry; "auto" writes the recommended window to sysfs, a number writes that
+    # many kB, each rank before it opens its mapping. Device-wide and left set after exit,
+    # hence opt-in (MappedTier._apply_readahead).
+    moe_bank_readahead: str = "off"
     # --moe-bank-rewarm: seconds of scheduler idle after which a --moe-bank-ram bank's
     # file-backed rows are checked and, if the page cache has lost them, read back in file
     # order until a request arrives (moe/bank_rewarm.py). 0 = off.

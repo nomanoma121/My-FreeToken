@@ -85,21 +85,15 @@ def readahead_kb(path: str) -> "tuple[int, str] | None":
     200, 100, 5 and 2.5 kB, so a window sized for the largest reads mostly other experts'
     rows -- and those are the tail of the frequency order, the least likely to be wanted.
     """
+    from freetoken.moe import disk_probe
+
     if not hasattr(os, "major"):  # Windows: no device numbers, no sysfs
         return None
     try:
         st = os.stat(path)
     except OSError:
         return None
-    dev = f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
-    for rel in (f"/sys/dev/block/{dev}/queue/read_ahead_kb",
-                f"/sys/dev/block/{dev}/../queue/read_ahead_kb"):
-        try:
-            with open(rel) as fh:
-                return int(fh.read().strip()), os.path.normpath(rel)
-        except (OSError, ValueError):
-            continue
-    return None
+    return disk_probe.readahead(f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}")
 
 
 def advise_range(start: int, length: int, limit: int) -> tuple[int, int] | None:
@@ -557,8 +551,14 @@ class MappedTier:
 
     def __init__(self, path: str, layers, *, num_experts: int, hot_per_layer: int,
                  all_layers=None, wanted: dict | None = None, layout: MappedBankLayout | None = None,
-                 meta: dict | None = None, can_write: bool = True, log=None, warn=None):
+                 meta: dict | None = None, can_write: bool = True, log=None, warn=None,
+                 readahead: str = "off", report_readahead: bool = True):
         self.path = path
+        # --moe-bank-readahead: "off" (report only), "auto" (the recommended window) or kB. Every
+        # rank maps the same file, so one device: each rank sets it before opening its own
+        # mapping, and only the first says anything about it.
+        self.readahead = str(readahead or "off").strip().lower()
+        self.report_readahead = report_readahead
         self.layers = [int(x) for x in layers]
         # every MoE layer of the model: the file's geometry, whichever of them this rank serves
         self.all_layers = self.layers if all_layers is None else [int(x) for x in all_layers]
@@ -750,6 +750,11 @@ class MappedTier:
         if self._file is not None:
             self._file.close()
             self._file = None
+        # Before the mapping's file is opened: the kernel copies the device window into each
+        # open file when it is opened, and a fault reads with that copy -- so the window has to
+        # be right before MappedBanks opens the bank, and a change made later reaches only the
+        # next start. It also means the settle already reads with the window decode will use.
+        self._apply_readahead()
         self.log("--moe-bank-ram: faulting in and locking the resident rows")
         self.banks = MappedBanks(self.path, layers=self.layers, hot_per_layer=self.hot_per_layer)
         b = self.banks
@@ -760,28 +765,6 @@ class MappedTier:
                 "RAM rather than page cache, and the GPU can address them. "
                 "FREETOKEN_BANK_MAP=shared forces the read-only form back"
             )
-        ra = readahead_kb(self.path)
-        if ra is not None:
-            kb, where = ra
-            # Compare against this model's own geometry, not a constant. A window wider
-            # than the widest block row cannot finish inside one expert's row, so the tail
-            # of every fault lands in a neighbouring expert -- and the non-resident rows are
-            # the tail of the frequency order, the ones least likely to be wanted next.
-            #
-            # The blocks differ by three orders of magnitude between models: Flash-Next's
-            # widest row is 1600 kB (best measured window 256), gpt-oss-120b's is 7.91 MiB.
-            # A threshold tuned on one is wrong on the other, and was: 1024 drew this
-            # warning on gpt-oss while measuring 17% faster than 256.
-            widest_kb = max(rb for _, _, _, rb in b.layout.banks) // 1024
-            note = f"--moe-bank-ram: device readahead {kb} kB ({where})"
-            if kb > max(widest_kb, 1):
-                self.log(
-                    f"{note} -- wider than this model's widest expert-row block "
-                    f"({widest_kb} kB), so every fault on a non-resident row spills into "
-                    f"experts nobody asked for; try {widest_kb} or less: echo N > {where}"
-                )
-            else:
-                self.log(note)
         self.log(
             f"--moe-bank-ram: mapped {b.mapped_bytes / 2**30:.1f} GiB, "
             f"{b.locked_bytes / 2**30:.1f} GiB locked resident, "
@@ -814,6 +797,63 @@ class MappedTier:
                 f"back from disk under pressure. Raise the limit to at least "
                 f"{b.requested_bytes / 2**30:.0f} GiB or lower --moe-bank-ram"
             )
+
+    def _apply_readahead(self) -> None:
+        """Report the device readahead window against this model's geometry, and set it when asked.
+
+        Compared with this model's own widest block row, not a constant: the blocks differ by
+        three orders of magnitude between models -- Flash-Next's widest row is 1600 kB (best
+        measured window 256), gpt-oss-120b's is 7.91 MiB (best 2048). A threshold tuned on one
+        was wrong on the other: 1024 drew the old warning on gpt-oss while measuring 17% faster
+        than 256. A window wider than the widest row cannot finish inside one expert's row, so
+        the tail of every fault lands in a neighbouring expert -- and the non-resident rows are
+        the tail of the frequency order, the ones least likely to be wanted next.
+
+        Setting it is opt-in (--moe-bank-readahead auto|<kB>) because the window belongs to the
+        whole device: every other file on that disk reads with it too, and it outlives the
+        server. Nothing is put back at exit, and the log says so.
+        """
+        from freetoken.moe import disk_probe
+
+        ra = readahead_kb(self.path)
+        layout = self.layout
+        if ra is None or layout is None or not layout.banks:
+            return
+        kb, where = ra
+        widest = max(rb for _, _, _, rb in layout.banks)
+        widest_kb = widest // 1024
+        rec = disk_probe.recommend_readahead_kb(widest)
+        mode = self.readahead
+        log = self.log if self.report_readahead else (lambda _msg: None)
+        warn = self.warn if self.report_readahead else (lambda _msg: None)
+        want = rec if mode == "auto" else (None if mode in ("off", "") else int(mode))
+        if want is not None:
+            if want == kb:
+                log(f"--moe-bank-readahead {mode}: {where} is already {kb} kB")
+                return
+            ok, why = disk_probe.set_readahead(where, want)
+            if ok:
+                log(
+                    f"--moe-bank-readahead {mode}: {where} {kb} -> {want} kB (widest expert-row "
+                    f"block {widest_kb} kB); device-wide, and left set after exit"
+                )
+                return
+            warn(
+                f"--moe-bank-readahead {mode}: could not write {where} ({why}), so it stays "
+                f"{kb} kB. Run once as root, then restart the server (an open mapping keeps the "
+                f"window it was opened with): {disk_probe.readahead_command(want, where)}"
+            )
+            return
+        note = f"--moe-bank-ram: device readahead {kb} kB ({where})"
+        if kb > max(widest_kb, 1):
+            warn(
+                f"{note} -- wider than this model's widest expert-row block ({widest_kb} kB), "
+                f"so every fault on a non-resident row spills into experts nobody asked for "
+                f"(measured 2.5x slower decode at 8192). Recommended {rec} kB: "
+                f"{disk_probe.readahead_command(rec, where)} and restart, or --moe-bank-readahead auto"
+            )
+        else:
+            log(note + (f", recommended {rec} kB" if kb != rec else ""))
 
     @property
     def sources(self) -> dict:
