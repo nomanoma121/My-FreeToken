@@ -104,6 +104,37 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
 
 
+def _log_context_limit(config, num_tokens: int) -> None:
+    """Say at boot how long a request can be, and what caps it.
+
+    The limit is min(model limit, KV pool), and nothing else reports the second term: /v1/models
+    shows the model's own limit, and --moe-cache-auto gives KV only its --kv-reserve-tokens floor
+    (8192 by default) and the rest to experts. So a server started without the context flags
+    looked like a 128k model to the client and refused the first long chat with "prompt is too
+    long: N tokens > 8221 maximum" (upstream #403), the only place the number ever appeared.
+    """
+    limit = int(config.max_seq_len)
+    if num_tokens >= limit:
+        logger.info_rank0(f"context limit {limit} tokens (KV pool {num_tokens} tokens)")
+        return
+    if getattr(config, "moe_cache_auto", False):
+        # Not "--kv-reserve-tokens {limit}": on a small card the model limit does not fit (a
+        # 6 GB 2060 holds ~20k for gpt-oss-20b), and a boot that does not fit already stops with
+        # the largest reserve that does (resolve_moe_cache_auto), so point there instead.
+        fix = (
+            f"--kv-reserve-tokens, up to {limit} (the VRAM comes out of the expert cache; a value "
+            "that does not fit stops the boot and names the largest that does)"
+        )
+    else:
+        fix = "--num-tokens, or a higher --memory-ratio"
+    logger.warning_rank0(
+        f"context limit {num_tokens} tokens: the KV pool holds {num_tokens} of the {limit} the "
+        f"model allows, so prompt + output past {num_tokens} is refused with \"prompt is too "
+        f"long\" (clients reading /v1/models still see {limit}). To raise it: {fix}; or pass "
+        f"--max-seq-len-override {num_tokens} so the advertised limit matches"
+    )
+
+
 def _required_attn_types(model_config) -> frozenset[AttnType]:
     """Backend-driving attention types of this model, from the group-spec walk
     (single source shared with the pool factory and the KV cost model). getattr
@@ -652,6 +683,7 @@ class Engine:
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
+        _log_context_limit(config, num_tokens)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
