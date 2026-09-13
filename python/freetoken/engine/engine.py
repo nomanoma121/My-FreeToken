@@ -625,6 +625,8 @@ class Engine:
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        if config.is_pp:
+            self.num_pages = self._agree_pipeline_num_pages(config, self.num_pages)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
@@ -721,6 +723,8 @@ class Engine:
                 torch.cuda.empty_cache()
             self._capture_spec_graph()
             self._premap_vram()
+        if config.is_pp:
+            self._resettle_pipeline_prefill_chunk(config)
 
     @staticmethod
     def _premap_enabled() -> bool:
@@ -1349,6 +1353,32 @@ class Engine:
             raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
+
+    def _agree_pipeline_num_pages(self, config, num_pages: int) -> int:
+        """Under --pp-size every rank takes the smallest KV page count any rank solved.
+
+        Each rank solves its pool from its own GPU (the halves hold different weights and
+        expert caches), but every rank also runs its own scheduler over the same request
+        stream, and that scheduler's admission, prefix matching and eviction all read the
+        pool size. With --moe-cache-auto the KV half of each rank's plan is its reserve plus
+        whatever the greedy expert fill left over (up to one expert slot's bytes), so the
+        pools differ by construction; once the prefix cache filled up, one rank could evict a
+        prefix the other still matched, and the two would build different batches for the
+        same step. Found by reading, not by a failure; the larger pools give up at most that
+        remainder.
+        """
+        agreed = torch.tensor([num_pages], dtype=torch.int64)
+        torch.distributed.all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+        )
+        agreed_pages = int(agreed.item())
+        if agreed_pages != num_pages:
+            logger.info(
+                f"--pp-size: KV pool {num_pages} -> {agreed_pages} pages, the smallest any rank "
+                "solved (the ranks' schedulers must see the same pool)"
+            )
+            object.__setattr__(config, "num_page_override", agreed_pages)
+        return agreed_pages
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None) -> tuple[int, int]:
         from freetoken.engine.cache_budget import expert_bytes_per_slot
@@ -2057,6 +2087,47 @@ class Engine:
         logger.info_rank0(
             f"{head} -> --max-prefill-length {configured} would need "
             f"{configured * per_token / 2**30:.2f} GiB; using {chosen} instead"
+        )
+
+    def _resettle_pipeline_prefill_chunk(self, config) -> None:
+        """Under --pp-size, shrink the boot chunk to what is still free once the boot is done.
+
+        ``_autosize_prefill_chunk`` has to run before the prefill warmup, and so before the
+        --spec-mtp verify-window and draft-head graphs are captured; those keep their pools (and
+        the window's per-token GDN states) resident, and the free VRAM the chunk was solved
+        against shrinks by that much. One GPU re-solves before every prefill and sees it; the
+        pipeline froze the boot value, so it never did. This is the one place left where every
+        rank is at the same point: agree on the least usable VRAM, and only ever shrink.
+        """
+        per_token = getattr(self, "_prefill_bytes_per_token", 0.0)
+        configured = int(getattr(config, "max_extend_tokens", 0) or 0)
+        # Both are the values the ranks already agreed on, so every rank takes the same branch
+        # and the collective below is entered by all of them or by none.
+        if per_token <= 0 or configured <= self._PREFILL_CHUNK_FLOOR:
+            return
+        torch.cuda.synchronize(self.device)
+        free = int(torch.cuda.mem_get_info(self.device)[0])
+        reserved = int(torch.cuda.memory_reserved(self.device))
+        allocated = int(torch.cuda.memory_allocated(self.device))
+        # cached-but-unused blocks count, as in prefill_chunk_now: the transient is served from them
+        usable = free + max(0, reserved - allocated)
+        agreed = torch.tensor([-float(usable)], dtype=torch.float64)
+        torch.distributed.all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+        )
+        usable = int(-agreed[0])
+        share = getattr(self, "_prefill_budget_share", self._PREFILL_TRANSIENT_BUDGET)
+        chosen = self._fit_prefill_chunk(per_token, usable, configured, share)
+        if chosen >= configured:
+            logger.info_rank0(
+                f"--prefill-chunk-budget: {configured} still fits after the boot "
+                f"({usable / 2**30:.2f} GiB usable on the tightest rank)"
+            )
+            return
+        object.__setattr__(config, "max_extend_tokens", chosen)
+        logger.info_rank0(
+            f"--prefill-chunk-budget: {configured} -> {chosen} after the boot: the tightest rank "
+            f"has {usable / 2**30:.2f} GiB usable once the graphs are captured"
         )
 
     def _measure_prefill_transient(self, length: int) -> tuple[float, int]:

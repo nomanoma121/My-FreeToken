@@ -368,3 +368,72 @@ def test_the_runtime_resolve_is_frozen_under_pp(monkeypatch):
 
     live = _PPLive(per_token=255.0 * KIB, free=0, reserved=0, allocated=0)
     assert live.prefill_chunk_now(3072) == 3072  # two ranks: frozen at what they agreed on
+
+
+# --- --pp-size: the boot chunk is checked again once the boot is over ----------------------
+
+
+class _Settler(_Live):
+    """The pipeline's end-of-boot re-check, bound to stubbed memory readings."""
+
+    _resettle_pipeline_prefill_chunk = Engine._resettle_pipeline_prefill_chunk
+
+    def __init__(self, per_token, free, reserved=0, allocated=0, share=None):
+        super().__init__(per_token, free, reserved, allocated, share)
+        self.tp_cpu_group = None
+
+
+def _other_rank_has(monkeypatch, usable: int, seen: dict):
+    import torch
+
+    from freetoken.engine import engine as engine_mod
+
+    def _all_reduce(tensor, op=None, group=None):
+        seen["op"] = op
+        seen["calls"] = seen.get("calls", 0) + 1
+        torch.maximum(tensor, torch.tensor([-float(usable)], dtype=torch.float64), out=tensor)
+
+    monkeypatch.setattr(engine_mod.torch.distributed, "all_reduce", _all_reduce)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda dev=None: None)
+
+
+def test_pipeline_chunk_shrinks_to_what_the_graphs_left(monkeypatch, patched_cuda):
+    """The chunk was solved before the --spec-mtp graphs were captured. The graphs keep their
+    pools resident, so the VRAM the chunk was solved against is not there any more; one GPU
+    re-solves before every prefill and notices, the pipeline froze the boot value."""
+    import torch
+
+    seen = {}
+    _other_rank_has(monkeypatch, int(0.60 * GIB), seen)
+    settler = patched_cuda(_Settler(per_token=255.0 * KIB, free=int(1.20 * GIB)))
+    config = _PPConfig(max_extend_tokens=2048)
+    settler._resettle_pipeline_prefill_chunk(config)
+
+    assert seen["op"] is torch.distributed.ReduceOp.MAX  # of the negated value: the least usable
+    # the tighter rank: 0.60 GiB * 0.55 / 261,120 B = 1357 -> 1280
+    assert config.max_extend_tokens == 1280
+
+
+def test_pipeline_chunk_is_never_raised_after_the_boot(monkeypatch, patched_cuda):
+    seen = {}
+    _other_rank_has(monkeypatch, 8 * GIB, seen)
+    settler = patched_cuda(_Settler(per_token=255.0 * KIB, free=8 * GIB))
+    config = _PPConfig(max_extend_tokens=1792)
+    settler._resettle_pipeline_prefill_chunk(config)
+    assert config.max_extend_tokens == 1792
+
+
+@pytest.mark.parametrize("per_token, configured", [(0.0, 4096), (255.0 * KIB, 512)])
+def test_pipeline_recheck_skips_the_collective_when_there_is_nothing_to_settle(
+    monkeypatch, patched_cuda, per_token, configured
+):
+    """No measurement (a probe failed on some rank, or the budget is 0) or a chunk already at the
+    floor: every rank has the same values and returns before the all_reduce, so no rank is left
+    waiting in a collective the others never enter."""
+    seen = {}
+    _other_rank_has(monkeypatch, int(0.10 * GIB), seen)
+    settler = patched_cuda(_Settler(per_token=per_token, free=int(0.10 * GIB)))
+    config = _PPConfig(max_extend_tokens=configured)
+    settler._resettle_pipeline_prefill_chunk(config)
+    assert config.max_extend_tokens == configured
+    assert "calls" not in seen
