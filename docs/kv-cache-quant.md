@@ -189,7 +189,7 @@ none of these are left to chance.
 | Qwen3.5-MoE family (Ornith-1.5-35B-A3B, Qwen3.6-35B-A3B) | full | `MHAKVCache` | **supported** (measured) |
 | Qwen3 / Qwen2 dense, Qwen3-MoE, Llama, Mistral, MiniMax-M2, GLM-4-MoE | full | `MHAKVCache` | supported (untested) |
 | **Qwen3.8-Flash-Next** | QSA (compressed-block sparse) | `QSAKVCache` | **supported** (measured; the case it suits best) |
-| gpt-oss-20b / gpt-oss-120b | full + sliding window, attention sinks | `HybridSWAKVCache` | **`q8_0` supported** (checked on an RTX 2060); **`q4_0` breaks its answers** |
+| gpt-oss-20b / gpt-oss-120b | full + sliding window, attention sinks | `HybridSWAKVCache` | **`q8_0` supported** (measured: 20b on an RTX 2060, 120b at 128k on two RTX 3060s); **`q4_0` breaks its answers** |
 | Gemma 4, MuseGlimmer | full + sliding window | `HybridSWAKVCache` | refused |
 | GLM-5.3-Flash, GLM-MoE-DSA | DSA | `KpoolDSAKVCache` / `DSAKVCache` | refused |
 | DeepSeek-V4-Flash | DSV4 | `DSV4PagedKVCache` | refused |
@@ -223,10 +223,30 @@ What it looks like from a chat client: a long wait, then an empty or cut-off rep
 reasoning used up `max_tokens`). It did not always happen -- the Japanese question came back
 right when asked again on its own -- so one good answer does not clear `q4_0`.
 
-As arithmetic, gpt-oss-120b's KV at 128k goes from 5.4 GiB to 2.9 GiB at `q8_0` (not measured
-on that model yet). Speed was not measured either. Decode should slow with context the way it does on Ornith (half of gpt-oss's layers read the
-whole context every step), and prefill should not speed up: calls with a sliding window or
-sinks never take the cuBLAS prefill path that makes `q8_0` fast on Ornith.
+**gpt-oss-120b at 128k on two RTX 3060s** (`--pp-size 2`, 26/10 layers): `q8_0` holds 131,755
+tokens of KV in 2.09 + 0.81 GiB, about what 16-bit takes for 64k (expert slots 394 at 16-bit
+64k, 384 at `q8_0` 128k). Its answers held, including a fact placed in the middle of a
+95,684-token document. At 16 bits the same context would need about 5.4 GiB of KV.
+
+Speed depends on what the freed VRAM buys:
+
+| setup | context | 16-bit | `q8_0` |
+|---|---|---|---|
+| gpt-oss-120b, two RTX 3060s, 64k pool (expert slots 394 → 468) | ~8k | 14.00 tok/s | 13.97 tok/s |
+| | ~32k | 13.42 | 12.38 (−8%) |
+| | ~60k | 12.98 | 12.34 (−5%) |
+| gpt-oss-120b, two RTX 3060s, `q8_0` 128k pool | ~120k | — | 10.04 |
+| gpt-oss-20b, RTX 2060 6 GB, 6.8k pool (expert slots 32 → 38 / 47), two runs each, alternated | ~2k | 8.24, 8.89 | 8.96, 9.87 |
+| | ~6k | 6.35, 7.83 | 9.43, 10.00 |
+
+On the 3060s the expert cache was already large, and the extra slots did not pay for
+dequantizing the KV of every full-attention layer at every step: there `q8_0` is a trade for
+context length. On the 2060 the cache sat at its 32-slot floor, and at these short contexts the
+extra slots were worth more than the dequantization. The 2060 runs were taken with other
+applications holding about 0.2 GiB of that card's VRAM and some of its GPU time, which is why
+the two settings were alternated: compare the columns with each other rather than with other
+2060 figures on this page. Prefill does not speed up on either card, because calls with a
+sliding window or sinks never take the cuBLAS prefill path that makes `q8_0` fast on Ornith.
 
 QSA has secondary tiers too (the compressed index slab, the pending ring, the scratch rows) and
 they stay 16-bit here as well; what made it worth doing anyway is the next section.

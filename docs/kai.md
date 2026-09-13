@@ -39,7 +39,8 @@ The fork adds nine things upstream does not have:
    regardless of context: measured on two RTX 3060s, `q4_0` decode runs 18.47 tok/s at 8k and
    18.21 at 125k (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank and the expert
    slots go 1180 to 1598. Plain paged-attention models on the Triton backend, Flash-Next
-   on `qsa_sparse`, and gpt-oss at `q8_0` (window pool included; `q4_0` breaks its answers); Gemma 4,
+   on `qsa_sparse`, and gpt-oss at `q8_0` (window pool included; gpt-oss-120b runs 128k of context on two
+   RTX 3060s, decoding 10 tok/s at 120k; `q4_0` breaks its answers); Gemma 4,
    MuseGlimmer, GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3 and MLA checkpoints are refused
    at startup. See
    [kv-cache-quant.md](kv-cache-quant.md), and [vram-and-speed.md](vram-and-speed.md) for why
