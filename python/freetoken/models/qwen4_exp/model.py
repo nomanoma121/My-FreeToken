@@ -32,6 +32,7 @@ from freetoken.layers import (
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.models.mtp_quant import draft_head_config
 from freetoken.models.pipeline import RemoteLayer as _RemoteLayer
+from freetoken.models.prefill_pieces import plan_prefill_pieces
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -83,6 +84,25 @@ class Qwen4ExpDecoderLayer(BaseOP):
         self.ple = (
             PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
         )
+
+    def forward_pieces(self, hidden: torch.Tensor, batch: Batch, pieces, ctx) -> torch.Tensor:
+        """forward() with the sequence mixer over consecutive pieces of the chunk and everything
+        else -- PLE, both hyper-connection mix/combine, the MoE -- over all of it
+        (models/prefill_pieces.py). PLE reads the chunk's own n-gram context and the
+        hyper-connections are per token, so only the mixer sees a piece at a time."""
+        if self.ple is not None:
+            hidden = hidden + self.ple.forward(hidden, batch)
+        block_input, inject = self.attn_hyper_connection.mix(hidden)
+        outs = []
+        for start, end, piece in pieces:
+            x = block_input[start:end]
+            with ctx.piece_batch(piece):
+                outs.append(
+                    self.linear_attn.forward(x) if self._is_linear else self.self_attn.forward(x, piece)
+                )
+        hidden = self.attn_hyper_connection.combine(hidden, torch.cat(outs), inject)
+        block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
@@ -154,6 +174,9 @@ class Qwen4ExpMTP(BaseOP):
         e = self.pre_fc_norm_embedding.forward(emb.forward(next_ids).to(residual.dtype))
         fe = self.fc_embedding.forward(e)
         r = fh + fe.repeat(1, self.hc_count)
+        pieces = getattr(batch, "prefill_pieces", None)
+        if pieces is not None and pieces[-1][1] == t:
+            return self.layers.op_list[0].forward_pieces(r, batch, pieces, get_global_ctx())
         return self.layers.op_list[0].forward(r, batch)
 
     def mix(self, residual: torch.Tensor) -> torch.Tensor:
@@ -253,9 +276,20 @@ class Qwen4ExpModel(BaseOP):
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
         layers = self.layers.op_list
-        dbg = get_global_ctx().debug_layer_outs
+        ctx = get_global_ctx()
+        dbg = ctx.debug_layer_outs
+        # --prefill-mixer-pieces (models/prefill_pieces.py). Pipeline ranks included: a piece
+        # never leaves the rank, and what crosses to the next rank is the whole chunk's stream.
+        pieces = None
+        if ctx.prefill_mixer_pieces >= 2:
+            pieces = plan_prefill_pieces(
+                batch, ctx.prefill_mixer_pieces, ctx.attn_backend, hidden.device, ctx.linear_state_pool
+            )
         for i in self._local_ids:
-            hidden = layers[i].forward(hidden, batch)
+            if pieces is not None:
+                hidden = layers[i].forward_pieces(hidden, batch, pieces, ctx)
+            else:
+                hidden = layers[i].forward(hidden, batch)
             if dbg is not None:
                 dbg.append((i, hidden.detach().clone()))
         if meta is not None:

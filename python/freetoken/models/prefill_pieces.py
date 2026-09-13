@@ -82,8 +82,8 @@ def plan_prefill_pieces(batch, n: int, attn_backend, device, linear_state_pool=N
         last = idx == len(bounds) - 1
         proxy = SimpleNamespace(
             table_idx=r.table_idx,
-            uid=r.uid,
-            input_ids=r.input_ids,
+            uid=getattr(r, "uid", None),
+            input_ids=getattr(r, "input_ids", None),
             mm_embeds=None,
             mm_rope=None,
             cached_len=r.cached_len + start,
@@ -109,6 +109,10 @@ def plan_prefill_pieces(batch, n: int, attn_backend, device, linear_state_pool=N
             piece.fla_metadata = build_fla_metadata(piece, device)
         attn_backend.prepare_metadata(piece)
         pieces.append((start, end, piece))
+    # A second pass over the same rows in the same step -- the MTP draft head fills its own KV
+    # for every row of a prefill chunk -- reuses these pieces instead of running whole, which on
+    # a chunk this plan made wider would be the step's new transient peak.
+    batch.prefill_pieces = pieces
     return pieces
 
 

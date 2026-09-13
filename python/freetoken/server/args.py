@@ -704,7 +704,8 @@ def parse_args(
             "on a small card, so with pieces the chunk-budget probe measures less and picks wider "
             "chunks, and an offloaded MoE streams its expert banks fewer times per prompt. "
             "Measured on an RTX 2060 (Ornith, 19.9k-token prompt): 490 -> 649 tok/s at 2, "
-            "722 tok/s at 4 with --max-prefill-length 16384. Single-GPU Qwen3.5-MoE only for now."
+            "722 tok/s at 4 with --max-prefill-length 16384. Qwen3.8-Flash-Next (one GPU or "
+            "--pp-size) and single-GPU Qwen3.5-MoE."
         ),
     )
     parser.add_argument(
