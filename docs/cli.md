@@ -11,6 +11,7 @@ ft <command> [args]
 | `ft ctl` | Query and manage a running server over HTTP |
 | `ft launch` | Configure and launch a coding agent against a server |
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
+| `ft bank` | Inspect, pack, verify, unpack or reorder the `--moe-bank-ram` bank file |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate the MoE backend |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
@@ -100,8 +101,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 | `--moe-bank-ram` | off | Half the RAM: keep only the frequently routed experts resident, map the rest from disk. Whole-host cap (`48G`), split across ranks. Needs `RLIMIT_MEMLOCK` (`ulimit -l`) at least as large as one rank's share, or the resident half is quietly smaller than asked. See [bank-ram.md](bank-ram.md) |
-| `--moe-bank-stats` | — | Routing histograms (from `--moe-stats-out`) that decide which experts stay resident |
-| `--moe-bank-dir` | `~/.cache/freetoken/bankmap` | Where the mapped bank file lives |
+| `--moe-bank-stats` | — | Routing histograms (from `--moe-stats-out`, every rank's file) that decide which experts stay resident. A change reorders the bank file in place; without the flag the order already in the file is kept |
+| `--moe-bank-dir` | `~/.cache/freetoken/bankmap/<model>` | Where the bank file (`bank.ftmb`, one for every rank) lives. A checkpoint packed by `ft bank pack` keeps its own inside it |
 | `--moe-bank-rewarm` | 0 | With `--moe-bank-ram`: after this many seconds idle, each rank reads back the non-resident rows the page cache has lost (below 95%), in file order, stopping when a request arrives; backs off while memory stays under pressure. 0 = off, because it reads the disk while idle. See [bank-ram.md](bank-ram.md#4-optional-read-the-cold-rows-back-while-idle---moe-bank-rewarm) |
 | `--moe-stats-out` | off | Write the per-expert decode routing histogram on shutdown (pass `--disable-cuda-graph`) |
 | `--moe-collect-stats` | off | Accumulate the cache's decode miss-rate counters device-side, captured into the decode graph; `--moe-stats-out` reads them back |
@@ -174,6 +175,24 @@ offload` (default) packs experts into offload banks; `--moe-backend triton`
 keeps them dense for resident serving. See the FTW caveats in
 [models.md](models.md#notes); FTW files from older builds can be repaired with
 [scripts/ftw_hotfix.py](ftw-hotfix.md) instead of reconverting.
+
+## ft bank
+
+```bash
+ft bank info    --model-path <model> [--moe-bank-dir D]
+ft bank pack    --model-path <model> --out <slim_dir> [--dry-run] [--copy] [--keep-bank] [--moe-bank-dir D]
+ft bank verify  --model-path <slim_dir> [--moe-bank-dir D]
+ft bank unpack  --model-path <slim_dir> --out <model> [--copy] [--moe-bank-dir D]
+ft bank reorder --model-path <model> --moe-bank-stats a.rank0.json a.rank1.json ... [--moe-bank-dir D]
+```
+
+The bank file `--moe-bank-ram` serves the experts from, as the canonical copy of them. `pack`
+writes a checkpoint without the expert tensors the bank reproduces -- after checking each one
+byte for byte and the bank against what the original packs to -- hard-links the shards that hold
+no experts, moves the bank file into it, and deletes nothing. `verify` repeats the check without
+the original; `unpack` writes the original files back and checks them against the SHA-256 recorded
+at pack time; `reorder` applies a new placement in place. No GPU. See
+[bank-ram.md](bank-ram.md#5-optional-drop-the-second-copy-ft-bank-pack).
 
 ## ft bench bw
 

@@ -16,9 +16,10 @@ you may not expect: 128 GB is four DDR5 DIMMs at 4000 MT/s where two would run 4
 CPU-side memory rate is what caps decode here, so an actual two-DIMM 64 GB machine has *faster*
 memory than the one these numbers came from.
 
-What it does not buy you: it does not make prefill faster (it makes it slower), it does not
-reduce disk space (it adds a copy of the banks), and it is not a way to run a model your GPUs
-could not otherwise hold. The GPU-side requirements are unchanged.
+What it does not buy you: it does not make prefill faster (it makes it slower), and it is not a
+way to run a model your GPUs could not otherwise hold. The GPU-side requirements are unchanged.
+On its own it also costs disk -- the bank file is a second copy of the experts -- until
+[`ft bank pack`](#5-optional-drop-the-second-copy-ft-bank-pack) takes them out of the checkpoint.
 
 ## How it works
 
@@ -27,11 +28,11 @@ The obvious design -- a small resident bank plus a cold tier read on demand -- r
 layer by that count. Shrinking the bank means changing the copy machinery and the prefill
 path, the hot paths, for every quantisation format.
 
-So the bank keeps its shape and the file does the work. Each rank writes its expert banks once
-to `~/.cache/freetoken/bankmap/<model>/bank.rankNofM.ftmb`, rows reordered so the frequently
-routed experts come first, then maps the file and hands the cache `[num_experts, ...]` tensor
-views over it. The cache never sees anything unusual. What changes is which rows are
-guaranteed to be in RAM:
+So the bank keeps its shape and the file does the work. The expert banks are written once to
+`~/.cache/freetoken/bankmap/<model>/bank.ftmb`, one file for every MoE layer, rows reordered so
+the frequently routed experts come first. Each rank maps the file and hands the cache
+`[num_experts, ...]` tensor views of its own layers. The cache never sees anything unusual. What
+changes is which rows are guaranteed to be in RAM:
 
 - rows `[0, hot)` are `mlock`ed, so the prefill sweep -- which touches every expert of every
   layer on each chunk -- cannot evict them, and they are `cudaHostRegister`ed so the PCIe
@@ -41,6 +42,44 @@ guaranteed to be in RAM:
   is read-only.
 
 Routing ids are renumbered to match, in the layer, before anything reads them.
+
+### What the file holds, and what a restart reads
+
+The file depends on the checkpoint, the expert kernel and each layer's row order -- and on
+nothing else about the run:
+
+- **The resident count is not in it.** `hot` is solved from `--moe-bank-ram` at every start, so a
+  different budget rewrites nothing.
+- **The layer split is not in it.** Every MoE layer is in the one file, by its index in the whole
+  model; a rank of `--pp-size 2` writes and maps only its own. Changing `--pp-size` or
+  `--pp-layers` rewrites nothing.
+- **The row order is per layer and can change in place.** A start with a different
+  `--moe-bank-stats` reorders the layers whose order changed, one layer at a time, without
+  reading the checkpoint. A layer's old bytes go to a journal next to the file first
+  (`bank.ftmb.journal.L<n>`, one layer's worth of disk), and the next start finishes or rolls
+  back a reorder that was interrupted. A start *without* `--moe-bank-stats` keeps the order that
+  is already in the file.
+- **A layer exists once it is committed**: blocks written and synced, then a manifest inside the
+  file names the layer with its order and a SHA-256 per block. A start killed while writing
+  leaves the layer out rather than a block of zeros that looks reusable.
+
+When every one of a rank's layers is committed, that rank **does not read the checkpoint's expert
+tensors at all** -- the startup log says `holds layers 0-23; the checkpoint's expert tensors are
+not read`. Before this, every start read and packed all of them (31.7 GiB per rank for
+Flash-Next) only to throw them away when the file already existed.
+
+The file is tied to the checkpoint by a fingerprint of the expert tensors' names, dtypes and
+shapes, and by the size and modification time of the shards that hold them: a checkpoint
+downloaded again, or copied, gets its bank written again rather than served the old experts.
+The kernel (`nvfp4 / triton`, `mxfp4 / triton_gptoss`) is part of the file too; switching to one
+with a different bank layout also starts it over. `ft bank info --model-path <model>` prints what
+a file holds.
+
+Files written by builds before this one (`bank.rank0of2.ftmb`, ...) are not read. The first start
+writes `bank.ftmb` and warns with the old files' names and size; delete them.
+
+This file layout is covered by CPU tests only so far; the measurements further down were taken
+with the per-rank files of the earlier builds.
 
 ### The GPU never sees a row it cannot address
 
@@ -144,7 +183,8 @@ ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
   --disable-cuda-graph --moe-stats-out ~/moe-stats.json
 ```
 
-`~/moe-stats.rank0.json` and `~/moe-stats.rank1.json` are written on shutdown.
+`~/moe-stats.rank0.json` and `~/moe-stats.rank1.json` are written on shutdown. Pass **every
+rank's** file to `--moe-bank-stats`: each holds only its own rank's layers.
 
 **Routing is domain-dependent.** Measured out-of-sample on three sessions: a histogram taken
 from prose predicts a prose session's routing far better than one taken from a coding session
@@ -156,15 +196,25 @@ kinds and pass them all; pooling is cheap insurance, not a decisive gain (1-2 po
 ```bash
 ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
   --moe-strategy hybrid --ple-backend disk --dense-quant fp8 \
-  --moe-bank-ram 48G --moe-bank-stats ~/moe-stats.rank0.json ~/moe-stats.rank1.json
+  --moe-bank-ram 48G --moe-bank-stats ~/moe-stats.rank*.json ~/moe-stats2.rank*.json
 ```
 
 `--moe-bank-ram` is a **whole-host** cap, not per rank: two ranks on one machine each get half
 of it. Leave headroom -- the rest of the process wants about 9 GiB, and what is left after
 that is page cache the design leans on.
 
-The first run writes the mapping (31.7 GiB per rank for Flash-Next); later runs reuse it
-unless the placement changed. `--moe-bank-dir` moves it off `~/.cache`.
+The first run reads the checkpoint's experts and writes the file (63.4 GiB for Flash-Next, each
+rank its half). Later runs read no expert tensor from the checkpoint; a new `--moe-bank-stats`
+reorders the file in place, and a new budget or layer split changes nothing on disk
+([What the file holds](#what-the-file-holds-and-what-a-restart-reads)). Once a histogram has been
+applied, later starts can leave `--moe-bank-stats` off. `--moe-bank-dir` moves the file off
+`~/.cache`.
+
+**Builds before this one placed rank 1 by rank 0's histograms.** The placement was keyed by each
+rank's own layer index (0-23 on both ranks of Flash-Next) while the histograms were keyed by the
+model's (rank 1's are 24-47), so rank 1 sorted its experts by the routing of layers 0-23. Every
+`--pp-size 2` figure below was measured that way; how much a correct rank 1 changes them has not
+been measured.
 
 ### 3. Set the device readahead
 
@@ -252,6 +302,71 @@ It is off by default because it reads the disk while nothing is running: 7.7 GiB
 `autoMemoryReclaim` actually empties the cache on its own was not measured either -- the
 pressure here was made by hand.
 
+### 5. Optional: drop the second copy (`ft bank pack`)
+
+Once the bank file holds every layer, the checkpoint's expert tensors are dead weight on the disk:
+nothing reads them. `ft bank pack` writes a checkpoint without them and makes the bank file part
+of it.
+
+```bash
+# the bank file must be complete: serve the original once with --moe-bank-ram (both ranks)
+ft bank info --model-path /models/Qwen3.8-Flash-Next-NVFP4
+ft bank pack --model-path /models/Qwen3.8-Flash-Next-NVFP4 --out /models/Qwen3.8-Flash-Next-banked --dry-run
+ft bank pack --model-path /models/Qwen3.8-Flash-Next-NVFP4 --out /models/Qwen3.8-Flash-Next-banked
+ft serve --model-path /models/Qwen3.8-Flash-Next-banked ... --moe-bank-ram 48G
+```
+
+What it does, in order:
+
+1. **Decides what can go by the bytes, not the names.** A checkpoint tensor is dropped only if the
+   bank reproduces it exactly. NVFP4 codes and block scales are stored as they are (gate and up
+   concatenated); the per-tensor global scales went into the bank as fp16 and stay in the
+   checkpoint -- a few hundred kilobytes. gpt-oss MXFP4 blocks, scales and biases all go. Expert
+   tensors the server never reads (`input_scale`, the `--spec-mtp` head's experts) stay.
+2. **Checks every layer twice**, in one sequential pass over the shards that hold experts: the
+   bank's rows must equal what the loader packs from the original (every bank role, the lossy
+   ones included), and every tensor being dropped is regenerated from the bank and compared byte
+   for byte. A SHA-256 over them per layer and role goes into the record. The bank's own block
+   hashes are checked on the way.
+3. **Writes the slim checkpoint beside the original**: shards with no expert tensors are
+   hard-linked (no space; `--copy` to copy them), shards that mix both are rewritten without the
+   experts, shards of nothing but experts are left out. The index is rewritten and every other
+   file copied.
+4. **Moves the bank file into it** (`bank.ftmb`, a rename; `--keep-bank` leaves it where it is and
+   records the path) and marks it as the only copy: a server started on some other checkpoint
+   with the same `--moe-bank-dir` refuses to overwrite it.
+5. **Deletes nothing.** It ends by saying the original can be deleted. Because of the hard links,
+   deleting the original frees the expert data only.
+
+`freetoken_bank_pack.json` in the slim directory records the original shard headers, the index and
+the whole-file SHA-256 of every shard that was rewritten or left out. So the step is reversible:
+
+```bash
+ft bank verify --model-path /models/Qwen3.8-Flash-Next-banked   # no original needed
+ft bank unpack --model-path /models/Qwen3.8-Flash-Next-banked --out /models/Qwen3.8-Flash-Next-NVFP4
+```
+
+`verify` checks the block hashes, the removed tensors against the recorded hashes, and the bank
+against what the slim checkpoint's kept tensors pack to. `unpack` writes the original files back
+and compares each rebuilt shard with the original's SHA-256.
+
+A packed checkpoint is only served with `--moe-bank-ram` and a CPU-capable expert kernel
+(`--moe-strategy hybrid`); without them the server stops before loading any weight and says so.
+A budget that covers every expert keeps them all resident. A new histogram reorders the bank in
+place as before (`ft bank reorder --model-path ... --moe-bank-stats ...` does it without starting
+the server); the pack record is about the bytes of each expert, not where their rows sit, so it
+stays valid.
+
+What to keep in mind: **the bank file is now the only copy of the experts.** Back it up if the
+original is not kept anywhere else, and do not point a cache cleaner at it. `ft bank pack` needs
+free disk for the rewritten shards (the dry run prints how much) and reads the experts and the
+bank once each. It holds a few layers' worth of rows in RAM at a time -- about 5 GiB for
+Flash-Next by arithmetic.
+
+So far `ft bank pack`, `verify` and `unpack` have run on the small synthetic NVFP4 and gpt-oss
+checkpoints of the test suite only; none of the timings or sizes above for real checkpoints has
+been measured.
+
 ## Measured
 
 Two RTX 3060 12 GB, a Core i5-12600KF, 128 GB of DDR5-4000, a Gen4 NVMe on the CPU-direct M.2,
@@ -325,8 +440,11 @@ were worth about a factor of two, and should not have been quoted as if they wer
 - **Prefill is 2-7x slower.** Each chunk still streams every expert of every layer, and the
   quarter that is not registered goes through a pinned bounce buffer at about 1.7 GB/s. Three
   quarters of it overlaps the previous layer's GEMMs; the rest does not.
-- **Disk space.** The mapping is a second copy of the banks: 63.4 GiB for Flash-Next, on top of
-  the checkpoint and (for that model) 47.7 GiB of PLE.
+- **Disk space.** The bank file is a second copy of the experts -- 63.4 GiB for Flash-Next, on
+  top of a checkpoint whose other large part is 47.7 GiB of PLE -- until `ft bank pack` removes
+  them from the checkpoint (section 5). The PLE is not copied: `--ple-backend disk` reads its rows
+  from the checkpoint's own shards, and a packed checkpoint hard-links every shard that holds no
+  expert tensors (`--dry-run` shows which).
 - **A slow disk changes the answer, and so does which M.2 slot it is in.** Decode reads whole
   expert rows at random from several threads. Measured against a Gen4 NVMe on the CPU-direct M.2:
   a Gen3 NVMe (3.2 GB/s) multiplies the disk part by about 1.6, and a SATA SSD (0.5 GB/s) adds
