@@ -172,6 +172,20 @@ instead and the server inherits it.
 
 ## Running
 
+### 0. Check the host first (`ft doctor disk`)
+
+```bash
+ft doctor disk --model /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2
+```
+
+It answers, without a GPU or root, the questions the rest of this section was learnt from: where
+the bank file is and which layers it already holds, what filesystem and device it is on (and
+whether a WSL2 `/mnt/c`, a network share, a USB/SATA disk or a chipset M.2 shared with a GPU is in
+the way), whether `read_ahead_kb` suits
+this model, how much RAM `--moe-bank-ram auto` would take, how fast the disk reads expert rows
+the way decode does, and roughly what each RAM cap costs per token. The last part is an estimate
+with its assumptions printed beside it, not a measurement; see [cli.md](cli.md#ft-doctor-disk).
+
 ### 1. Measure the routing
 
 The placement is only as good as the histogram behind it. Run once with the graph disabled
@@ -202,6 +216,18 @@ ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
 `--moe-bank-ram` is a **whole-host** cap, not per rank: two ranks on one machine each get half
 of it. Leave headroom -- the rest of the process wants about 9 GiB, and what is left after
 that is page cache the design leans on.
+
+`--moe-bank-ram auto` does that arithmetic at startup, once, before the ranks start:
+
+```
+--moe-bank-ram auto: 47.9 GiB for the banks across 2 ranks = MemAvailable 60.0 GiB - 9.0 GiB for the rest of the server (4.5 per rank) - 3.1 GiB left as page cache for the non-resident rows; pass a size to override
+```
+
+The 4.5 GiB per rank is Flash-Next's measured 9 GiB halved; the margin is 5% of MemTotal (at
+least 2 GiB), which is what the measured 48G configuration left on a 64 GB host. It reads
+MemAvailable, so whatever else is running at startup is left alone -- and a server started while
+something large is running gets a smaller cap than it would otherwise. A model that keeps more in
+host RAM than Flash-Next (a host embedding, PLE tables in RAM) needs an explicit size.
 
 The first run reads the checkpoint's experts and writes the file (63.4 GiB for Flash-Next, each
 rank its half). Later runs read no expert tensor from the checkpoint; a new `--moe-bank-stats`
@@ -236,14 +262,33 @@ frequency order. The right value depends on the checkpoint's block geometry: the
 expert-row block is 1600 kB for Flash-Next and 7.91 MiB for gpt-oss-120b, and the measured
 optimum was a quarter to a sixth of that.
 
+`ft doctor disk` and the startup line both name the file and the recommended value for the
+model: the widest row block over sqrt(24), to the nearest power of two, which lands on both
+measured optima (256 for Flash-Next, 2048 for gpt-oss-120b) and is a guess for anything else.
+The startup line warns when the window is wider than the widest block. To set it by hand:
+
 ```bash
-DEV=$(df --output=source ~/.cache/freetoken/bankmap | tail -1)
-B=$(lsblk -no PKNAME "$DEV" | head -1); B=${B:-$(basename "$DEV")}
-echo 256 > /sys/block/$B/queue/read_ahead_kb
+echo 256 | sudo tee /sys/block/nvme0n1/queue/read_ahead_kb
 ```
 
-The startup line names the value and the file it came from, and complains when the window is
-wider than the widest block. Being under that threshold does not mean it is optimal -- measure.
+Do it before starting the server. The kernel copies the window into each file when it is opened
+and faults read with that copy, so a server already running keeps the window its mapping was
+opened with until it restarts.
+
+Or let the server do it: `--moe-bank-readahead auto` writes the recommended value before each rank
+opens its mapping of the bank file, and `--moe-bank-readahead 256` writes that one. Every rank maps
+the same file, so every rank sets it for itself and only the first logs it. It needs
+permission to write sysfs (root, or a container that mounts `/sys` writable); without it the
+server logs the command above once and carries on. It is off by default because the window
+belongs to the whole device -- every other file on that disk reads with it too -- and the
+server does not put the old value back when it exits (the log line names both). It does not
+survive a reboot either; a udev rule does, e.g.
+`ACTION=="add|change", KERNEL=="nvme0n1", ATTR{queue/read_ahead_kb}="256"` in
+`/etc/udev/rules.d/60-freetoken-readahead.rules`.
+
+Under WSL2 the window that counts is the virtual disk's (`/sys/block/sdX`), since that is the
+device the ext4 filesystem sits on. Being under the warning threshold does not mean the value
+is optimal -- measure.
 
 ### 4. Optional: read the cold rows back while idle (`--moe-bank-rewarm`)
 
@@ -445,7 +490,9 @@ were worth about a factor of two, and should not have been quoted as if they wer
   them from the checkpoint (section 5). The PLE is not copied: `--ple-backend disk` reads its rows
   from the checkpoint's own shards, and a packed checkpoint hard-links every shard that holds no
   expert tensors (`--dry-run` shows which).
-- **A slow disk changes the answer, and so does which M.2 slot it is in.** Decode reads whole
+- **A slow disk changes the answer, and so does which M.2 slot it is in** (`ft doctor disk`
+  reports the transport, the link and whether the drive shares the chipset uplink with a GPU;
+  the startup log warns about USB, SATA, rotating disks and 9p/network/tmpfs mounts). Decode reads whole
   expert rows at random from several threads. Measured against a Gen4 NVMe on the CPU-direct M.2:
   a Gen3 NVMe (3.2 GB/s) multiplies the disk part by about 1.6, and a SATA SSD (0.5 GB/s) adds
   roughly 306 ms per step even at 64 GB, which is not a configuration worth running. A *chipset*

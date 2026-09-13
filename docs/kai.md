@@ -34,7 +34,8 @@ The fork adds nine things upstream does not have:
    31 s → 3 s on a 2060). The bank file covers every layer, so a restart reads no expert tensor
    from the checkpoint and a new layer split or budget rewrites nothing; `ft bank pack` then
    removes the experts from the checkpoint, after checking that the bank gives each one back
-   byte for byte. See [bank-ram.md](bank-ram.md).
+   byte for byte. `ft doctor disk` checks a host for all of this before the first run,
+   without a GPU. See [bank-ram.md](bank-ram.md).
 7. **A quantized KV cache** (`--kv-cache-dtype q8_0` / `q4_0`), 1.88x / 3.56x smaller than
    16-bit: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB 2060. It is a VRAM trade, not a speed
    one -- measured on that card, `q4_0` costs about a third of the decode rate once the

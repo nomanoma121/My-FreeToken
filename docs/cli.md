@@ -13,6 +13,7 @@ ft <command> [args]
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
 | `ft bank` | Inspect, pack, verify, unpack or reorder the `--moe-bank-ram` bank file |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate the MoE backend |
+| `ft doctor disk` | Check whether `--moe-bank-ram` suits this host's disk and RAM, and what to set (no GPU, no root) |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
 `+g<sha>` build stamp, tagged releases a bare version). Every command supports
@@ -100,9 +101,10 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
-| `--moe-bank-ram` | off | Half the RAM: keep only the frequently routed experts resident, map the rest from disk. Whole-host cap (`48G`), split across ranks. Needs `RLIMIT_MEMLOCK` (`ulimit -l`) at least as large as one rank's share, or the resident half is quietly smaller than asked. See [bank-ram.md](bank-ram.md) |
+| `--moe-bank-ram` | off | Half the RAM: keep only the frequently routed experts resident, map the rest from disk. Whole-host cap (`48G`), split across ranks. `auto` = MemAvailable at startup − 4.5 GiB per rank − a page cache margin (5% of MemTotal, at least 2 GiB), with the arithmetic logged. Needs `RLIMIT_MEMLOCK` (`ulimit -l`) at least as large as one rank's share, or the resident half is quietly smaller than asked. See [bank-ram.md](bank-ram.md) |
 | `--moe-bank-stats` | — | Routing histograms (from `--moe-stats-out`, every rank's file) that decide which experts stay resident. A change reorders the bank file in place; without the flag the order already in the file is kept |
-| `--moe-bank-dir` | `~/.cache/freetoken/bankmap/<model>` | Where the bank file (`bank.ftmb`, one for every rank) lives. A checkpoint packed by `ft bank pack` keeps its own inside it |
+| `--moe-bank-dir` | `~/.cache/freetoken/bankmap/<model>` | Where the bank file (`bank.ftmb`, one for every rank) lives. A checkpoint packed by `ft bank pack` keeps its own inside it. The startup log warns when that is a 9p/drvfs, network or tmpfs mount, a USB, SATA or rotating disk |
+| `--moe-bank-readahead` | off | With `--moe-bank-ram`: `auto` writes the recommended device `read_ahead_kb` for the model's block geometry, a number writes that many kB; `off` only logs the current window and the command to change it. Each rank sets it before opening its mapping, since an open mapping keeps the window it was opened with. Device-wide and left set after exit. See [bank-ram.md](bank-ram.md#3-set-the-device-readahead) |
 | `--moe-bank-rewarm` | 0 | With `--moe-bank-ram`: after this many seconds idle, each rank reads back the non-resident rows the page cache has lost (below 95%), in file order, stopping when a request arrives; backs off while memory stays under pressure. 0 = off, because it reads the disk while idle. See [bank-ram.md](bank-ram.md#4-optional-read-the-cold-rows-back-while-idle---moe-bank-rewarm) |
 | `--moe-stats-out` | off | Write the per-expert decode routing histogram on shutdown (pass `--disable-cuda-graph`) |
 | `--moe-collect-stats` | off | Accumulate the cache's decode miss-rate counters device-side, captured into the decode graph; `--moe-stats-out` reads them back |
@@ -193,6 +195,37 @@ no experts, moves the bank file into it, and deletes nothing. `verify` repeats t
 the original; `unpack` writes the original files back and checks them against the SHA-256 recorded
 at pack time; `reorder` applies a new placement in place. No GPU. See
 [bank-ram.md](bank-ram.md#5-optional-drop-the-second-copy-ft-bank-pack).
+
+## ft doctor disk
+
+```bash
+ft doctor disk --model /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2
+ft doctor disk --model /models/gpt-oss-120b --moe-bank-stats ~/moe-stats.rank0.json --eval-stats ~/other-session.rank0.json
+ft doctor disk --moe-bank-dir /nvme/bankmap/gpt-oss-120b --disk-gbs 3.2 --base-step-ms 55 --ram 32G,48G
+```
+
+Whether `--moe-bank-ram` is usable here, before a 60 GiB bank file is written. Needs no GPU
+and no root; reads `/proc` and `/sys` and nothing else unless it benchmarks.
+
+- **The bank file**, found the way `ft serve` finds it (`--moe-bank-dir`, the one a packed
+  checkpoint names, else the cache directory): which of the model's layers it holds, whether it
+  is the only copy of a packed checkpoint's experts, and per-rank files an older build left.
+- **Storage** of the bank file (and of the checkpoint when it is elsewhere): filesystem,
+  the block device under it through dm/partitions, transport (NVMe/SATA/USB/virtual), the NVMe
+  PCIe link, and an estimate of whether the drive sits behind the chipset -- and shares that
+  uplink with a GPU. Inside WSL2 the drive is behind a virtual disk; the report says so and
+  prints the PowerShell to look it up from Windows.
+- **Readahead**: the current window against the one recommended for this model's widest
+  expert-row block, and the exact command to set it (before starting the server).
+- **Memory**: MemTotal/MemAvailable, swap, `ulimit -l`, and what `--moe-bank-ram auto` would choose.
+- **Read benchmark**: whole expert rows at random from the bank file once it holds every layer
+  (otherwise the checkpoint's largest file -- unwritten layers read back as zeros),
+  O_DIRECT, one thread and then one per physical core per rank. Skipped when another process
+  maps the file (a running server), unless `--bench-anyway`. `--bench-seconds 0` skips it.
+- **Prediction per RAM cap**: resident share, routes covered (from `--moe-bank-stats`, counted
+  on `--eval-stats` when given -- the same histogram overstates it), page cache left, disk read
+  per token, and with a read rate and `--base-step-ms` a step time. The assumptions are printed
+  under the table; the model was within about 2x of the measurements it was checked against.
 
 ## ft bench bw
 
