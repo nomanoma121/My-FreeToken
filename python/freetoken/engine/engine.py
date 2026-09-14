@@ -638,7 +638,7 @@ class Engine:
             )
         self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
-        if config.active_encoders:
+        if config.encodes_here:
             from freetoken.models.blocks import SupportsMultimodal
 
             if not isinstance(self.model, SupportsMultimodal):
@@ -672,7 +672,12 @@ class Engine:
             self.model.prepare_for_runtime()
         self.encoder_cache = None
         self.mm_processor = None
-        if config.active_encoders:
+        if config.active_encoders and not config.encodes_here:
+            # a later pipeline rank: the first rank encodes, this one only ropes the image rows
+            logger.info(
+                f"Multimodal: pipeline rank {config.tp_info.rank} leaves the encoders to rank 0"
+            )
+        elif config.active_encoders:
             from freetoken.mm.encoder_cache import EncoderCache
             from freetoken.mm.processor import get_mm_processor
 
@@ -984,7 +989,7 @@ class Engine:
             self.device,
             include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
             include_mtp=has_mtp,
-            include_vision=bool(config.active_encoders),
+            include_vision=config.encodes_here,
         )
         remap = getattr(self.model, "remap_loaded_weight", None)
         if remap is not None:
@@ -1700,7 +1705,7 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        if batch.mm_gather_plan:
+        if batch.mm_gather_plan and self.encoder_cache is not None:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         pp = self.pp_comm

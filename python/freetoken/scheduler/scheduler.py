@@ -568,7 +568,7 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
-            if msg.mm_items and self.engine.encoder_cache is None:
+            if msg.mm_items and not _serves_multimodal(self.engine):
                 # no encoder runtime: fail loudly instead of decoding unexpanded placeholders
                 self.send_result(
                     [
@@ -924,6 +924,8 @@ class Scheduler(SchedulerIOMixin):
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
+        if self.engine.encoder_cache is None:
+            return  # a later pipeline rank: the image rows arrive in the residual stream
         jobs, plan, rows = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
         if plan:
             batch.mm_encoder_jobs = jobs
@@ -1084,6 +1086,15 @@ class Scheduler(SchedulerIOMixin):
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _serves_multimodal(engine) -> bool:
+    """Whether the model this process serves takes images. Every pipeline rank answers alike --
+    they admit or refuse a request together -- though only the first holds an encoder cache."""
+    config = getattr(engine, "config", None)
+    if config is not None and hasattr(config, "active_encoders"):
+        return bool(config.active_encoders)
+    return engine.encoder_cache is not None
 
 
 def _no_tokens_needed(batch: Batch) -> bool:
