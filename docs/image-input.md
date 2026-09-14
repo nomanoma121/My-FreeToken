@@ -28,6 +28,7 @@ every token is roped on three axes, text included.
 | `--pp-size` | Only the first rank builds, loads and runs the tower; the other ranks rope the image rows and admit or refuse image requests alike |
 | `--spec-mtp` | The verify window, the draft head and their CUDA graphs rope on three axes; the draft head embeds the placeholder token where an image row's successor is a content pad id |
 | `--prefill-mixer-pieces` | An image chunk splits like a text one |
+| `--mm-encoder-dtype` | A GPU vision tower computes in float32 when the model runs bfloat16 (below) |
 | `--dense-quant fp8` | Leaves the vision tower bf16 (its blocks are streamed from host memory, so fp8 would save RAM, not VRAM) |
 | Pin budget | With `--mm-encoder-weights host` the tower's pinned block bank counts against the pin quota the expert bank planner uses (WSL2 caps it) |
 
@@ -64,6 +65,28 @@ cache plan is the text-only one (1.70 GiB of weights, 358 expert slots, 21 layer
 blue) answers 6/6, and a repeated image prompt reuses 128 of its 184 tokens from the prefix
 cache. With `--spec-mtp 3` at 16k an image prompt is described correctly at 1.4-3.8 tokens
 accepted per step.
+
+## `--mm-encoder-dtype`: the tower in bfloat16
+
+Upstream builds the vision tower in the model's dtype. In bfloat16 (7 fraction bits) this tower does
+not hold its output: on the same image (Ornith-1.5's tower, 150 tokens) against transformers' own
+tower in float32 on the CPU,
+
+| Tower on the GPU | Cosine, worst token | Cosine, mean | Relative L2 error |
+|---|---|---|---|
+| upstream's, float32 | 1.00000 | 1.00000 | 0.17% |
+| upstream's, float16 | 0.99760 | 0.99992 | 1.4% |
+| upstream's, bfloat16 | 0.93186 | 0.99743 | 8.9% |
+| transformers', bfloat16 | 0.93186 | 0.99743 | 8.9% |
+
+Upstream's tower is exact; the loss is the format's. It still names colours right, but the text model
+is less sure of what it saw: on two RTX 3060s (Qwen3.8-Flash-Next, bfloat16, `--spec-mtp 5`), a
+description of a four-quadrant image kept the end-of-turn token second, within 1-4 logits, on most rows
+and ended mid-list; with the CPU tower (float32) it stayed out of reach. So by default (`auto`) a GPU
+tower computes in float32 whenever the model runs bfloat16, and in the model dtype otherwise (float16 on
+Turing is left as it is). float32 doubles what the tower keeps on the GPU (the merger, the embeddings and
+two block-sized staging buffers: 0.19 GiB for Ornith-1.5's tower in float16 on the RTX 2060) and its
+pinned block bank.
 
 ## Not covered
 

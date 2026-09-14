@@ -220,6 +220,16 @@ class Qwen3VLVisionModel(BaseOP):
     """
 
     def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = "visual"):
+        if getattr(vc, "dtype", None) is not None:
+            from freetoken.utils.torch_utils import torch_dtype
+
+            # every buffer in the tower's own dtype; its output is cast to the model dtype where the rows are gathered
+            with torch_dtype(getattr(torch, vc.dtype)):
+                self._build(vc, quant_config, prefix)
+        else:
+            self._build(vc, quant_config, prefix)
+
+    def _build(self, vc: VisionConfig, quant_config: QuantConfig | None, prefix: str) -> None:
         self.patch_embed = VisionConv3dPatchEmbed(vc)
         self.pos_embed = _EmbeddingParams(vc.num_position_embeddings, vc.hidden_size)
         self.blocks = OPList(

@@ -285,6 +285,11 @@ class EngineConfig:
         if config.vision_config is not None and not self.builds_tower:
             # a later pipeline rank, or a CPU tower, builds none; the rope sections parsed from it stay
             config = replace(config, vision_config=None)
+        elif config.vision_config is not None and "dtype" in getattr(config.vision_config, "__dataclass_fields__", {}):
+            # the Qwen VL tower's compute dtype (--mm-encoder-dtype); other families' towers follow the model
+            config = replace(
+                config, vision_config=replace(config.vision_config, dtype=self.mm.resolve_encoder_dtype(self.dtype))
+            )
         return config
 
     @property

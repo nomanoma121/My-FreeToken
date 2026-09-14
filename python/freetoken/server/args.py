@@ -572,6 +572,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mm-encoder-dtype",
+        choices=["auto", "float32", "float16", "bfloat16"],
+        default=MultimodalConfig.encoder_dtype,
+        help="Compute dtype of a GPU encoder tower (not --mm-encoder-weights cpu, which is float32). auto: "
+        "float32 when the model runs bfloat16 -- the Qwen VL vision tower loses about 9%% of its output in "
+        "bfloat16 -- otherwise the model dtype.",
+    )
+
+    parser.add_argument(
         "--allowed-media-domains",
         type=str,
         default=ServerArgs.allowed_media_domains,
@@ -1218,6 +1227,7 @@ def parse_args(
         disabled_encoders=frozenset(disabled),
         embed_cache_device=kwargs.pop("mm_embed_cache_device"),
         encoder_weights=kwargs.pop("mm_encoder_weights"),
+        encoder_dtype=kwargs.pop("mm_encoder_dtype"),
         image_min_tokens=image_min_tokens,
         image_max_tokens=image_max_tokens,
         processor_kwargs=kwargs.pop("mm_processor_kwargs") or {},

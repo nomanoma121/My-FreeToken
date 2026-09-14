@@ -20,6 +20,18 @@ class MultimodalConfig:
     # Encoder tower block weights. "host": pinned host banks streamed two blocks at a time behind the compute, "gpu": resident,
     # "cpu": the tower runs on the CPU in the tokenizer worker and the engine builds none (mm/cpu_tower.py).
     encoder_weights: Literal["gpu", "host", "cpu"] = "host"
+    # Encoder tower compute dtype on the GPU (Kai). "auto": float32 when the engine runs bfloat16 -- the Qwen VL
+    # tower loses ~9% of its output in bf16 (7 fraction bits), in transformers' own code as in this one --
+    # else the engine dtype. Or float32 / float16 / bfloat16 explicitly.
+    encoder_dtype: Literal["auto", "float32", "float16", "bfloat16"] = "auto"
+
+    def resolve_encoder_dtype(self, engine_dtype: Any) -> str:
+        """The torch dtype name the GPU encoder towers are built and run in."""
+        import torch
+
+        if self.encoder_dtype != "auto":
+            return self.encoder_dtype
+        return "float32" if engine_dtype == torch.bfloat16 else str(engine_dtype).removeprefix("torch.")
     # per-image token budget; the family's MMProcessor converts it to its image processor's own limits, None keeps the checkpoint defaults
     image_min_tokens: int | None = None
     image_max_tokens: int | None = None

@@ -696,7 +696,9 @@ class Engine:
             self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
             logger.info_rank0(
                 f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
-                f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
+                f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}"
+                + (f" ({config.mm.resolve_encoder_dtype(config.dtype)})" if config.builds_tower else "")
+                + f", serving {sorted(config.served_modalities)}"
             )
             if config.builds_tower:
                 self._warmup_encoders()
