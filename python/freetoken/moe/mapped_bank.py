@@ -567,8 +567,10 @@ class MappedTier:
     def __init__(self, path: str, layers, *, num_experts: int, hot_per_layer: int,
                  all_layers=None, wanted: dict | None = None, layout: MappedBankLayout | None = None,
                  meta: dict | None = None, can_write: bool = True, log=None, warn=None,
-                 readahead: str = "off", report_readahead: bool = True, first_rank: bool = True):
+                 readahead: str = "off", report_readahead: bool = True, first_rank: bool = True,
+                 ranks: int = 1):
         self.path = path
+        self.ranks = max(1, int(ranks))  # every rank maps its own resident rows on this host
         # --moe-bank-readahead: "off" (report only), "auto" (the recommended window) or kB. Every
         # rank maps the same file, so one device: each rank sets it before opening its own
         # mapping, and only the first says anything about it.
@@ -909,11 +911,16 @@ class MappedTier:
         cache.expert_perm = perm
         if self.banks is None:
             return
-        if self.banks.cold_spans and os.environ.get("FREETOKEN_BANK_PREAD", "1").strip() != "0":
+        mode = os.environ.get("FREETOKEN_BANK_PREAD", "auto").strip().lower()
+        if self.banks.cold_spans and mode not in ("0", "off"):
             try:
-                from freetoken.moe.bank_reader import BankReader
+                from freetoken.moe.bank_reader import BankReader, choose_direct
 
-                cache.bank_reader = BankReader(self.banks)
+                cold = sum(n for _, n in self.banks.cold_spans)
+                direct, why = choose_direct(cold, self.banks.mapped_bytes - cold, self.ranks)
+                if mode in ("direct", "buffered"):
+                    direct, why = mode == "direct", f"FREETOKEN_BANK_PREAD={mode}"
+                cache.bank_reader = BankReader(self.banks, direct=direct, why=why)
                 self.log(f"--moe-bank-ram: prefill reads the non-resident rows directly "
                          f"({cache.bank_reader.describe()})")
             except Exception as exc:  # noqa: BLE001 -- the mapping copy still works

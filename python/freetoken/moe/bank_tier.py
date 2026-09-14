@@ -180,5 +180,5 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
         path, layers, all_layers=range(total_layers), num_experts=num_experts, hot_per_layer=hot,
         wanted=wanted, layout=layout, meta=meta, can_write=packed is None, log=log, warn=warn,
         readahead=getattr(config, "moe_bank_readahead", "off") or "off", report_readahead=first_rank,
-        first_rank=first_rank,
+        first_rank=first_rank, ranks=ranks,
     )

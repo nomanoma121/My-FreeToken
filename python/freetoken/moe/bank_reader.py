@@ -19,9 +19,21 @@ several threads at once, straight into the pinned staging buffers:
 * nothing goes through the page cache, so a prefill no longer evicts the non-resident rows
   decode has been accumulating there (the reason a long generation speeds up as it goes).
 
-A range the page cache already holds (at least ``FREETOKEN_BANK_PREAD_CACHED``, default 0.9 of
-its pages, by ``mincore``) is still copied out of the mapping: from RAM that is a memcpy at
-10+ GiB/s, which no disk read beats. ``FREETOKEN_BANK_PREAD=0`` turns the reader off;
+A piece the page cache already holds (at least ``FREETOKEN_BANK_PREAD_CACHED``, default 0.9 of
+its pages, by ``mincore``) is copied out of the mapping instead, on the same threads: from RAM
+that is a memcpy at 10+ GiB/s, which no disk read beats. Deciding per piece rather than per
+range matters because what the page cache keeps is not spread evenly: with a third of the rows
+cached, deciding per range still read every byte from the disk.
+
+Direct reads never fill the page cache, which is the point on a host whose page cache cannot hold
+the non-resident rows anyway, and the wrong thing on one that can: there a piece that was not
+cached once would come from the disk on every chunk (measured on the RTX 2060 host with RAM to
+spare: 2.65 GiB per chunk, 0.7 -> 1.9 s of bank read). So the reads are direct only when the page
+cache left beside the resident rows is smaller than the non-resident rows (the arithmetic of
+``ft doctor disk``: the smaller of MemTotal and this process's cgroup limit, less every rank's
+resident rows and the rest of the server); otherwise they are buffered, still parallel, and the
+page cache fills after the first chunk. ``FREETOKEN_BANK_PREAD`` = ``auto`` (default),
+``direct``, ``buffered``, or ``0`` to turn the reader off;
 ``FREETOKEN_BANK_READ_THREADS`` (default 8) and ``FREETOKEN_BANK_READ_PIECE_MB`` (default 16)
 size it. Where the filesystem refuses ``O_DIRECT`` the reads are buffered: still parallel and
 still off the fault path, but they do fill the page cache.
@@ -38,6 +50,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import torch
+
+from freetoken.utils.prefill_profile import major_faults as _major_faults
 
 ALIGN = 4096
 
@@ -109,31 +123,94 @@ class DirectRangeReader:
             got += n
         return skew, nbytes
 
+    def _fill(self, s: int, j: int, offset: int, p: int, n: int, source, cached) -> tuple[int, bool]:
+        """One piece into buffer ``j`` of set ``s``: copied from ``source`` when ``cached`` says the
+        page cache holds it, else read from the file. Returns (start of the data in the buffer, copied)."""
+        view, raw = self.buffers[s][j]
+        if source is not None and cached is not None and cached(p, n):
+            # the buffers are made where the engine runs, under torch.inference_mode(), and that
+            # mode is per thread: outside it here an in-place write to them is refused
+            with torch.inference_mode():
+                view[:n].copy_(source[p:p + n])
+            return 0, True
+        return self._read(raw, offset + p, n)[0], False
+
     def read(self, offset: int, nbytes: int, sink: Callable[[int, torch.Tensor, int], None],
-             before_group: Callable[[int], None] | None = None) -> None:
+             before_group: Callable[[int], None] | None = None, *, source: torch.Tensor | None = None,
+             cached: Callable[[int, int], bool] | None = None) -> int:
         """Read ``nbytes`` from ``offset`` in pieces, ``threads`` at a time, and hand each piece to
         ``sink(position, host view, group set)`` in file order. ``before_group(set)`` runs before
-        a set's buffers are refilled (the caller waits there for whatever last read them)."""
+        a set's buffers are refilled (the caller waits there for whatever last read them).
+        ``source`` is the same bytes as a host tensor (the mapping) and ``cached(position, bytes)``
+        picks the pieces to copy from it instead. Returns the bytes copied rather than read."""
         pieces = [(p, min(self.piece, nbytes - p)) for p in range(0, nbytes, self.piece)]
+        copied = 0
         for g in range(0, len(pieces), self.threads):
             s = (g // self.threads) % len(self.buffers)
             if before_group is not None:
                 before_group(s)
             group = pieces[g:g + self.threads]
             futures = [
-                self._pool.submit(self._read, self.buffers[s][j][1], offset + p, n)
+                self._pool.submit(self._fill, s, j, offset, p, n, source, cached)
                 for j, (p, n) in enumerate(group)
             ]
             for j, ((p, n), fut) in enumerate(zip(group, futures)):
-                skew, _ = fut.result()
+                skew, from_source = fut.result()
+                copied += n if from_source else 0
                 sink(p, self.buffers[s][j][0][skew:skew + n], s)
+        return copied
+
+
+def _cgroup_limit(proc: str = "/proc", sys: str = "/sys") -> int | None:
+    """The tightest memory.high / memory.max on this process's cgroup v2 path, or None."""
+    try:
+        with open(os.path.join(proc, "self/cgroup"), encoding="ascii") as f:
+            path = next((line.split(":", 2)[2].strip() for line in f if line.startswith("0::")), None)
+    except OSError:
+        return None
+    if path is None:
+        return None
+    best = None
+    parts = [p for p in path.split("/") if p]
+    for depth in range(len(parts), -1, -1):
+        base = os.path.join(sys, "fs/cgroup", *parts[:depth])
+        for name in ("memory.high", "memory.max"):
+            try:
+                with open(os.path.join(base, name), encoding="ascii") as f:
+                    value = f.read().strip()
+            except OSError:
+                continue
+            if value.isdigit():
+                best = int(value) if best is None else min(best, int(value))
+    return best
+
+
+def choose_direct(cold_bytes: int, resident_bytes: int, ranks: int, *, mem_total: int | None = None,
+                  limit: int | None = None) -> tuple[bool, str]:
+    """(read directly?, why): direct when the page cache beside every rank's resident rows cannot
+    hold every rank's non-resident rows, so buffered reads would only churn it."""
+    from freetoken.moe import disk_probe
+
+    if mem_total is None:
+        mem_total = disk_probe.meminfo().get("MemTotal", 0)
+    if limit is None:
+        limit = _cgroup_limit()
+    usable = min(mem_total, limit) if limit else mem_total
+    room = usable - ranks * (resident_bytes + disk_probe.NONBANK_PER_RANK_BYTES)
+    need = ranks * cold_bytes
+    gib = 2**30
+    direct = room < need
+    why = (f"page cache left {max(room, 0) / gib:.1f} GiB {'<' if direct else '>='} {need / gib:.1f} GiB non-resident "
+           f"({usable / gib:.1f} GiB {'cgroup limit' if limit and limit < mem_total else 'MemTotal'}, {ranks} rank"
+           f"{'s' if ranks > 1 else ''})")
+    return direct, why
 
 
 class BankReader:
     """``OffloadMoeCache.bank_reader``: the prefill copy of a mapped bank's non-resident rows."""
 
     def __init__(self, banks, *, threads: int | None = None, piece_bytes: int | None = None,
-                 cached_share: float | None = None) -> None:
+                 cached_share: float | None = None, direct: bool = True, why: str = "") -> None:
         from freetoken.kernel.pinned import alloc_pinned_tensor
 
         self.banks = banks
@@ -147,7 +224,9 @@ class BankReader:
             threads=threads or _env_int("FREETOKEN_BANK_READ_THREADS", 8),
             piece_bytes=piece_bytes or _env_int("FREETOKEN_BANK_READ_PIECE_MB", 16) << 20,
             alloc=lambda n: alloc_pinned_tensor(n, dtype=torch.uint8),
+            direct=direct,
         )
+        self.why = why
         self._events = [torch.cuda.Event() for _ in self.reader.buffers]
         self._libc = ctypes.CDLL("libc.so.6", use_errno=True)
         self._libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
@@ -157,30 +236,47 @@ class BankReader:
 
     def describe(self) -> str:
         r = self.reader
-        return (f"{r.threads} threads x {r.piece >> 20} MiB, {'O_DIRECT' if r.direct else 'buffered (no O_DIRECT here)'}, "
-                f"mapping copy when {self.cached_share:.0%} of a range is cached")
+        mode = "O_DIRECT" if r.direct else "buffered"
+        return (f"{r.threads} threads x {r.piece >> 20} MiB, {mode}"
+                + (f": {self.why}" if self.why else "")
+                + f"; a piece {self.cached_share:.0%} in the page cache is copied from the mapping")
 
-    def _share_cached(self, addr: int, nbytes: int) -> float:
+    def _residency(self, addr: int, nbytes: int) -> tuple[bytes, int] | None:
+        """(mincore vector, address of its first page) for ``[addr, addr + nbytes)``; None if it failed."""
         start = addr // mmap.PAGESIZE * mmap.PAGESIZE
         length = addr + nbytes - start
-        count = -(-length // mmap.PAGESIZE)
-        vec = ctypes.create_string_buffer(count)
+        vec = ctypes.create_string_buffer(-(-length // mmap.PAGESIZE))
         if self._libc.mincore(ctypes.c_void_p(start), length, vec) != 0:
-            return 1.0  # cannot tell: the mapping copy is the path that always works
-        raw = vec.raw
-        return (count - raw.count(0)) / count
+            return None
+        return vec.raw, start
+
+    def _share_cached(self, addr: int, nbytes: int) -> float:
+        res = self._residency(addr, nbytes)
+        if res is None:
+            return 1.0
+        raw = res[0]
+        return (len(raw) - raw.count(0)) / len(raw)
 
     def h2d(self, dst: torch.Tensor, src: torch.Tensor, prof=None) -> bool:
         """Copy ``src`` (a view of the bank mapping) to ``dst`` on the current stream by direct
-        reads. False when ``src`` is not in the mapping or the page cache already holds it, and
-        the caller copies it the usual way."""
+        reads, and the pieces the page cache holds by copies out of the mapping. False when ``src``
+        is not in the mapping (or mincore fails), and the caller copies it the usual way."""
         addr = src.data_ptr()
         nbytes = src.numel() * src.element_size()
         if nbytes == 0 or addr < self._lo or addr + nbytes > self._hi:
             return False
-        if self._share_cached(addr, nbytes) >= self.cached_share:
-            self.bytes_cached += nbytes
-            return False
+        res = self._residency(addr, nbytes)
+        if res is None:
+            return False  # cannot tell what is cached: the mapping copy always works
+        raw, first = res
+        page = mmap.PAGESIZE
+        share = self.cached_share
+
+        def cached(p: int, n: int) -> bool:
+            lo = (addr + p - first) // page
+            hi = -(-(addr + p + n - first) // page)
+            return (hi - lo - raw.count(0, lo, hi)) >= share * (hi - lo)
+
         d = dst.reshape(-1).view(torch.uint8)
         stream = torch.cuda.current_stream(dst.device)
         events = self._events
@@ -195,13 +291,17 @@ class BankReader:
             d[p:p + host.numel()].copy_(host, non_blocking=True)  # async DMA on the stream
             events[s].record(stream)
 
+        source = src.reshape(-1).view(torch.uint8)
+        faults = _major_faults() if prof is not None else 0
         started = time.perf_counter()
         with self._lock:
-            self.reader.read(addr + self._file_base, nbytes, sink, before_group)
+            copied = self.reader.read(addr + self._file_base, nbytes, sink, before_group,
+                                      source=source, cached=cached)
         if prof is not None:
             elapsed = time.perf_counter() - started
-            prof.staged_piece(waited[0], elapsed - waited[0], nbytes, 0)
-        self.bytes_read += nbytes
+            prof.staged_piece(waited[0], elapsed - waited[0], nbytes, _major_faults() - faults)
+        self.bytes_cached += copied
+        self.bytes_read += nbytes - copied
         return True
 
     def close(self) -> None:
