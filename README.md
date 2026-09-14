@@ -4,7 +4,7 @@
 at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 
 > An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken), merged
-> with upstream `main` at `9535656` (2026-09-12). Not affiliated with, endorsed by, or supported by
+> with upstream `main` at `e0886cc` (2026-09-14). Not affiliated with, endorsed by, or supported by
 > FlashML. The license is unchanged (Apache-2.0).
 >
 > **Please keep questions and bug reports about this fork in this repository.** The FreeToken
@@ -45,7 +45,7 @@ at the far end. A 125B MoE on two of them. A 35B MoE on an RTX 2060 6 GB.**
 > KV pool actually holds, which for an offloaded MoE left at the default `--kv-reserve-tokens 8192`
 > is far below what `/v1/models` advertises.
 
-Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer, text only.
+Upstream FreeToken serves one model on one GPU, on Ampere (RTX 30 series) or newer.
 This fork adds nine things on top of it. They are independent — take one, ignore the rest.
 
 | | What it does | How you ask for it |
@@ -53,7 +53,7 @@ This fork adds nine things on top of it. They are independent — take one, igno
 | 1 | **Two consumer GPUs, one model.** Layer split, one process per card, the residual stream handed over gloo — **no NCCL and no GPU-to-GPU peer access.** Uneven splits for cards of different sizes. | `--pp-size 2` |
 | 2 | **Half the host RAM** an offloaded MoE needs. Expert banks become a file mapping with a locked resident prefix, so 128 GB configurations run in 64 GB. On a host whose driver will not register a read-only mapping -- and there are such hosts -- the resident rows are copied into private pages instead, so the GPU can still reach them and the VRAM expert cache still works. When the page cache is taken while the server is idle, the cold rows can be read back before the next request faults them in one by one. | `--moe-bank-ram 48G`, `--moe-bank-rewarm 5` |
 | 3 | **Turing (RTX 20 series, sm_75) support — and at the card's own speed.** Upstream requires Ampere or newer, and the assumption shows up as tiles and warp counts that a 64 KB shared-memory card cannot run: the prefill attention and the two GDN chunk kernels were at 1-3% of what the card does in fp16. Eight changes, each isolated to pre-Ampere. On an RTX 2060, prefill went from 192 to 469 tok/s on a 27k prompt and stopped falling off with context. | automatic |
-| 4 | **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served text-only. The vision tower runs on the CPU, so it costs no VRAM. | send `image_url` parts |
+| 4 | **Image input without VRAM.** Upstream serves images with the vision tower on the GPU; this runs it on the CPU instead, so a 6 GB card keeps its expert cache and 64k of context. No torchvision needed, and images work with the layer split and `--spec-mtp`. | `--mm-encoder-weights cpu` |
 | 5 | **Speculative decoding with the checkpoint's own MTP head.** Verify window and draft head captured as CUDA graphs. Correctness-verified. It pays off only where a multi-row verify costs about what a single row costs: with the experts in host RAM that means long acceptance, so it wins on code and tool calls on two cards and loses on free prose and on one card. | `--spec-mtp 5` |
 | 6 | **64k of context on a 6 GB card.** The input embedding table lives in host memory and the GPU reads rows from it directly. | `--host-embedding` |
 | 7 | **A KV cache 1.9x or 3.6x smaller**, stored as block-quantized codes: 1.25 GiB down to 0.35 GiB at 64k on a 6 GB card. It buys VRAM, not speed — past a few thousand tokens of context it costs about a third of the decode rate. Plain paged-attention models and gpt-oss on the Triton backend, and Qwen3.8-Flash-Next on its own sparse backend — where the cost above does not apply: measured on two RTX 3060s, `q4_0` decode is flat from 8k to 125k of context (−1.4%) while the KV drops 1.55 GiB to 0.47 GiB per rank, because its attention reads a fixed budget of tokens however long the context is. On gpt-oss use `q8_0`: it runs gpt-oss-120b at 128k of context on two RTX 3060s, and `q4_0` breaks its answers. | `--kv-cache-dtype q4_0` (gpt-oss: `q8_0`) |
@@ -175,9 +175,9 @@ worth 2.5x on its own.
 [docs/turing.md](docs/turing.md), which gives all six symptoms, their causes and their fixes.
 Other Turing cards (RTX 2070/2080, T4) should behave like the 2060 but are unverified.
 
-**Your checkpoint has a vision tower that FreeToken serves as text-only** — Qwen3.8-Flash-Next,
-Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B. See [docs/image-input.md](docs/image-input.md). Works from
-Open WebUI and any OpenAI client that sends `image_url` parts.
+**You want image input on a small card** — Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B.
+Upstream's vision tower lives on the GPU; `--mm-encoder-weights cpu` keeps it off. See
+[docs/image-input.md](docs/image-input.md).
 
 **You are on Ampere or newer.** Nothing here is taken away from you: every Turing change is behind
 a compute-capability check, and the layer split, the bank mapping, image input, `--spec-mtp` and
@@ -187,7 +187,7 @@ a compute-capability check, and the layer split, the bank mapping, image input, 
 ## Install
 
 Source install, same as upstream, plus Pillow for image decoding. torchvision is deliberately not
-required (the Qwen-VL processor is reimplemented on Pillow).
+required (without it the Qwen VL image processor is loaded as its Pillow backend).
 
 ```bash
 git clone https://github.com/yuuki-net/FreeToken-Kai.git && cd FreeToken-Kai
@@ -208,7 +208,7 @@ CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upst
 | [docs/prefill-chunk.md](docs/prefill-chunk.md) | The prefill chunk: sized to free VRAM (`--prefill-chunk-budget`), and made wider (`--prefill-mixer-pieces`) |
 | [docs/prefix-reuse.md](docs/prefix-reuse.md) | Why switching conversations re-prefills everything on hybrid GDN models (`--linear-state-cache-ratio`), and keeping prefixes on disk (`--prefix-disk-cache`, experimental) |
 | [docs/turing.md](docs/turing.md) | Turing (sm_75): six symptoms, six causes, six fixes |
-| [docs/image-input.md](docs/image-input.md) | Image input over the OpenAI API |
+| [docs/image-input.md](docs/image-input.md) | Image input: upstream's path, and the vision tower on the CPU (`--mm-encoder-weights cpu`) |
 | [docs/gguf.md](docs/gguf.md) | Why 3-bit and 2-bit GGUF experts are not the shortcut they look like — a road not taken, with the numbers |
 
 ## Who wrote this

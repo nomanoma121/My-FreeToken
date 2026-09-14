@@ -1,15 +1,16 @@
 # FreeToken Kai (改)
 
 An unofficial fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
-merged with upstream `main` at commit `9535656` (2026-09-12). It is not affiliated with, endorsed
+merged with upstream `main` at commit `e0886cc` (2026-09-14). It is not affiliated with, endorsed
 by, or supported by FlashML. The license is unchanged (Apache-2.0).
 
 The fork adds nine things upstream does not have:
 
-1. **Image input over the OpenAI API** for checkpoints that ship a vision tower but were served
-   text-only: Qwen3.8-Flash-Next and the Qwen3.5-MoE family (Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B).
-   The vision tower runs on the CPU, so it costs no VRAM. Works from Open WebUI and any OpenAI
-   client that sends `image_url` parts. See [image-input.md](image-input.md).
+1. **Image input without VRAM** (`--mm-encoder-weights cpu`). Upstream serves images on the Qwen
+   VL families with the vision tower on the GPU; this runs the tower on the CPU instead, so a
+   6 GB card keeps its expert cache and context. Also: no torchvision needed, and image input
+   works with `--pp-size`, `--spec-mtp`, `--prefill-mixer-pieces` and `--dense-quant`. See
+   [image-input.md](image-input.md).
 2. **Turing (RTX 20 series, sm_75) support.** Upstream requires Ampere or newer; six small,
    isolated changes make the engine run on an RTX 2060 at a usable speed. See [turing.md](turing.md).
 3. **Speculative decoding with the checkpoint's own MTP head** (`--spec-mtp`) for the
@@ -151,7 +152,7 @@ to read the thread count as a tuned value.
 |---|---|---|
 | RTX 2060 6 GB, 32 GB RAM, Windows 11 + WSL2 (`memory=24GB`) | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (35B MoE, 3B active, vision) | Text and image input work. Decode 25-39 tok/s (`--moe-strategy hybrid`, `--dtype float16`), 64k of context with `--host-embedding`. Prefill: a 2062-token prompt in ~7.8 s (68 s before the Turing GEMM changes); ~5 s of that is the per-chunk expert streaming, the rest ~1.3 ms/token; a follow-up turn behind a cached prefix answers in 2-3 s |
 | same | `openai/gpt-oss-20b` (MXFP4) | 20k of context with the defaults (`--moe-strategy hybrid --disable-moe-prefill-overlap`, bf16, `--kv-reserve-tokens 20480`: 20,868 tokens allocated, K + V = 0.58 GiB, 34 expert slots). Decode 14-16 tok/s measured against the depth held: 16.1 tok/s median at 1,845 tokens, 15.3 at 8,035, 14.4 at 15,953 (2026-09-13). One run fell to 9.1 at 19,315 with the pool 93% full; a `--memory-ratio 0.95` run (30,817 tokens) did not drop at the same depth, so the cause is not the length, and it is not pinned down. That `--memory-ratio 0.95` run leaves 0.12 GiB free and decodes slower (9.8 tok/s at 7.4k), so 20k is the usable figure. `--kv-cache-dtype` is refused (`HybridSWAKVCache`). Prefill is the cost: a 19k prompt took about 6.5 minutes, and consecutive prompts sharing a prefix showed `#cached-token: 0`. The earlier 13-14 tok/s was the Turing patch alone on upstream |
-| The two-GPU machine above (`--pp-size 2`, GPU 1 on the chipset x4 slot) | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` | Does not fit one 12 GB card; runs with 128k of context. 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end (colour probe 6/6, chunked image prefill). A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
+| The two-GPU machine above (`--pp-size 2`, GPU 1 on the chipset x4 slot) | `RadixArk/Qwen3.8-Flash-Next-NVFP4` (125B MoE, vision), `--pp-size 2 --dense-quant fp8` | Does not fit one 12 GB card; runs with 128k of context. 18-20 tok/s plain, 13-27 tok/s with `--spec-mtp 5` (2.1-4.5 tokens accepted per step; the verify window and the draft head run as CUDA graphs on both ranks). Image input validated end to end on the fork's earlier CPU image path (colour probe 6/6, chunked image prefill); upstream's image path with `--mm-encoder-weights cpu` has not been run here yet. A follow-up turn behind a cached prefix answers in 2.4-4.5 s (9 s before the CPU short-prefill path) |
 | same | `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | One card (`--gpu 0`), `--moe-strategy hybrid`: 41-46 tok/s, 2,947 expert slots (2026-09-06; the context length of that run was not recorded). The same one-card configuration takes 256k of context (`--max-seq-len-override 262144 --kv-reserve-tokens 262144`, 262154 tokens allocated, K + V = 5.00 GiB, 1.33 GiB free after initialisation) with the expert cache cut to 680 slots. Measured against the depth actually held, 22 sampled steps each: 39.2 tok/s median at 8,185 tokens, 34.8 at 63,655 (-11%), 25.2 at 249,948 (-36%, KV at 95% of capacity). Prefill of the 250k context took 435 s in 8,192-token chunks, the per-chunk rate falling from 896 tok/s over the first chunk to 371 at a depth of 221k. On this host the expert transfer is not the bottleneck, so the cache can be spent on context almost for free; the cost lands on prefill. The first steps after any prefill run at 31-37 until the cache warms. Two cards, `--pp-layers 25 --moe-strategy offload`: 40-44 tok/s, 3,833 slots per card; the even split with hybrid is slower (25-30 tok/s). `--spec-mtp 5` on one card: 19-35 tok/s (a 6-row verify step costs 68-92 ms against 23 ms for one row: the window multiplies the expert traffic, as on the 2060) |
 | same | `openai/gpt-oss-120b` (MXFP4, 57 GB of expert banks) | One card: 9-12 tok/s (202 expert slots; the banks exceed the pin budget, so 9 layers decode on the CPU). Two cards, `--pp-layers 26 --moe-strategy hybrid`: 12-17 tok/s (394 slots per card, every bank pinned). All gpt-oss-120b runs used 32k of context (`--max-seq-len-override 32768 --kv-reserve-tokens 32768`), not the 128k of the Flash-Next row above: 18 of its 36 layers are full attention at 2048 B per token per layer, so 128k of KV would want 4.7-5.5 GiB against 1.62 GiB free. Untested at 128k |
 
@@ -182,7 +183,7 @@ Nothing in this fork is limited to Turing, and nothing is taken away from newer 
 ## Install
 
 Source install, same as upstream, plus Pillow for image decoding. torchvision is deliberately not
-required (the Qwen-VL processor is reimplemented on Pillow).
+required (without it the Qwen VL image processor is loaded as its Pillow backend).
 
 ```bash
 git clone https://github.com/<your-account>/freetoken-kai.git && cd freetoken-kai
@@ -196,11 +197,11 @@ CUDA kernels are JIT-compiled on first use (CUDA 13 toolkit with `nvcc`, as upst
 ## Running Ornith-1.5-35B-A3B on an RTX 2060 (6 GB) under WSL2
 
 ```bash
-FT_IMAGE_MAX_PIXELS=262144 ft serve \
+ft serve \
   --model models/Ornith-1.5-35B-A3B-NVFP4 --dtype float16 --host 0.0.0.0 --port 1919 \
   --moe-strategy hybrid --moe-cpu-layers auto --disable-moe-prefill-overlap --max-running-req 1 \
   --kv-reserve-tokens 16384 --max-seq-len-override 16384 --memory-ratio 0.85 \
-  --moe-cpu-threads 6
+  --moe-cpu-threads 6 --mm-encoder-weights cpu --image-max-tokens 256
 ```
 
 | Flag / variable | Why |
@@ -212,7 +213,8 @@ FT_IMAGE_MAX_PIXELS=262144 ft serve \
 | `--kv-reserve-tokens 16384` | KV pages are carved from the same budget as the expert cache; the default 8192 was too small for Open WebUI prompts, 4096 far too small |
 | `--memory-ratio 0.85` | The ratio is of total VRAM and the desktop's ~600 MB counts against it; 0.92 left 60 MB for graph capture |
 | `--dtype float16` | Turing has fp16 tensor cores but no bf16 ones (cuBLAS: 19 vs 3 TFLOPS on a 2060); Ornith's output is unaffected |
-| `FT_IMAGE_MAX_PIXELS=262144` | One image becomes at most 256 soft tokens (512 x 512); the default 1024 x 1024 is 1024 tokens |
+| `--mm-encoder-weights cpu` | The vision tower runs on the CPU; on the GPU it would take 0.19 GiB of weights and 0.77 GiB of pin budget from a 6 GB card (see [image-input.md](image-input.md)) |
+| `--image-max-tokens 256` | One image becomes at most 256 tokens (512 x 512); the processor's own limit is 16384 |
 | WSL `.wslconfig` `memory=24GB` | The expert banks are 17 GB, the CPU vision tower 1.7 GB in fp32; with `memory=16GB` loading swaps and appears to hang |
 
 The attention backend resolves to `triton` automatically on Turing. Pipe the log through
@@ -326,8 +328,7 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FT_IMAGE_MAX_PIXELS` | `1048576` | Resolution cap the image processor keeps (soft tokens per image = pixels / 1024) |
-| `FT_IMAGE_EMBED_CACHE` | `32` | LRU entries of vision-tower output per image (chat clients resend every image each turn); `0` disables |
+| `FT_IMAGE_EMBED_CACHE` | `32` | `--mm-encoder-weights cpu`: images whose embeddings the tokenizer worker keeps, by content hash (chat clients resend every image each turn); `0` disables |
 | `FREETOKEN_FP8_SCRATCH_GEMM` | arch (on below Ampere) | fp8 W8A16 prefill GEMM as dequant + cuBLAS instead of the inline-dequant Triton kernel |
 | `FREETOKEN_NVFP4_MOE_SCRATCH` | arch (on below Ampere) | NVFP4 prefill MoE as chunked dequant + per-expert cuBLAS instead of the inline-dequant kernel |
 | `FREETOKEN_NVFP4_MOE_ARITH` | arch (on below Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
@@ -348,14 +349,12 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 
 ## Known limitations
 
-- Video and the Anthropic / Responses adapters (still text-only) are not covered.
+- Video is not covered.
 - Token log probabilities are not available. `/v1/chat/completions` and `/v1/completions`
   answer a request for `logprobs` / `top_logprobs` with a 400 rather than a response without
   them (on chat, `logprobs: false` and `top_logprobs: 0` are accepted).
 - `--spec-mtp` serves one request at a time and needs a checkpoint that ships an MTP head; its
   CUDA graphs need the Triton attention backend (eager otherwise).
-- Image prompts bypass the shared prefix cache (by upstream design), so a conversation with images
-  is prefilled in full every turn.
 - `--pp-size`: the ranks run in sequence, so two cards are never faster than one card that
   holds everything; every rank needs one layer of each attention kind; the runtime cache
   rebuild (`ft ctl`) is not available with more than one rank. See [pipeline.md](pipeline.md).
@@ -381,8 +380,8 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
   GLM-5.3-Flash, DeepSeek-V4-Flash, MiniMax-M3 and MLA checkpoints are refused. Flash-Next's
   own index tiers stay 16-bit too, but only its paged K/V is quantized, so it is supported.
   `q4_0` has not been measured on a benchmark suite.
-- DeepStack vision checkpoints (Qwen3-VL proper) are refused; only checkpoints with an empty
-  `deepstack_visual_indexes` are supported.
+- `--mm-encoder-weights cpu` refuses DeepStack vision checkpoints (Qwen3-VL proper); upstream's
+  GPU tower serves them.
 
 ## Related work
 
