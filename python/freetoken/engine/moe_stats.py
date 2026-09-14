@@ -12,6 +12,7 @@ and that placement table is exactly this histogram, ordered.
 from __future__ import annotations
 
 import json
+import os
 
 from freetoken.utils import init_logger
 
@@ -52,26 +53,41 @@ def collect_moe_stats(cache, rank: int, size: int, layer_range=None) -> dict:
     }
 
 
-def write_moe_stats(cache, path: str | None, rank: int, size: int, layer_range=None) -> str | None:
+def write_moe_stats(
+    cache, path: str | None, rank: int, size: int, layer_range=None, quiet: bool = False
+) -> str | None:
     """Write one rank's stats; return the path written, or None when nothing was written.
 
-    Never raises: this runs on the way out of an orderly shutdown, and a bad path or a full
-    disk must not turn a clean stop into a traceback. A dense model has no offload cache at
-    all, which is also not an error.
+    Called every time the scheduler goes idle as well as on an orderly stop, so the file
+    never depends on how the server is stopped: ``kill``, ``systemctl stop`` and a launcher
+    that ignores SIGINT never reach the stop path, and neither does a crash. The file is
+    replaced whole (written next to it, then renamed), so a stop in the middle of a write
+    leaves the previous one readable.
+
+    Never raises: a bad path, a full disk or a stats method that fails must not take down a
+    serving scheduler or turn a clean stop into a traceback. A dense model has no offload
+    cache at all, which is also not an error. ``quiet`` logs the success at debug level (the
+    idle rewrites); failures are always warnings.
     """
     if not path or cache is None:
         return None
     out = rank_path(path, rank, size)
-    payload = collect_moe_stats(cache, rank, size, layer_range)
+    tmp = f"{out}.tmp"
     try:
-        with open(out, "w", encoding="utf-8") as f:
+        payload = collect_moe_stats(cache, rank, size, layer_range)
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f)
-    except OSError as exc:
+        os.replace(tmp, out)
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
         logger.warning(f"--moe-stats-out: could not write {out}: {exc}")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         return None
     routing = payload["routing"] or {}
     cover = routing.get("experts_for_90pct")
-    logger.info(
+    (logger.debug if quiet else logger.info)(
         f"--moe-stats-out: wrote {out} "
         f"(miss_rate={payload['miss_stats'].get('miss_rate', 0.0):.3f}"
         + (f", experts_for_90pct={cover:.1f}/{payload['num_experts']}" if cover else "")

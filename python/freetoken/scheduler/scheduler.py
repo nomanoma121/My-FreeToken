@@ -185,6 +185,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefix_disk.persist_idle()
         if getattr(self, "bank_rewarm", None) is not None:
             self.bank_rewarm.idle()
+        self.engine.write_moe_stats_idle()
 
     def _wait_for_prefix_disk(self) -> None:
         """Nothing was scheduled: if that is because the head of the prefill queue is waiting for

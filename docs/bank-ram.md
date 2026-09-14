@@ -201,7 +201,8 @@ ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
   --disable-cuda-graph --moe-stats-out ~/moe-stats.json
 ```
 
-`~/moe-stats.rank0.json` and `~/moe-stats.rank1.json` are written on shutdown. Pass **every
+`~/moe-stats.rank0.json` and `~/moe-stats.rank1.json` are rewritten each time the server goes idle
+(after a request finishes), so they hold the whole session however the server is stopped. Pass **every
 rank's** file to `--moe-bank-stats`: each holds only its own rank's layers.
 
 **Routing is domain-dependent.** Measured out-of-sample on three sessions: a histogram taken

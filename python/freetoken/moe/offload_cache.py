@@ -537,7 +537,9 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
-        self.decode_freq.zero_()
+        # decode_freq is kept: which experts the router picks does not depend on the slot
+        # count, and --moe-stats-out rewrites its file at every idle, so zeroing here would
+        # replace a session's histogram with whatever came after the rebuild
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable

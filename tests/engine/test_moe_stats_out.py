@@ -165,3 +165,34 @@ def test_bad_bank_ram_is_rejected_at_parse_time():
     # better here than deep in the loader, after the weights have been read
     with pytest.raises(ValueError, match="could not parse"):
         _parse(["--moe-bank-ram", "lots"])
+
+
+def test_rewrite_replaces_the_file_whole(tmp_path):
+    # the idle rewrites land on a file a reader (ft bank reorder, a copy) may be holding
+    out = tmp_path / "moe.json"
+    out.write_text("{\"old\": true}", encoding="utf-8")
+    assert _write(str(out)) == str(out)
+    assert json.loads(out.read_text(encoding="utf-8"))["decode_freq"] == [[5, 1, 0], [2, 2, 2]]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["moe.json"]
+
+
+def test_a_failing_stats_method_keeps_the_previous_file(tmp_path):
+    # runs inside a serving scheduler at every idle: nothing may propagate
+    class _Broken(_FakeCache):
+        def decode_routing_stats(self):
+            raise RuntimeError("boom")
+
+    out = tmp_path / "moe.json"
+    _write(str(out))
+    before = out.read_text(encoding="utf-8")
+    assert _write(str(out), cache=_Broken()) is None
+    assert out.read_text(encoding="utf-8") == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["moe.json"]
+
+
+def test_quiet_write_still_writes(tmp_path):
+    from freetoken.engine.moe_stats import write_moe_stats
+
+    out = tmp_path / "moe.json"
+    assert write_moe_stats(_FakeCache(), str(out), 0, 1, None, quiet=True) == str(out)
+    assert out.exists()

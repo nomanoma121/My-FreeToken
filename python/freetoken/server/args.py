@@ -717,7 +717,8 @@ def parse_args(
         default=ServerArgs.moe_stats_out,
         help=(
             "Write the decode routing histogram (per layer, per expert) and the realized "
-            "miss rates to this JSON path at shutdown; implies --moe-collect-stats. One "
+            "miss rates to this JSON path, rewritten each time the server goes idle and on "
+            "shutdown; implies --moe-collect-stats. One "
             "file per pipeline rank (.rank<N>.json) when --pp-size > 1. The histogram is "
             "only accumulated outside a captured graph, so pair it with "
             "--disable-cuda-graph for a collection run."

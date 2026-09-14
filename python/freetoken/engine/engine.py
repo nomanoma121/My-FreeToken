@@ -2422,21 +2422,38 @@ class Engine:
             config, method, pp=try_get_pp_info(), log=logger.info, warn=logger.warning
         )
 
-    def _write_moe_stats(self) -> None:
-        """Dump the decode instrumentation to ``--moe-stats-out`` on an orderly stop.
+    def write_moe_stats_idle(self) -> None:
+        """Rewrite ``--moe-stats-out`` with everything counted so far (the scheduler went idle).
 
-        Ctrl+C / SIGTERM reach here via uvicorn's lifespan; a hard kill loses the window,
-        which is acceptable for an opt-in instrumentation run.
+        The stop path alone is not enough: it runs only when the scheduler worker itself takes
+        a KeyboardInterrupt, i.e. Ctrl+C in the terminal the server runs in the foreground of.
+        ``kill`` / ``systemctl stop`` make the API process terminate the workers first, and a
+        launcher that starts the server with SIGINT ignored passes that on to them, so the
+        file was never written -- silently. Idle is when nothing is on the device, the
+        histogram is a few tens of KB, and it is rewritten only after the server did something.
         """
+        if not getattr(self, "_moe_stats_out", None):
+            return
+        cache = getattr(self.ctx, "moe_offload_cache", None)
+        if cache is not None and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        first = not getattr(self, "_moe_stats_written", False)
+        if self._write_moe_stats(quiet=not first) and first:
+            self._moe_stats_written = True
+            logger.info("--moe-stats-out: rewritten each time the server goes idle, and on stop")
+
+    def _write_moe_stats(self, quiet: bool = False) -> str | None:
+        """Dump the decode instrumentation to ``--moe-stats-out`` (idle and orderly stop)."""
         from freetoken.engine.moe_stats import write_moe_stats
 
         rank, size = getattr(self, "_moe_stats_rank", (0, 1))
-        write_moe_stats(
+        return write_moe_stats(
             getattr(self.ctx, "moe_offload_cache", None),
             getattr(self, "_moe_stats_out", None),
             rank,
             size,
             getattr(self, "_moe_stats_layer_range", None),
+            quiet=quiet,
         )
 
 
