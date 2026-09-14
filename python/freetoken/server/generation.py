@@ -14,8 +14,6 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
 import time
 from collections.abc import AsyncIterator
@@ -25,6 +23,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
 try:
@@ -45,12 +44,14 @@ from .reasoning_parser import (
 )
 
 
-class GenerationError(Exception):
+class GenerationError(ValueError):
     """A request failed before producing output (surfaced via ``UserReply.error`` — e.g. a
     chat template the tokenizer cannot render, or a prompt that exceeds the KV budget). Each
     adapter turns this into its own wire-level error instead of hanging on a reply that never
     arrives. ``code`` carries the stable class (``UserReply.error_code``) when the failure has
-    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose."""
+    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose.
+
+    Subclasses ValueError so every adapter's invalid-request handler maps it to a 400."""
 
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
@@ -142,7 +143,6 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
-    images: list[bytes] = field(default_factory=list)    # decoded image files, one per {"type":"image"} part
 
     @property
     def parse_tools(self) -> bool:
@@ -195,27 +195,15 @@ def resolve_sampling(
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only adapters). Shared by all adapters."""
+    ValueError on a non-text content part (text-only server). Shared by all adapters."""
     return [_render_message(m) for m in messages]
 
 
-def render_messages_multimodal(
-    messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[bytes]]:
-    """``render_messages`` for an adapter that forwards images: ``image_url`` parts (``data:``
-    URLs only; nothing is fetched) become ``{"type": "image"}`` parts the multimodal chat
-    template turns into placeholders, and their decoded bytes come back in prompt order.
-    A message without images still flattens to a plain string, exactly as before."""
-    images: list[bytes] = []
-    rendered = [_render_message(m, images) for m in messages]
-    return rendered, images
-
-
-def _render_message(message: dict[str, Any], images: list[bytes] | None = None) -> dict[str, Any]:
+def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _render_content_parts(content, images)
+        m["content"] = _flatten_text_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -247,52 +235,41 @@ def _render_message(message: dict[str, Any], images: list[bytes] | None = None) 
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> str:
-    out = _render_content_parts(parts, None)
-    assert isinstance(out, str)
-    return out
-
-
-def _render_content_parts(parts: list[Any], images: list[bytes] | None) -> str | list[dict[str, Any]]:
-    """Text-only content flattens to one string (what every template expects). With
-    ``images`` given, ``image_url`` parts are accepted: the content stays a part list of
-    ``{"type": "text"}`` / ``{"type": "image"}`` so a multimodal template can place its
-    placeholders, and each image's bytes are appended to ``images`` in order."""
+def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
+    """Plain string for text-only parts; a template-ready part list with {"type": "image"} entries (source kept under freetoken_ref) when images are present."""
     out: list[dict[str, Any]] = []
     has_image = False
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
             out.append({"type": "text", "text": part.get("text") or ""})
-        elif ptype == "image_url" and images is not None:
-            images.append(_decode_image_url(part.get("image_url")))
-            out.append({"type": "image"})
+        elif ptype in ("image_url", "input_image"):
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            url = url or part.get("url")
+            if not url:
+                raise ValueError("image content part carries no url")
+            out.append({"type": "image", "freetoken_ref": {"kind": "url", "data": url}})
+            has_image = True
+        elif ptype == "image" and isinstance(part.get("freetoken_ref"), dict):
+            out.append(part)
             has_image = True
         else:
-            raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
+            raise ValueError(f"Unsupported content part type: {ptype}")
     if not has_image:
         return "".join(p["text"] for p in out)
     return out
 
 
-def _decode_image_url(image_url: Any) -> bytes:
-    """The bytes of an OpenAI ``image_url`` part. Only ``data:`` URLs are accepted: the
-    server never fetches a remote URL on a client's behalf."""
-    url = image_url.get("url") if isinstance(image_url, dict) else image_url
-    if not isinstance(url, str) or not url.startswith("data:"):
-        raise ValueError(
-            "image_url must be a data: URL (data:image/png;base64,...); remote URLs are not fetched"
-        )
-    header, sep, payload = url.partition(",")
-    if not sep or ";base64" not in header:
-        raise ValueError("image_url data: URL must be base64-encoded")
+async def _resolve_images(refs: list[dict[str, Any]], state: Any) -> list[bytes]:
+    """Gate and fetch a request's images; every failure is a GenerationError."""
+    if reason := image_reject_reason(state.config):
+        raise GenerationError(reason)
     try:
-        data = base64.b64decode("".join(payload.split()), validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError(f"image_url is not valid base64: {exc}") from exc
-    if not data:
-        raise ValueError("image_url data: URL is empty")
-    return data
+        return await fetch_image_bytes(refs, state.config)
+    except ValueError as exc:
+        raise GenerationError(str(exc)) from exc
 
 
 def split_tool_lists(
@@ -315,6 +292,8 @@ def split_tool_lists(
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    refs = collect_image_refs(spec.messages)
+    images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -323,7 +302,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
-            images=spec.images or None,
+            images=images,
         )
     )
     return uid
@@ -334,7 +313,6 @@ async def count_prompt_tokens(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
     state: Any,
-    images: list[bytes] | None = None,
 ) -> int:
     """Token count of an already-converted (messages, tools, chat_template_kwargs) prompt,
     using the frontend's own tokenizer (``state.frontend_tokenizer()``) so the count equals the
@@ -348,6 +326,8 @@ async def count_prompt_tokens(
     class the generation path maps to a 400. A tokenizer *initialization* failure (missing
     template, load error) propagates as its original exception, a server fault. Load + tokenize
     run in a worker thread so the event loop is never blocked."""
+    refs = collect_image_refs(messages)
+    images = await _resolve_images(refs, state) if refs else None
     msg = TokenizeMsg(
         uid=0,
         text=messages,
@@ -358,10 +338,10 @@ async def count_prompt_tokens(
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
-        input_ids = (await asyncio.to_thread(manager.tokenize, [msg]))[0]
+        (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
-    return int(input_ids.numel())
+    return int(user_msg.input_ids.numel())
 
 
 async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
@@ -382,7 +362,6 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
-        images=spec.images or None,
     )
     try:
         manager = await asyncio.to_thread(build)

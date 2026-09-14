@@ -39,6 +39,9 @@ from .attention import Qwen4ExpAttention
 from .hc import GatedResidual, GroupedPlusOneRMSNorm
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+from freetoken.mm import restore_placeholder
+from freetoken.models.blocks import embed_input_ids
+from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -161,6 +164,7 @@ class Qwen4ExpMTP(BaseOP):
         # VRAM goes to KV pages instead. The copy stays bf16 under --dense-quant fp8.
         self.embed_tokens = HostEmbedding(config.vocab_size, hidden) if own_embedding else None
         self._embed_ref = None  # the target's embedding when shared (not a state-dict child)
+        self._image_token_id = config.image_token_id
 
     def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
         """``residual [T, hc*hidden]`` + ``next_ids [T]`` -> the head's own residual ``[T, hc*hidden]``
@@ -171,6 +175,10 @@ class Qwen4ExpMTP(BaseOP):
         rn = self.pre_fc_norm_hidden.forward(residual)
         fh = self.fc_hidden.forward(rn.reshape(t * self.hc_count, self.hidden_size))
         fh = fh.reshape(t, self.hc_count * self.hidden_size)
+        if self._image_token_id is not None:
+            # an image row's successor id is a content pad id past the vocab: the head embeds
+            # the placeholder token there, as the PLE hash does
+            next_ids = restore_placeholder(next_ids, self._image_token_id)
         e = self.pre_fc_norm_embedding.forward(emb.forward(next_ids).to(residual.dtype))
         fe = self.fc_embedding.forward(e)
         r = fh + fe.repeat(1, self.hc_count)
@@ -195,7 +203,6 @@ class Qwen4ExpModel(BaseOP):
 
     def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
-        self._image_token_id = config.image_token_id
         pp = try_get_pp_info()
         start, end = (0, config.num_layers) if pp is None else (pp.start, pp.end)
         self._pp_first = start == 0
@@ -256,15 +263,9 @@ class Qwen4ExpModel(BaseOP):
         previous pipeline rank (required on non-first ranks); a non-last rank returns the
         stream it hands on instead of the mixed ``[T, hidden]`` head input."""
         if self._pp_first:
-            embeds = self.embed_tokens.forward(input_ids)
-            mm_embeds = getattr(batch, "mm_embeds", None)
-            if mm_embeds is not None and self._image_token_id is not None:
-                # image soft tokens (vision tower + merger output, already in the text
-                # width) replace the placeholder embeddings; the count was checked at
-                # admission. Only the embedding rank sees input embeddings.
-                mask = (input_ids == self._image_token_id).unsqueeze(-1)
-                embeds = embeds.masked_scatter(mask, mm_embeds.to(embeds.dtype))
-            hidden = embeds.repeat(1, self.hc_count)
+            # only the embedding rank sees input embeddings, so only it places image soft tokens
+            hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
+            hidden = hidden.repeat(1, self.hc_count)
         else:
             assert hidden_in is not None, "non-first pipeline rank needs the received residual stream"
             hidden = hidden_in
@@ -381,6 +382,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
                 "per_head_offsets": emb.ngram_heads_offsets.tolist(),
                 "eos_token_id": args.ngram_boundary_token_id,
+                "image_token_id": args.image_token_id,
             }
             disk_table = DiskRowTable(
                 resolve_row_source(folder),
@@ -477,4 +479,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         return self.lm_head.forward(out)
 
 
-__all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]
+class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config)
+        if config.is_multimodal:
+            assert not config.vision_config.deepstack_visual_indexes, "Qwen3.8 consumes no DeepStack features"
+            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+
+
+__all__ = [
+    "Qwen4ExpDecoderLayer",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpModel",
+    "build_linear_mixer",
+]

@@ -366,8 +366,6 @@ class PrefixDiskCache:
         state = getattr(req, "disk_state", None)
         if state is None:
             req.disk_state = "checked"
-            if req.mm_embeds is not None:
-                return True
             limit = req.input_len - 1      # admission always prefills at least the last token
             if limit < self.min_tokens:
                 return True

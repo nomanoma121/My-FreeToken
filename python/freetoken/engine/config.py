@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -7,7 +8,8 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.layers.quantization import set_quant_config
-from freetoken.models.register import _load_attr, checkpoint_quant_config, get_model_spec
+from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
+from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
@@ -154,6 +156,8 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
+    mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
         if self.moe_backend is None:
@@ -179,10 +183,35 @@ class EngineConfig:
         return 1 if self.is_pp else self.tp_info.size
 
     @cached_property
+    def model_spec(self) -> ModelSpec:
+        return get_model_spec(self.hf_config.architectures[0])
+
+    @cached_property
+    def active_encoders(self) -> tuple[EncoderSpec, ...]:
+        """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
+        return tuple(
+            e
+            for e in self.model_spec.encoders
+            if getattr(self.hf_config, e.config_key, None) is not None
+            and e.kind not in self.mm.disabled_encoders
+        )
+
+    @cached_property
+    def served_modalities(self) -> frozenset[str]:
+        """Modalities this process accepts."""
+        return frozenset(m for e in self.active_encoders for m in e.modalities)
+
+    @cached_property
     def full_model_config(self) -> ModelConfig:
         """The whole model, before any pipeline windowing."""
-        spec = get_model_spec(self.hf_config.architectures[0])
-        quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
+        # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
+        hf_config = copy.copy(self.hf_config)
+        built = {e.config_key for e in self.active_encoders}
+        for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
+            if key not in built:
+                setattr(hf_config, key, None)
+        spec = self.model_spec
+        quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         embed_quant = None
         if self.dense_quant == "fp8":
             from freetoken.layers.quantization import LoadTimeFp8Config
@@ -197,8 +226,7 @@ class EngineConfig:
         # so install what the layers are built from -- the --dense-quant wrapper included, or a
         # reader would quantize against the checkpoint's own schemes and disagree with them.
         set_quant_config(quant)
-        parse_config = _load_attr(spec.module, spec.parse_config)
-        config = parse_config(self.hf_config)
+        config = _load_attr(spec.module, spec.parse_config)(hf_config)
         if embed_quant is not None:
             config = replace(config, embed_quant=embed_quant)
         return replace(config, quant=quant)
@@ -231,8 +259,6 @@ class EngineConfig:
         KV/GDN pools, attention backends and the expert cache size themselves per rank). The
         MTP draft head joins the full-attention group of the head-owning rank as layer
         num_layers; --host-embedding marks the embedding-owning rank's table host-resident."""
-        from dataclasses import replace
-
         config = self.full_model_config
         mtp_layer = config.num_layers if (self.spec_mtp > 0 and self.pp_is_last) else None
         if self.pp_layer_range is not None or mtp_layer is not None:

@@ -13,6 +13,7 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
 from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import ShardReader, iter_weight_files
 from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 from freetoken.models.register import ModelSpec, get_model_spec
@@ -20,6 +21,7 @@ from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
 from .config import parse_config
+from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 # bf16 checkpoints store the routed experts pre-stacked per layer
 _STACKED_EXPERT_RE = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)$")
@@ -68,16 +70,10 @@ def _rename(raw_name: str, keep_mtp: bool = False) -> str | None:
     """
     if raw_name.startswith("mtp."):
         return raw_name if keep_mtp else None
-    if raw_name.startswith(("model.visual.", "visual.")):
-        return None
     # static KV-cache scales of the quantizers; the KV cache runs in the engine's dtype
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
-    if raw_name.startswith("model.language_model."):
-        return "model." + raw_name[len("model.language_model."):]
-    if raw_name.startswith("language_model."):
-        return "model." + raw_name[len("language_model."):]
-    return raw_name
+    return rename_vl_prefix(raw_name)
 
 
 def _is_gemma_norm(name: str) -> bool:
@@ -135,7 +131,7 @@ class _DenseReader:
             for idx, part in enumerate(parts):
                 self.by_part.setdefault(part, []).append((fused, idx))
         # target module -> (part count, {part: {role: tensor}}, {part: the roles its module stores})
-        self.pending: dict[str, tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]]]] = {}
+        self.pending: dict[str, tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]], QuantScheme | None]] = {}
 
     def scheme(self, module: str) -> QuantScheme | None:
         return None if self.quant is None else self.quant.scheme_for(module)
@@ -176,14 +172,30 @@ class _DenseReader:
             )
         if stored is None and tensor.dtype in _QUANT_DTYPES:
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
+        if stored is not None and role == "weight" and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]:
+            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {stored}")
         target, idx, count = self.target(module)
-        _, parts, expected = self.pending.setdefault(target, (count, {}, {}))
+        _, parts, expected, _ = self.pending.setdefault(target, (count, {}, {}, stored))
         parts.setdefault(idx, {})[role] = tensor
         expected[idx] = set(roles.values())
         if len(parts) < count or any(set(parts[i]) != expected[i] for i in parts):
             return []
         del self.pending[target]
         return self._emit(target, [parts[i] for i in range(count)], stored)
+
+    def missing(self) -> list[str]:
+        """One line per incomplete module: the roles its parts still lack."""
+        lines = []
+        for target, (count, parts, expected, stored) in sorted(self.pending.items()):
+            lacking = sorted(set().union(*(expected[i] - set(parts[i]) for i in parts)))
+            note = ""
+            if lacking == ["input_scale"]:
+                fix = "declares W4A16_NVFP4 or sets with_input_scale false" if stored is not None and stored.kind is QuantKind.NVFP4 else "sets with_input_scale false"
+                note = f" (an export without activation scales {fix})"
+            if len(parts) < count:
+                lacking.append(f"{count - len(parts)} of {count} fused parts")
+            lines.append(f"{target}: missing {lacking}{note}")
+        return lines
 
     def _emit(self, target: str, parts: list[dict[str, torch.Tensor]], stored: QuantScheme | None):
         if stored is not None:
@@ -262,6 +274,7 @@ def iter_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
     include_mtp: bool = False,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense weights fused to the model's buffers, and the routed experts only where a resident path takes them from here: bf16 stacked experts as stored, block-fp8 experts restacked per layer.
 
@@ -280,7 +293,8 @@ def iter_weights(
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
         yield from _iter_shards(
-            model_path, device, reader, stacked=stacked, include_mtp=include_mtp
+            model_path, device, reader, stacked=stacked, include_mtp=include_mtp,
+            include_vision=include_vision,
         )
     if include_moe_experts and config.is_moe and config.expert_quant == "fp8_block":
         yield from _resident_fp8_experts(model_path, config)
@@ -288,7 +302,7 @@ def iter_weights(
 
 def _iter_shards(
     model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool,
-    include_mtp: bool = False,
+    include_vision: bool, include_mtp: bool = False,
 ):
     mtp_experts: dict[int, dict[str, torch.Tensor]] = {}
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
@@ -311,6 +325,8 @@ def _iter_shards(
                             tensor.to("cpu")
                         )
                     continue
+                if not include_vision and name.startswith(VISION_KEY_PREFIXES):
+                    continue
                 if _STACKED_EXPERT_RE.match(name):
                     if stacked:
                         yield name, f.get_tensor(raw_name)
@@ -326,7 +342,9 @@ def _iter_shards(
                 else:
                     yield name, tensor
     if reader is not None and reader.pending:
-        raise ValueError(f"checkpoint is missing tensors of {sorted(reader.pending)}")
+        lines = reader.missing()
+        shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
+        raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
     if include_mtp:
         stacked_mtp = _stack_mtp_experts(mtp_experts)
         assert stacked_mtp, "--spec-mtp: the checkpoint has no mtp.layers.0.mlp.experts.* tensors"

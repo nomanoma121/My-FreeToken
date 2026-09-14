@@ -104,13 +104,14 @@ def test_stage_chain_restages_instead_of_rebuilding():
         page_table=torch.arange(64, dtype=torch.int32).view(4, 16) * 7, attn_backend=backend
     )
     sg.chain_batch = mini
-    for name in ("c_pos", "c_rope", "c_out_loc", "c_table", "c_ids"):
+    for name in ("c_pos", "c_out_loc", "c_table", "c_ids"):
         setattr(sg, name, torch.zeros(1, dtype=torch.int32))
+    sg.c_rope = torch.zeros(3, 1, dtype=torch.int32)  # an mrope model: t/h/w of the one token
 
     req = SimpleNamespace(table_idx=2, linear_slot_idx=1)
     sg._stage_chain(req, position=9, token=1234, rope_delta=5)
 
     assert seen == [mini], "the chain step must restage, never rebuild the metadata object"
     assert proxy.table_idx == 2 and proxy.device_len == 10 and proxy.cached_len == 9
-    assert int(sg.c_pos[0]) == 9 and int(sg.c_rope[0]) == 14 and int(sg.c_ids[0]) == 1234
+    assert int(sg.c_pos[0]) == 9 and sg.c_rope[:, 0].tolist() == [14, 14, 14] and int(sg.c_ids[0]) == 1234
     assert int(sg.c_out_loc[0]) == int(sg.engine.page_table[2, 9])

@@ -419,7 +419,7 @@ def test_engine_config_dense_quant_override(monkeypatch):
     from freetoken.engine import config as cfg_mod
     from freetoken.engine.config import EngineConfig
 
-    monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p"))
+    monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p", encoders=()))
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed_qwen4()))
     monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _qwen4_hf_config())
     monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)

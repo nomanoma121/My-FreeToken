@@ -47,17 +47,13 @@ def plan_prefill_pieces(batch, n: int, attn_backend, device, linear_state_pool=N
     """[(start, end, piece_batch), ...] covering the chunk, or None when it should run whole.
 
     Whole when: fewer than 2 pieces asked; not a prefill; an MTP verify window; more than one
-    request (the proxies below are per request); multimodal rope or embeddings; or the chunk
+    request (the proxies below are per request); or the chunk
     is too short to split on the lattice with a last piece that still crosses a boundary.
     """
     if n < 2 or not batch.is_prefill or getattr(batch, "spec_verify", False):
         return None
     reqs = batch.padded_reqs
     if len(reqs) != 1:
-        return None
-    if (getattr(batch, "rope_cos_sin", None) is not None
-            or getattr(batch, "rope_positions", None) is not None
-            or getattr(batch, "mm_embeds", None) is not None):
         return None
     r = reqs[0]
     total = r.extend_len
@@ -84,8 +80,6 @@ def plan_prefill_pieces(batch, n: int, attn_backend, device, linear_state_pool=N
             table_idx=r.table_idx,
             uid=getattr(r, "uid", None),
             input_ids=getattr(r, "input_ids", None),
-            mm_embeds=None,
-            mm_rope=None,
             cached_len=r.cached_len + start,
             device_len=r.cached_len + end,
             extend_len=end - start,
@@ -102,6 +96,10 @@ def plan_prefill_pieces(batch, n: int, attn_backend, device, linear_state_pool=N
         piece.reqs = [proxy]
         piece.padded_reqs = [proxy]
         piece.positions = batch.positions[start:end]
+        if getattr(batch, "mrope_positions", None) is not None:
+            # the image soft tokens are already in the stream (the embedding runs before the
+            # pieces); what the mixers still need is each row's 3-axis rope position
+            piece.mrope_positions = batch.mrope_positions[:, start:end]
         piece.input_ids = batch.input_ids[start:end]
         piece.out_loc = batch.out_loc[start:end]
         piece.fla_metadata = None

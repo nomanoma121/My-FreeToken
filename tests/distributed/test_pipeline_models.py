@@ -66,12 +66,12 @@ def test_qwen35_window_keeps_one_full_layer_per_rank():
 def test_qwen35_first_rank_owns_embedding_and_its_layers(monkeypatch):
     from freetoken.models.config import window_model_config
     from freetoken.models.pipeline import RemoteLayer
-    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoEForCausalLM
+    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
     from freetoken.moe.offload_cache import iter_offload_moe_layers
 
     full = _qwen35()
     _pp(monkeypatch, 0, 2, 0, 4, 8)
-    model = _meta_build(Qwen3_5MoEForCausalLM, window_model_config(full, 0, 4))
+    model = _meta_build(Qwen3_5MoeForCausalLM, window_model_config(full, 0, 4))
     assert model.model.pp_first and not model.model.pp_last
     assert model.model.embed_tokens is not None and model.lm_head is None and model.model.norm is None
     assert model.mtp is None and model.pp_hidden_width == 64
@@ -86,12 +86,12 @@ def test_qwen35_first_rank_owns_embedding_and_its_layers(monkeypatch):
 
 def test_qwen35_last_rank_owns_head_norm_and_draft_head(monkeypatch):
     from freetoken.models.config import window_model_config
-    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoEForCausalLM
+    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
     from freetoken.moe.offload_cache import iter_offload_moe_layers
 
     full = _qwen35()
     _pp(monkeypatch, 1, 2, 4, 8, 8)
-    model = _meta_build(Qwen3_5MoEForCausalLM, window_model_config(full, 4, 8, extra_full_layer=8))
+    model = _meta_build(Qwen3_5MoeForCausalLM, window_model_config(full, 4, 8, extra_full_layer=8))
     assert not model.model.pp_first and model.model.pp_last
     assert model.model.embed_tokens is None and model.lm_head is not None and model.model.norm is not None
     assert model.mtp is not None and model.mtp.embed_tokens is not None  # its own copy of the table
@@ -109,10 +109,10 @@ def test_qwen35_last_rank_owns_head_norm_and_draft_head(monkeypatch):
 
 
 def test_qwen35_single_process_is_first_and_last(monkeypatch):
-    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoEForCausalLM
+    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 
     _pp(monkeypatch, 0, 1, 0, 8, 8)
-    model = _meta_build(Qwen3_5MoEForCausalLM, _qwen35())
+    model = _meta_build(Qwen3_5MoeForCausalLM, _qwen35())
     assert model.model.pp_first and model.model.pp_last
     assert model.model.embed_tokens is not None and model.lm_head is not None
     assert model.host_resident_prefixes == ()

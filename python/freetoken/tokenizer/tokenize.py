@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
 import os
 import threading
 from types import ModuleType
-from typing import Any, List, Tuple
+from typing import TYPE_CHECKING, Any, List
 
 import torch
-from freetoken.message import TokenizeMsg
+from freetoken.message import TokenizeMsg, UserMsg
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from freetoken.mm.processor import MMProcessor
 
 from .effort import (
     EffortProfile,
@@ -48,41 +50,19 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, model_path: str | None = None) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
         self.tokenizer = tokenizer
-        self.model_path = model_path or getattr(tokenizer, "name_or_path", None)
+        self.mm_processor = mm_processor  # None: the model takes no images
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
-        # The checkpoint's HF processor (image processor + tokenizer + template), built on
-        # the first request that carries images; None when the checkpoint has none.
-        self._processor: Any = None
-        self._processor_tried = False
-        self._processor_error: str | None = None  # why it could not be built (missing library)
-        # Host-side vision encoder for checkpoints whose tower runs on the CPU (Qwen4Exp);
-        # None when the engine encodes images itself or the model has none.
-        self._host_encoder: Any = None
-        self._host_encoder_tried = False
 
-    def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        """Token ids only (token counting, prompt validation): images are expanded to their
-        placeholders but never encoded."""
-        return [ids for ids, _ in self.tokenize_with_images(msgs, encode=False)]
-
-    def tokenize_with_images(
-        self, msgs: List[TokenizeMsg], *, encode: bool = True
-    ) -> List[Tuple[torch.Tensor, dict[str, torch.Tensor] | None]]:
-        """``tokenize`` that also returns, per message, the image tensors the scheduler needs
-        for a request carrying images (else None): the HF processor's tensors, or -- for a
-        checkpoint whose vision tower runs here on the CPU -- the encoded soft tokens."""
-        results: List[Tuple[torch.Tensor, dict[str, torch.Tensor] | None]] = []
+    def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
+        results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
-            if msg.images:
-                results.append(self._tokenize_multimodal(msg, encode=encode))
-                continue
             prompt = self.render_prompt(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
@@ -95,7 +75,25 @@ class TokenizeManager:
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
             )
-            results.append((input_ids.view(-1).to(torch.int32), None))
+            input_ids = input_ids.view(-1).to(torch.int32)
+            if msg.images:
+                if self.mm_processor is None:
+                    raise ValueError("image input is not supported for this model")
+                mm = self.mm_processor.apply(input_ids, msg.images)
+                results.append(
+                    UserMsg(
+                        uid=msg.uid,
+                        input_ids=mm.input_ids,
+                        sampling_params=msg.sampling_params,
+                        mm_items=mm.mm_items,
+                        mrope_positions=mm.mrope_positions,
+                        mrope_delta=mm.mrope_delta,
+                    )
+                )
+            else:
+                results.append(
+                    UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
+                )
         return results
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
@@ -105,136 +103,19 @@ class TokenizeManager:
         validation, count_tokens) must quantize identically."""
         if not isinstance(msg.text, list):
             return msg.text
-        kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
-        if msg.images:
-            return self._render(msg.text, msg.tools, kwargs, owner=self._require_processor(msg))
-        return self._render(msg.text, msg.tools, kwargs)
-
-    # ----- images ---------------------------------------------------------------------------
-    def _image_processor(self) -> Any:
-        """The checkpoint's HF processor, or None when it has no image processor. Built once;
-        a failed build is remembered so a text-only checkpoint does not retry per request."""
-        if self._processor_tried:
-            return self._processor
-        self._processor_tried = True
-        if self._dsv4_encoder is not None or not self.model_path:
-            return None
-        try:
-            from transformers import AutoProcessor
-
-            try:
-                proc = AutoProcessor.from_pretrained(self.model_path)
-            except Exception as exc:  # noqa: BLE001
-                if "torchvision" not in str(exc).lower():
-                    raise
-                # AutoProcessor also builds the *video* processor, which needs torchvision even
-                # for image-only use. Qwen-VL checkpoints get a processor made of the PIL image
-                # processor + the tokenizer instead (the template places the image tokens, the
-                # image processor sizes the grid, the placeholders are repeated to match).
-                from .qwen_vl_lite import QwenVLLiteProcessor
-
-                proc = QwenVLLiteProcessor.from_pretrained(self.model_path, self.tokenizer)
-                if proc is None:
-                    raise
-        except Exception as exc:  # noqa: BLE001 -- text-only checkpoints have no processor
-            reason = " ".join(str(exc).split())[:300]
-            # a missing library is the server's problem, not a text-only checkpoint: keep the
-            # reason so the request's error says what to install
-            if any(w in reason.lower() for w in ("torchvision", "pil ", "pillow", "pil library")):
-                self._processor_error = reason
-            logger.info("no image processor for this checkpoint (%s)", reason)
-            return None
-        if getattr(proc, "image_processor", None) is None or not getattr(proc, "image_token", None):
-            logger.info("checkpoint processor %s has no image support", type(proc).__name__)
-            return None
-        self._processor = proc
-        logger.info("image input enabled via %s", type(proc).__name__)
-        return proc
-
-    def _require_processor(self, msg: TokenizeMsg) -> Any:
-        proc = self._image_processor()
-        if proc is None:
-            detail = self._processor_error
-            raise ValueError(
-                "this model does not accept image input"
-                + (f" (image processor unavailable on the server: {detail})" if detail else "")
-            )
-        n_parts = _count_image_parts(msg.text)
-        if n_parts != len(msg.images or ()):
-            raise ValueError(
-                f"{n_parts} image content part(s) but {len(msg.images or ())} image(s) attached"
-            )
-        return proc
-
-    def _host_image_encoder(self) -> Any:
-        if self._host_encoder_tried:
-            return self._host_encoder
-        self._host_encoder_tried = True
-        from .mm_host import build_host_image_encoder
-
-        self._host_encoder = build_host_image_encoder(self.model_path)
-        return self._host_encoder
-
-    def _image_size_kwargs(self, proc: Any) -> dict[str, Any]:
-        """Cap the pixel budget of dynamic-resolution processors (Qwen-VL lineage: ``size`` in
-        total pixels). ``FT_IMAGE_MAX_PIXELS`` (default 1024*1024, about 1k soft tokens)
-        bounds both the CPU vision cost and the prompt length."""
-        size = getattr(getattr(proc, "image_processor", None), "size", None)
-        # a dict in preprocessor_config.json, a SizeDict on a built processor
-        get = size.get if isinstance(size, dict) else (lambda k, d=None: getattr(size, k, d))
-        if size is None or get("longest_edge") is None:
-            return {}
-        max_pixels = int(os.environ.get("FT_IMAGE_MAX_PIXELS", str(1024 * 1024)))
-        shortest = int(get("shortest_edge") or 0)
-        return {"size": {"shortest_edge": min(shortest, max_pixels) if shortest else 0, "longest_edge": max_pixels}}
-
-    def _tokenize_multimodal(
-        self, msg: TokenizeMsg, *, encode: bool = True
-    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Render with the processor's template (it places one image token per
-        ``{"type": "image"}`` part) and let the processor expand each into the model's
-        placeholder run while producing the vision tensors. ``add_special_tokens=False``
-        for the same reason as the text path: the template already rendered bos. With
-        ``encode`` the checkpoint's host-side tower (if any) turns those tensors into the
-        soft tokens the scheduler scatters."""
-        proc = self._require_processor(msg)
-        prompt = self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {}), owner=proc
+        return self._render(
+            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
         )
-        images = [_open_image(b) for b in msg.images or ()]
-        out = proc(
-            text=[prompt], images=[images], return_tensors="pt", add_special_tokens=False,
-            **self._image_size_kwargs(proc),
-        )
-        input_ids = out["input_ids"].view(-1).to(torch.int32)
-        if not encode:
-            return input_ids, None
-        mm: dict[str, torch.Tensor] = {}
-        for key in ("pixel_values", "image_position_ids", "image_grid_thw"):
-            value = out.get(key)
-            if torch.is_tensor(value):
-                if key == "pixel_values":
-                    value = value.to(torch.float16)
-                mm[key] = value.cpu()
-        encoder = self._host_image_encoder()
-        if encoder is not None:
-            mm = encoder.encode(mm)
-        return input_ids, mm
 
     def _render(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
-        owner: Any = None,
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
-        to actually reach the template so rejection is observable. ``owner`` is what
-        applies the template: the tokenizer, or the checkpoint's processor for a
-        prompt with images (its template knows the image placeholder)."""
+        to actually reach the template so rejection is observable."""
         if self._dsv4_encoder is not None:
-            if owner is not None:
-                raise ValueError("this model does not accept image input")
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs
             )
@@ -249,7 +130,7 @@ class TokenizeManager:
             )
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
-        prompt = (owner or self.tokenizer).apply_chat_template(
+        prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
@@ -308,28 +189,6 @@ class TokenizeManager:
         else:
             sanitized["reasoning_effort"] = mapped
         return sanitized
-
-
-def _count_image_parts(messages: Any) -> int:
-    if not isinstance(messages, list):
-        return 0
-    n = 0
-    for m in messages:
-        content = m.get("content") if isinstance(m, dict) else None
-        if isinstance(content, list):
-            n += sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image")
-    return n
-
-
-def _open_image(data: bytes) -> Any:
-    try:
-        from PIL import Image
-    except ImportError as exc:  # pragma: no cover - environment-specific
-        raise ValueError("image input needs Pillow installed on the server") from exc
-    try:
-        return Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception as exc:  # noqa: BLE001 -- a client's bad file is a request error
-        raise ValueError(f"could not decode image: {exc}") from exc
 
 
 def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleType | None:

@@ -21,6 +21,7 @@ from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
+from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
@@ -55,7 +56,6 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
-
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
@@ -442,6 +442,9 @@ def _materialize_loaded_weight_state_dict(
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
         expected = model_state.get(key)
+        if expected is None and key.endswith(".input_scale"):
+            # NOTE: the quant scheme may declare no input_scale for a layer whose FTW still stores one
+            continue
         dtype = weight.dtype if expected is None else expected.dtype
         if host_prefixes and key.startswith(host_prefixes):
             state_dict[key] = _to_pinned_host(weight.to(dtype=dtype))
@@ -635,6 +638,16 @@ class Engine:
             )
         self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
+        if config.active_encoders:
+            from freetoken.models.blocks import SupportsMultimodal
+
+            if not isinstance(self.model, SupportsMultimodal):
+                raise TypeError(
+                    f"{type(self.model).__name__} has encoders registered but lacks the SupportsMultimodal hooks; "
+                    "run with --text-model-only"
+                )
+            # before the residency snapshot, so streamed blocks are not charged as resident weights
+            self.model.place_encoder_weights(config.mm.encoder_weights)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -657,6 +670,27 @@ class Engine:
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+        self.encoder_cache = None
+        self.mm_processor = None
+        if config.active_encoders:
+            from freetoken.mm.encoder_cache import EncoderCache
+            from freetoken.mm.processor import get_mm_processor
+
+            self.mm_processor = get_mm_processor(config.model_path, config.mm)
+            self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
+            logger.info_rank0(
+                f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
+                f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
+            )
+            self._warmup_encoders()
+        elif any(getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS):
+            logger.info_rank0(
+                "Multimodal disabled: --text-model-only"
+                if config.mm.text_model_only
+                else "Multimodal disabled: --mm-disable"
+                if config.mm.disabled_encoders
+                else "Multimodal disabled: no encoder registered for this architecture"
+            )
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
@@ -747,6 +781,7 @@ class Engine:
                 if self.pp_comm is not None and not self.pp_comm.is_first
                 else None
             ),
+            mrope=config.model_config.model_is_mrope,
         )
         # pre-map before the prefill warmup so its persistent buffers come from the cache
         self._premap_vram()
@@ -949,6 +984,7 @@ class Engine:
             self.device,
             include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
             include_mtp=has_mtp,
+            include_vision=bool(config.active_encoders),
         )
         remap = getattr(self.model, "remap_loaded_weight", None)
         if remap is not None:
@@ -1050,6 +1086,38 @@ class Engine:
         logger.info("MTP draft head: its expert layer appended to the offload cache")
         return 1
 
+    @torch.inference_mode()
+    def _warmup_encoders(self) -> None:
+        for item in self.mm_processor.dummy_items(self.dtype, self.device):
+            if item.modality in self.config.served_modalities:
+                self.model.encode(item)
+        torch.cuda.synchronize(self.device)
+
+    @torch.inference_mode()
+    def _run_mm_encoder(self, batch: Batch) -> None:
+        """Encode the chunk's cache-miss items and gather its embedding rows into batch.mm_embeds, right before the LM forward."""
+        cache = self.encoder_cache
+        jobs = batch.mm_encoder_jobs or ()
+        # a job whose rows are not gathered this chunk would be encoded and freed unread
+        planned = {row[1] for row in batch.mm_gather_plan}
+        orphans = [item.hash for item in jobs if item.hash not in planned]
+        assert not orphans, f"encoder jobs without gather rows: {orphans}"
+        for item in jobs:
+            if not cache.has(item.hash):
+                if item.precomputed_embeddings is not None:
+                    emb = item.precomputed_embeddings.to(self.device, non_blocking=True)
+                else:
+                    emb = self.model.encode(item)
+                cache.put(item.hash, emb)
+            # cached now; free the ~MiB feature buffer
+            item.feature = None
+            item.precomputed_embeddings = None
+        parts = []
+        for uid, item_hash, lo, hi, _, _ in batch.mm_gather_plan:
+            parts.append(cache.get_slice(item_hash, lo, hi, self.device))
+            cache.consume(item_hash, uid, hi - lo)
+        if parts:
+            batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
@@ -1624,6 +1692,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            mrope=config.model_config.model_is_mrope,
         )
         if self.spec_k > 0:
             # the verify-window graph addressed the old pools / page table: capture it again
@@ -1631,6 +1700,8 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if batch.mm_gather_plan:
+            self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         pp = self.pp_comm
         spec = self.spec_k > 0
@@ -1883,16 +1954,14 @@ class Engine:
         self._spec_restore(snap)
         proxy = SimpleNamespace(
             table_idx=req.table_idx, extend_len=1, device_len=pos + 1, cached_len=pos,
-            linear_slot_idx=req.linear_slot_idx, uid=req.uid, mm_embeds=None,
+            linear_slot_idx=req.linear_slot_idx, uid=req.uid,
             mamba_restore_src=None, mamba_ping_pong=None, decode_batch_idx=0,
-            input_ids=req.input_ids, mm_rope=getattr(req, "mm_rope", None),
+            input_ids=req.input_ids,
         )
         mini = Batch(reqs=[proxy], phase="decode")
         mini.padded_reqs = [proxy]
         mini.positions = torch.tensor([pos], dtype=torch.int32, device=self.device)
-        rope = getattr(req, "mm_rope", None)
-        if rope is not None and int(rope.delta):
-            mini.rope_positions = torch.tensor([pos + int(rope.delta)], dtype=torch.int32, device=self.device)
+        mini.mrope_positions = self._decode_mrope_positions(pos + req.mrope_delta)
         mini.input_ids = torch.tensor([token], dtype=torch.int32, device=self.device)
         mini.out_loc = self.page_table[req.table_idx, pos : pos + 1]
         mini.active_table_idx = torch.tensor([req.table_idx], dtype=torch.int32, device=self.device)
@@ -1954,8 +2023,7 @@ class Engine:
         if mtp is None:
             return []
         req = batch.reqs[0]
-        rope = getattr(req, "mm_rope", None)
-        delta = int(rope.delta) if rope is not None else 0
+        delta = req.mrope_delta  # past an image prompt the rope position runs ahead of the logical one
         if sg is not None and draft and sg.mtp_ready and rows == sg.rows:
             # successor ids of the window rows: the drafts, then the target's sample; the
             # drafting row's successor is the sample (see the eager path below)
@@ -1998,6 +2066,13 @@ class Engine:
             prof.mark("mtp_chain")
         return drafts
 
+    def _decode_mrope_positions(self, rope_position: int) -> torch.Tensor | None:
+        """``[3, 1]`` rope position of one text token on an mrope model (every axis at the same
+        value, the logical position plus the request's delta); None on a 1-D rope model."""
+        if not self.config.model_config.model_is_mrope:
+            return None
+        return torch.full((3, 1), rope_position, dtype=torch.int32, device=self.device)
+
     def _mtp_step_batch(self, req: Req, position: int, token: int, *, rope_delta: int = 0) -> Batch:
         """A one-token decode batch at ``position`` for a draft step: the same page-table row
         as the request (its KV pages past device_len are reserved by the scheduler)."""
@@ -2005,13 +2080,12 @@ class Engine:
 
         proxy = SimpleNamespace(
             table_idx=req.table_idx, extend_len=1, device_len=position + 1, cached_len=position,
-            linear_slot_idx=req.linear_slot_idx, uid=req.uid, mm_embeds=None, mamba_restore_src=None,
+            linear_slot_idx=req.linear_slot_idx, uid=req.uid, mamba_restore_src=None,
         )
         mini = Batch(reqs=[proxy], phase="decode")
         mini.padded_reqs = [proxy]
         mini.positions = torch.tensor([position], dtype=torch.int32, device=self.device)
-        if rope_delta:  # after an image prompt the rope position runs ahead of the logical one
-            mini.rope_positions = torch.tensor([position + rope_delta], dtype=torch.int32, device=self.device)
+        mini.mrope_positions = self._decode_mrope_positions(position + rope_delta)
         mini.input_ids = torch.tensor([token], dtype=torch.int32, device=self.device)
         mini.out_loc = self.page_table[req.table_idx, position : position + 1]
         self.attn_backend.prepare_metadata(mini)
@@ -2224,6 +2298,8 @@ class Engine:
             batch.padded_reqs = batch.reqs
             batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
             batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
+            if self.config.model_config.model_is_mrope:
+                batch.mrope_positions = batch.positions.unsqueeze(0).expand(3, -1).contiguous()
             batch.out_loc = dummy_row[:length]
             self.attn_backend.prepare_metadata(batch)
             with self.ctx.forward_batch(batch):
@@ -2322,6 +2398,10 @@ class Engine:
                 batch.padded_reqs = batch.reqs
                 batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
                 batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
+                if self.config.model_config.model_is_mrope:
+                    batch.mrope_positions = (
+                        batch.positions.unsqueeze(0).expand(3, -1).contiguous()
+                    )
                 batch.out_loc = dummy_row[:length]
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):

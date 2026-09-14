@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 if TYPE_CHECKING:
-    from freetoken.core import MMRope, SamplingParams
+    from freetoken.core import SamplingParams
 
     from .prefill import ChunkedReq
 
@@ -17,9 +17,9 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
-    mm_embeds: torch.Tensor | None = None
-    mm_rope: MMRope | None = None
-    mm_slots: torch.Tensor | None = None  # bool [prompt_len]: image placeholder rows (chunking)
+    mm_items: list | None = None
+    mrope_positions_full: torch.Tensor | None = None
+    mrope_delta: int = 0
 
     @property
     def input_len(self) -> int:

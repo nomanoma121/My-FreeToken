@@ -129,8 +129,10 @@ def test_qsa_is_accepted_and_quantizes_only_the_paged_slab():
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
+    model_config = _model_config("qsa")
+    model_config.model_is_mrope = False  # text-only: no per-slot 3-axis rope positions
     pool = create_kvcache_pool(
-        model_config=_model_config("qsa"),
+        model_config=model_config,
         num_pages=16,
         page_size=64,
         dtype=torch.bfloat16,

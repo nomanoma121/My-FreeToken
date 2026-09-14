@@ -40,7 +40,7 @@ def _batch(extend=1024, cached=0, **over):
     )
     b = SimpleNamespace(
         is_prefill=True, is_decode=False, spec_verify=False, padded_reqs=[req], reqs=[req],
-        rope_cos_sin=None, rope_positions=None, mm_embeds=None, fla_metadata=None,
+        mrope_positions=None, fla_metadata=None,
         positions=torch.arange(cached, cached + extend), input_ids=torch.zeros(extend),
         out_loc=torch.arange(extend),
     )
@@ -65,12 +65,22 @@ def test_pieces_tile_the_chunk_on_the_lattice_and_continue_each_other():
     assert b.padded_reqs[0].cached_len == 300  # the chunk's own request is not touched
 
 
+def test_pieces_carry_their_rows_of_the_three_axis_rope():
+    """An mrope model (vision served) ropes every row at a [t, h, w] position: each piece takes its
+    own columns, so an image prompt splits like a text one (the soft tokens are already in the
+    stream when the pieces run)."""
+    mrope = torch.arange(3 * 1000).view(3, 1000)
+    b, _ = _batch(extend=1000, cached=300, mrope_positions=mrope)
+    pieces = plan_prefill_pieces(b, 3, _Backend(), "cpu")
+    assert [(s, e) for s, e, _ in pieces] == [(0, 320), (320, 640), (640, 1000)]
+    for s, e, piece in pieces:
+        assert torch.equal(piece.mrope_positions, mrope[:, s:e])
+
+
 @pytest.mark.parametrize("over, extend, n", [
     ({}, 1024, 1),                                   # not asked
     ({"is_prefill": False}, 1024, 2),                # decode
     ({"spec_verify": True}, 1024, 2),                # MTP verify window
-    ({"rope_positions": torch.zeros(1)}, 1024, 2),   # M-RoPE
-    ({"mm_embeds": torch.zeros(1)}, 1024, 2),        # image soft tokens
     ({}, 100, 2),                                    # too short to split on 64s
     ({}, 128, 2),                                    # the last piece (64) would not cross a boundary
 ])

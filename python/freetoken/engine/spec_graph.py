@@ -65,7 +65,10 @@ class SpecVerifyGraph:
         i32 = torch.int32
         self.input_ids = torch.zeros(rows, dtype=i32, device=dev)
         self.positions = torch.zeros(rows, dtype=i32, device=dev)
-        self.rope_positions = torch.zeros(rows, dtype=i32, device=dev)  # positions + M-RoPE delta
+        # [3, rows] t/h/w rope positions on an mrope model (logical + the request's delta)
+        self.mrope_positions = (
+            torch.zeros(3, rows, dtype=i32, device=dev) if engine.config.model_config.model_is_mrope else None
+        )
         self.out_loc = torch.zeros(rows, dtype=i32, device=dev)
         # GDN metadata of a one-request extend: constant indptr, one slot, continuing state
         self.fla_cu = torch.tensor([0, rows], dtype=torch.int64, device=dev)
@@ -97,8 +100,7 @@ class SpecVerifyGraph:
         """Point ``batch`` at the static buffers and stage the attention addressing."""
         batch.input_ids = self.input_ids
         batch.positions = self.positions
-        batch.rope_positions = self.rope_positions
-        batch.rope_cos_sin = None
+        batch.mrope_positions = self.mrope_positions
         batch.out_loc = self.out_loc
         self.fla_slot.fill_(slot)
         batch.fla_metadata = self._fla()
@@ -131,7 +133,8 @@ class SpecVerifyGraph:
         batch.spec_all_rows = True
         # the dummy page-table row points every position at the dummy slot: fine for a capture
         self.positions.copy_(torch.arange(cached, cached + rows, dtype=torch.int32, device=eng.device))
-        self.rope_positions.copy_(self.positions)
+        if self.mrope_positions is not None:
+            self.mrope_positions.copy_(self.positions.unsqueeze(0).expand(3, -1))
         self.out_loc.copy_(eng.page_table[dummy.table_idx, cached : cached + rows])
         self._bind(batch, table_idx=dummy.table_idx, slot=slot, kv_len=cached + rows)
 
@@ -222,21 +225,24 @@ class SpecVerifyGraph:
         proxy = SimpleNamespace(
             table_idx=dummy.table_idx, extend_len=1, device_len=cached + rows + 1,
             cached_len=cached + rows, linear_slot_idx=dummy.linear_slot_idx, uid=-1,
-            mm_embeds=None, mamba_restore_src=None, mamba_ping_pong=None, decode_batch_idx=0,
+            mamba_restore_src=None, mamba_ping_pong=None, decode_batch_idx=0,
             input_ids=torch.zeros(cached + rows + 1, dtype=torch.int32),
         )
         mini = Batch(reqs=[proxy], phase="decode")
         mini.padded_reqs = [proxy]
         self.c_pos = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.c_rope = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.c_rope = (
+            torch.zeros(3, 1, dtype=torch.int32, device=dev) if eng.config.model_config.model_is_mrope else None
+        )
         self.c_out_loc = torch.zeros(1, dtype=torch.int32, device=dev)
         self.c_ids = torch.zeros(1, dtype=torch.int32, device=dev)
         self.c_table = torch.zeros(1, dtype=torch.int32, device=dev)
         mini.positions, mini.input_ids, mini.out_loc = self.c_pos, self.c_ids, self.c_out_loc
-        mini.rope_positions = self.c_rope
+        mini.mrope_positions = self.c_rope
         mini.active_table_idx = self.c_table
         self.c_pos.fill_(cached + rows)
-        self.c_rope.fill_(cached + rows)
+        if self.c_rope is not None:
+            self.c_rope.fill_(cached + rows)
         self.c_out_loc.copy_(eng.page_table[dummy.table_idx, cached + rows : cached + rows + 1])
         self.c_table.fill_(dummy.table_idx)
         attn.prepare_for_capture(mini)  # decode metadata on the backend's static buffers
@@ -272,7 +278,8 @@ class SpecVerifyGraph:
         proxy.device_len = position + 1
         proxy.cached_len = position
         self.c_pos.fill_(position)
-        self.c_rope.fill_(position + rope_delta)
+        if self.c_rope is not None:
+            self.c_rope.fill_(position + rope_delta)
         self.c_out_loc.copy_(eng.page_table[req.table_idx, position : position + 1])
         self.c_table.fill_(req.table_idx)
         self.c_ids.fill_(token)
@@ -312,8 +319,8 @@ class SpecVerifyGraph:
         req = batch.reqs[0]
         self.input_ids.copy_(batch.input_ids)
         self.positions.copy_(batch.positions)
-        rope = getattr(batch, "rope_positions", None)
-        self.rope_positions.copy_(batch.positions if rope is None else rope)
+        if self.mrope_positions is not None:
+            self.mrope_positions.copy_(batch.mrope_positions)
         self.out_loc.copy_(batch.out_loc)
         slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
         self._bind(batch, table_idx=req.table_idx, slot=slot, kv_len=req.device_len)

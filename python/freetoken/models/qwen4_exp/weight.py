@@ -6,7 +6,7 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
-Dropped: ``model.visual.*`` (served text-only), and ``mtp.*`` (the speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) unless ``include_mtp`` asks for it.
+Dropped: ``mtp.*`` (the speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) unless ``include_mtp`` asks for it; ``model.visual.*`` is kept only when the model built the tower.
 """
 
 from __future__ import annotations
@@ -21,6 +21,9 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.models.qwen3_vl.weight import rename_vl_prefix
+
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
@@ -91,8 +94,6 @@ _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("model.visual.", "visual.")):
-        return None
     # mtp.* (the MTP draft head) is kept under its own prefix: the engine drops it unless
     # --spec-mtp built the head, and turns its stacked bf16 experts into a bank layer
     if _PLE_TABLE_INFIX in raw_name:
@@ -101,11 +102,7 @@ def _rename(raw_name: str) -> str | None:
         return None  # routed experts: offload source banks
     if raw_name.endswith(_SCALE_SUFFIXES):
         return None
-    if raw_name.startswith("model.language_model."):
-        return "model." + raw_name[len("model.language_model.") :]
-    if raw_name.startswith("language_model."):
-        return "model." + raw_name[len("language_model.") :]
-    return raw_name
+    return rename_vl_prefix(raw_name)
 
 
 def _split_kind(name: str) -> tuple[str, str]:
@@ -217,6 +214,7 @@ def iter_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
     include_mtp: bool = False,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
     ``include_mtp`` also yields the checkpoint's MTP draft head (``mtp.*``, the engine asks for
@@ -244,6 +242,8 @@ def iter_weights(
             for raw_name in f.keys():
                 name = _rename(raw_name)
                 if name is None or (not include_mtp and name.startswith("mtp.")):
+                    continue
+                if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
                 tensor = f.get_tensor(raw_name)
                 fused = fuser.fuse(name, tensor)

@@ -9,11 +9,13 @@ from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.utils import align_down, div_ceil, init_logger
 
+from .mm import mm_rows_after
 from .utils import PendingReq
 
 if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle
     from freetoken.message import UserMsg
+    from freetoken.mm.encoder_cache import EncoderCache
 
     from .cache import CacheManager
     from .decode import DecodeManager
@@ -45,6 +47,7 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    encoder_cache: EncoderCache | None = None
     # SWA-pool tokens charged to reqs admitted so far this pass. Mirrors reserved_size: swa is
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
@@ -201,15 +204,6 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        mm_embeds = pending_req.mm_embeds
-        if mm_embeds is not None and (is_chunked or cached_len > 0):
-            if pending_req.mm_slots is None:
-                # offline path: soft tokens without a placeholder map cannot be split
-                raise NotImplementedError(
-                    "Multimodal prompts must fit in a single prefill chunk; increase "
-                    "--max-extend-tokens or shrink the prompt."
-                )
-            mm_embeds = chunk_mm_embeds(mm_embeds, pending_req.mm_slots, cached_len, chunk_size)
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -218,9 +212,10 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
-            mm_embeds=mm_embeds,
-            mm_rope=pending_req.mm_rope,
         )
+        req.mm_items = pending_req.mm_items
+        req.mrope_positions_full = pending_req.mrope_positions_full
+        req.mrope_delta = pending_req.mrope_delta
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
@@ -274,19 +269,6 @@ class PrefillAdder:
             return req
 
         return None
-
-
-def chunk_mm_embeds(
-    mm_embeds: torch.Tensor, slots: torch.Tensor, cached_len: int, chunk_size: int
-) -> torch.Tensor:
-    """This chunk's share of a prompt's soft tokens: the rows for the image placeholders
-    inside ``[cached_len, cached_len + chunk_size)``, in prompt order (``slots`` marks the
-    placeholder positions of the whole prompt). A chunk without placeholders gets an empty
-    ``[0, hidden]`` slice rather than None, so the request stays multimodal for the cache
-    manager (image placeholders share a token id and must never enter the prefix cache)."""
-    before = int(slots[:cached_len].sum())
-    inside = int(slots[cached_len : cached_len + chunk_size].sum())
-    return mm_embeds[before : before + inside]
 
 
 class AdmissionStall:
@@ -415,6 +397,7 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
+    encoder_cache: EncoderCache | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
     stall: AdmissionStall = field(
         default_factory=lambda: AdmissionStall(ENV.ADMISSION_WARN_SECONDS.value)
@@ -425,9 +408,12 @@ class PrefillManager:
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
             PendingReq(
-                req.uid, req.input_ids, req.sampling_params,
-                mm_embeds=req.mm_embeds, mm_rope=getattr(req, "mm_rope", None),
-                mm_slots=getattr(req, "mm_slots", None),
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_items=req.mm_items,
+                mrope_positions_full=req.mrope_positions,
+                mrope_delta=req.mrope_delta,
             )
         )
 
@@ -441,6 +427,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            encoder_cache=self.encoder_cache,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -452,10 +439,6 @@ class PrefillManager:
         log_cached_tokens = 0
         for pending_req in self.pending_list:
             is_continuation = pending_req.chunked_req is not None
-            # A prompt with images runs alone: its rope table is indexed by logical position
-            # from 0 (it is never prefix-cached) and cannot share a forward with other rows.
-            if pending_req.mm_embeds is not None and reqs:
-                break
             if (
                 self.prefix_disk is not None
                 and not is_continuation
@@ -486,11 +469,15 @@ class PrefillManager:
                     prompt_admissions.append(
                         (req.uid, pending_req.input_len, req.cache_handle.cached_len)
                     )
+                    if pending_req.mm_items and self.encoder_cache is not None:
+                        # claim the rows every chunk of this request will gather; the entry outlives the chunks
+                        for item in pending_req.mm_items:
+                            self.encoder_cache.register(
+                                item.hash, req.uid, mm_rows_after(item, req.cache_handle.cached_len)
+                            )
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
-                if pending_req.mm_embeds is not None:
-                    break  # solo, see above
             else:
                 break  # We cannot add more requests
         if len(reqs) == 0:

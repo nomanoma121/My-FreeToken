@@ -202,7 +202,7 @@ def test_engine_config_spec_mtp_adds_head_layer(monkeypatch):
     from freetoken.engine import config as cfg_mod
     from freetoken.engine.config import EngineConfig
 
-    monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p"))
+    monkeypatch.setattr(cfg_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p", encoders=()))
     monkeypatch.setattr(cfg_mod, "_load_attr", lambda module, name: (lambda hf: _parsed(4)))
     monkeypatch.setattr(cfg_mod, "cached_load_hf_config", lambda path: _toy_hf_config(4))
     monkeypatch.setattr(cfg_mod, "checkpoint_quant_config", lambda *a, **k: None)
@@ -268,14 +268,14 @@ def test_spec_graph_applicable_only_for_full_windows():
 
 def _build(cfg):
     from freetoken.layers import set_rope_device
-    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoEForCausalLM
+    from freetoken.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 
     set_rope_device(torch.device("cpu"))
     prev = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("meta"):
-            return Qwen3_5MoEForCausalLM(cfg)
+            return Qwen3_5MoeForCausalLM(cfg)
     finally:
         torch.set_default_dtype(prev)
 

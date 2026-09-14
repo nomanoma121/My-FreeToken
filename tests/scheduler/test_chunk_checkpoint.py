@@ -65,7 +65,7 @@ def _req(*, cached_len=4096, handle_len=0, track=2048, chunk_upto=None, table_id
                                                                       dtype=torch.int32))
     return SimpleNamespace(
         uid=7, table_idx=table_idx, cached_len=cached_len, input_ids=torch.zeros(cached_len),
-        mm_embeds=None, mamba_last_track_seqlen=track, mamba_ping_pong=(11, 12),
+        mamba_last_track_seqlen=track, mamba_ping_pong=(11, 12),
         mamba_next_track_idx=0, cache_handle=handle, successor=None,
         chunk_upto=chunk_upto, chunk_dups=[],
     )

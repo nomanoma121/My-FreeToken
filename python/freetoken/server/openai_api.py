@@ -36,7 +36,6 @@ from .generation import (
     generate_full,
     prerender_error,
     render_messages,
-    render_messages_multimodal,
     resolve_sampling,
     submit_generation,
 )
@@ -69,12 +68,8 @@ def chat_request_to_genspec(
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
-    messages, images = render_messages_multimodal(
-        [m.model_dump(exclude_none=True) for m in req.messages]
-    )
     return GenSpec(
-        messages=messages,
-        images=images,
+        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,
@@ -208,7 +203,10 @@ async def handle_chat_completion(
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
-    uid = await submit_generation(spec, state)
+    try:
+        uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        return create_error_response(str(exc), code=exc.code)
 
     if req.stream:
         chunks = stream_chat_completion_chunks(uid, req, state, spec)
