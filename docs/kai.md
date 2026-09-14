@@ -333,6 +333,9 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 | `FREETOKEN_NVFP4_MOE_ARITH` | arch (on below Ampere) | Arithmetic (gather-free) e2m1 dequant in the prefill MoE kernel; bit-identical, speed knob only |
 | `FREETOKEN_CPU_PREFILL_MAX_TOKENS` | `256` | Prefill extends up to this many rows compute their routed experts on the CPU executor (offload/hybrid) instead of streaming every layer's bank; `0` disables |
 | `FREETOKEN_STAGED_COPY` / `FREETOKEN_STAGED_COPY_MB` | on / `32` | Whole-layer prefill copies of non-pinned bank layers go through two pinned staging buffers of this size |
+| `FREETOKEN_BANK_PREAD` | `auto` | With `--moe-bank-ram`: how a prefill chunk reads the non-resident rows. `auto` reads them from the file on several threads, `O_DIRECT` when the page cache left beside every rank's resident rows (the smaller of MemTotal and the cgroup limit) is smaller than every rank's non-resident rows, buffered otherwise; `direct` / `buffered` force one; `0` faults them in through the mapping as before |
+| `FREETOKEN_BANK_READ_THREADS` / `FREETOKEN_BANK_READ_PIECE_MB` | `8` / `16` | Threads and piece size of those reads (two sets of pinned buffers of this many pieces) |
+| `FREETOKEN_BANK_PREAD_CACHED` | `0.9` | A piece with at least this share of its pages in the page cache is copied from the mapping instead of read |
 | `FT_SPEC_TRACE` | `0` | Log the first n verify windows of `--spec-mtp` (input ids, drafts, samples, accepted, next drafts, top-3 logits) |
 | `FT_SPEC_PROFILE` | off | Per-phase wall time of the verify step (target forward, sample, rollback, head window, head chain), logged every 20 steps |
 | `FT_STEP_PROFILE` | off | The same phase timer for every decode step on every pipeline rank (receive, forward, sample, send, wait for tokens), logged every 20 steps; where a `--pp-size` step's time goes |

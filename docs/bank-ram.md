@@ -300,6 +300,9 @@ survive a reboot either; a udev rule does, e.g.
 `ACTION=="add|change", KERNEL=="nvme0n1", ATTR{queue/read_ahead_kb}="256"` in
 `/etc/udev/rules.d/60-freetoken-readahead.rules`.
 
+The window no longer matters to prefill: a chunk reads the non-resident rows from the file
+directly instead of faulting them in (see Limits and caveats), so set it for decode.
+
 Under WSL2 the window that counts is the virtual disk's (`/sys/block/sdX`), since that is the
 device the ext4 filesystem sits on. Being under the warning threshold does not mean the value
 is optimal -- measure.
@@ -588,6 +591,20 @@ were worth about a factor of two, and should not have been quoted as if they wer
   the chunk work in [prefill-chunk.md](prefill-chunk.md): on the two RTX 3060s a 19.9k-token prompt
   took 68.3 s at 64 GB-equivalent against 56.5 s with the same flag and all of the RAM, and
   `--prefill-mixer-pieces 2` took those to 52.7 s and 45.0 s.
+
+  Where the page cache is smaller than the non-resident rows, the chunk's bank read is most of
+  that: reading one layer's rows evicts the previous layer's, so every chunk reads nearly all of
+  them from the disk again. They used to be faulted in through the mapping, one thread and one
+  readahead window at a time; they are now read from the file by several threads into the
+  bounce buffers, with `O_DIRECT` when the page cache could not hold them anyway (so a prefill
+  no longer pushes out the rows decode has cached) and buffered when it can (so it fills after
+  the first chunk). A piece the page cache already holds is copied from the mapping. On an
+  RTX 2060 host with Ornith at `--moe-bank-ram 6G` (11 GiB non-resident) and the server held to
+  13 GiB, the bank read per chunk went from 8.5 s to 5.4 s and prefill from 235 to 300 tok/s
+  (that host's virtual disk tops out near 2 GiB/s); with readahead turned off, from 28 to
+  230 tok/s. With RAM to spare it is unchanged (0.65 s per chunk from the page cache).
+  `--prefill-profile` shows the split per chunk; `FREETOKEN_BANK_PREAD` in
+  [kai.md](kai.md#environment-variables-added-by-this-fork) selects the reads.
 - **Disk space.** The bank file is a second copy of the experts -- 63.4 GiB for Flash-Next, on
   top of a checkpoint whose other large part is 47.7 GiB of PLE -- until `ft bank pack` removes
   them from the checkpoint (section 5). The PLE is not copied: `--ple-backend disk` reads its rows

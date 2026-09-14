@@ -229,8 +229,9 @@ and no root; reads `/proc` and `/sys` and nothing else unless it benchmarks.
 - **Read benchmark**: whole expert rows at random from the bank file once it holds every layer
   (otherwise the checkpoint's largest file -- unwritten layers read back as zeros),
   O_DIRECT, one thread and then one per physical core per rank; then, from a complete bank
-  file, a range dropped from the page cache and copied out of a mapping, which is how a prefill
-  chunk reads the non-resident rows and follows `read_ahead_kb`. Skipped when another process
+  file, the reads a prefill chunk makes of the non-resident rows (the server's threads and piece
+  size, `O_DIRECT`), and a range dropped from the page cache and copied out of a mapping, which
+  is how it read them before and follows `read_ahead_kb`. Skipped when another process
   maps the file (a running server), unless `--bench-anyway`. `--bench-seconds 0` skips it.
 - **Prediction per RAM cap**: resident share, routes covered (from `--moe-bank-stats`, counted
   on `--eval-stats` when given -- the same histogram overstates it), page cache left, disk read
@@ -238,8 +239,9 @@ and no root; reads `/proc` and `/sys` and nothing else unless it benchmarks.
   under the table; the model was within about 2x of the measurements it was checked against.
 - **Prefill data movement per chunk, per rank**: for each cap, the rank's non-resident rows, the
   page cache beside them, what comes from the disk (all of them each chunk when the page cache is
-  smaller -- reading one layer evicts the one before), the copy time at the page-cache read rate
-  (`--fault-gbs` to supply it), and the transfer time at the slowest host -> GPU rate. Data
+  smaller -- reading one layer evicts the one before), the copy time at the prefill read rate
+  (`--prefill-read-gbs` to supply it) and the factor the page-cache rate would cost, and the
+  transfer time at the slowest host -> GPU rate. Data
   movement only; compare with the server's `--prefill-profile` lines.
 
 ## ft bench bw
