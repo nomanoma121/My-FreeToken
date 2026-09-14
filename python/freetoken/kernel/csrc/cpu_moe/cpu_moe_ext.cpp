@@ -1330,47 +1330,6 @@ struct CpuMoeExecutor {
   std::vector<int64_t> flag_served;          // slot -> completed dispatch count (tests/debug)
   std::mutex flag_task_mtx;
 
-  // ---- --moe-bank-prefetch: page in this task's cold rows before the workers fault on them ----
-  // Under --moe-bank-ram the rows past a block's resident prefix are file-backed pages. Left to
-  // the workers, each is a synchronous 4 KiB fault answered by a readahead window centred on it,
-  // so a window reads into the neighbouring (cold, unwanted) experts and the pool waits on one
-  // window per worker at a time. Here the submitting thread -- which sees the routing before any
-  // worker does -- asks for exactly the rows this task will read, deduplicated: a mincore(2)
-  // check (a row already in page cache costs no syscall beyond it), then MADV_WILLNEED, which
-  // inserts every page of the row into the page cache and submits the reads without waiting for
-  // them. A worker that then faults finds the page there, waits on its I/O instead of starting a
-  // read of its own, and reads nothing it will not use.
-  //
-  // Chosen by replaying the executor's access shape against a real bank file (guides/40): per
-  // cold row, the fault path took 3.2-3.9 ms and read 1.7x the bytes it used at read_ahead_kb
-  // 256, 10-39 ms and 4-11x at 8192; WILLNEED took 0.9-1.2 ms and read 1.00x at both.
-  // MADV_POPULATE_READ goes through the same fault path and inherited its waste; a buffered pread
-  // pool matched WILLNEED only with 16 threads; starting the workers first and advising in
-  // parallel wasted reads once readahead was wide, because a worker could fault before the advice
-  // landed. So: serial, before the wake -- for the gate_up side. The down side is advised right
-  // after the wake, since pass 2 cannot start until pass 1 (which waits on gate_up I/O) is done.
-  struct PrefetchSpan {
-    uint64_t base;       // address of row 0 of this (bank, layer) block
-    uint64_t row_bytes;  // bytes per expert row
-    int cold_from;       // rows [cold_from, num_experts) are file-backed and may be absent
-    int phase;           // 1 = read by pass 1 (gate_up side), 2 = by pass 2 (down side)
-  };
-  std::vector<std::vector<PrefetchSpan>> pf_spans;  // layer_id -> blocks with a cold part
-  std::vector<int> pf_min_cold;                      // layer_id -> min cold_from (skip test)
-  std::atomic<bool> pf_enabled{false};
-  std::vector<uint32_t> pf_stamp;  // expert -> generation that last listed it (dedup)
-  uint32_t pf_gen = 0;
-  std::vector<int> pf_rows;              // this task's distinct cold rows, ascending
-  std::vector<unsigned char> pf_vec;     // mincore scratch
-  uint64_t pf_page = 4096;
-  // Counters (read by Python for logs and tests; written only by the submitting thread).
-  std::atomic<uint64_t> pf_tasks{0};         // tasks that had at least one cold row
-  std::atomic<uint64_t> pf_rows_seen{0};     // distinct cold rows over those tasks
-  std::atomic<uint64_t> pf_ranges_advised{0};
-  std::atomic<uint64_t> pf_bytes_advised{0};
-  std::atomic<uint64_t> pf_ns{0};            // time spent in the prefetch calls
-  std::atomic<int> pf_errno{0};              // last madvise failure (0 = none)
-
   // Portable ordering for the flag handshake: "ready observed => the DMA'd inputs that
   // preceded the bump are visible" and "y stores are visible before done". Plain
   // volatile loads lean on x86 TSO; acquire/release makes it hold on aarch64 too
@@ -2061,7 +2020,7 @@ struct CpuMoeExecutor {
 
   void submit(MoeTask* t) {
     // --moe-bank-prefetch: the gate_up side before the workers start (they read it first)...
-    const bool pf = prefetch_collect(t);
+    const bool pf = pf_enabled.load(std::memory_order_relaxed) && prefetch_collect(t);
     if (pf) prefetch_phase(t, 1);
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
@@ -2282,6 +2241,51 @@ struct CpuMoeExecutor {
     MoeTask* t = reinterpret_cast<MoeTask*>(ud);
     t->exec->sync();
   }
+
+  // ---- --moe-bank-prefetch: page in this task's cold rows before the workers fault on them ----
+  // (Kept as the LAST members of the executor: inserted among the flag-handshake members above, they
+  // shifted that layout and decode stalled for 2-5 s a few times per 1500 tokens on the RTX 2060 with
+  // the flag off -- 0 of 7 runs without these members, 4 of 4 with. guides/40 §13.)
+  // Under --moe-bank-ram the rows past a block's resident prefix are file-backed pages. Left to
+  // the workers, each is a synchronous 4 KiB fault answered by a readahead window centred on it,
+  // so a window reads into the neighbouring (cold, unwanted) experts and the pool waits on one
+  // window per worker at a time. Here the submitting thread -- which sees the routing before any
+  // worker does -- asks for exactly the rows this task will read, deduplicated: a mincore(2)
+  // check (a row already in page cache costs no syscall beyond it), then MADV_WILLNEED, which
+  // inserts every page of the row into the page cache and submits the reads without waiting for
+  // them. A worker that then faults finds the page there, waits on its I/O instead of starting a
+  // read of its own, and reads nothing it will not use.
+  //
+  // Chosen by replaying the executor's access shape against a real bank file (guides/40): per
+  // cold row, the fault path took 3.2-3.9 ms and read 1.7x the bytes it used at read_ahead_kb
+  // 256, 10-39 ms and 4-11x at 8192; WILLNEED took 0.9-1.2 ms and read 1.00x at both.
+  // MADV_POPULATE_READ goes through the same fault path and inherited its waste; a buffered pread
+  // pool matched WILLNEED only with 16 threads; starting the workers first and advising in
+  // parallel wasted reads once readahead was wide, because a worker could fault before the advice
+  // landed. So: serial, before the wake -- for the gate_up side. The down side is advised right
+  // after the wake, since pass 2 cannot start until pass 1 (which waits on gate_up I/O) is done.
+  struct PrefetchSpan {
+    uint64_t base;       // address of row 0 of this (bank, layer) block
+    uint64_t row_bytes;  // bytes per expert row
+    int cold_from;       // rows [cold_from, num_experts) are file-backed and may be absent
+    int phase;           // 1 = read by pass 1 (gate_up side), 2 = by pass 2 (down side)
+  };
+  std::vector<std::vector<PrefetchSpan>> pf_spans;  // layer_id -> blocks with a cold part
+  std::vector<int> pf_min_cold;                      // layer_id -> min cold_from (skip test)
+  std::atomic<bool> pf_enabled{false};
+  std::vector<uint32_t> pf_stamp;  // expert -> generation that last listed it (dedup)
+  uint32_t pf_gen = 0;
+  std::vector<int> pf_rows;              // this task's distinct cold rows, ascending
+  std::vector<unsigned char> pf_vec;     // mincore scratch
+  uint64_t pf_page = 4096;
+  // Counters (read by Python for logs and tests; written only by the submitting thread).
+  std::atomic<uint64_t> pf_tasks{0};         // tasks that had at least one cold row
+  std::atomic<uint64_t> pf_rows_seen{0};     // distinct cold rows over those tasks
+  std::atomic<uint64_t> pf_ranges_advised{0};
+  std::atomic<uint64_t> pf_bytes_advised{0};
+  std::atomic<uint64_t> pf_ns{0};            // time spent in the prefetch calls
+  std::atomic<int> pf_errno{0};              // last madvise failure (0 = none)
+
 };
 
 }  // namespace
