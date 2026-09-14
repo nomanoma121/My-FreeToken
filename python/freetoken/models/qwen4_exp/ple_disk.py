@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -17,6 +17,7 @@ import torch
 from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.utils import init_logger
+from freetoken.utils.prefill_profile import active as _prefill_profile
 
 from .weight import (
     _PLE_SCALE_SUFFIX,
@@ -207,10 +208,12 @@ class DiskRowTable:
         started = time.perf_counter() if self._profile_every else 0.0
         pinned = self._graph_pinned if graph else self._eager_pinned
         offset = 0
-        for run in runs:
-            self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
-            offset += run.numel() - 2
-        self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
+        prof = _prefill_profile()
+        with prof.ple_fill() if prof is not None else nullcontext():
+            for run in runs:
+                self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
+                offset += run.numel() - 2
+            self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
         if self._profile_every:
             self._note_fill(time.perf_counter() - started, offset)
 

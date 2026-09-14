@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -26,6 +27,8 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
 from freetoken.utils import init_logger
+from freetoken.utils.prefill_profile import active as _prefill_profile
+from freetoken.utils.prefill_profile import major_faults as _major_faults
 
 logger = init_logger(__name__)
 
@@ -697,12 +700,20 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
+            prof = _prefill_profile() if self.device.type == "cuda" else None
+            if prof is not None:
+                stream = torch.cuda.current_stream(self.device)
+                start, nbytes = prof.hot_copy_begin(stream), 0
             for src, dst in self._prefill_pairs(layer_id, buffer_id):
                 hot = self._prefill_hot(src)
                 if hot < src.size(0):
                     dst[:hot].copy_(src[:hot], non_blocking=True)
                 else:
                     dst.copy_(src, non_blocking=True)
+                if prof is not None:
+                    nbytes += src[:hot].numel() * src.element_size()
+            if prof is not None:
+                prof.hot_copy_end(start, stream, nbytes)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -1122,11 +1133,19 @@ class OffloadMoeCache:
         n = d.numel()
         off = 0
         i = 0
+        prof = _prefill_profile()
         while off < n:
             m = min(size, n - off)
-            events[i].synchronize()  # the DMA that last read this buffer is done
             stage = bufs[i][:m]
-            stage.copy_(s[off : off + m])  # host memcpy into pinned memory
+            if prof is None:
+                events[i].synchronize()  # the DMA that last read this buffer is done
+                stage.copy_(s[off : off + m])  # host memcpy into pinned memory
+            else:
+                t0 = time.perf_counter()
+                events[i].synchronize()
+                t1, faults = time.perf_counter(), _major_faults()
+                stage.copy_(s[off : off + m])
+                prof.staged_piece(t1 - t0, time.perf_counter() - t1, m, _major_faults() - faults)
             d[off : off + m].copy_(stage, non_blocking=True)  # async DMA on the stream
             events[i].record(stream)
             off += m

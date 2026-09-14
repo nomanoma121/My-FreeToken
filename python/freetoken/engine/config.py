@@ -49,6 +49,9 @@ class EngineConfig:
     # The mixers set the transient that caps the chunk width, so the probe measures less and
     # the solver picks wider chunks: fewer chunks, fewer expert-bank transfers. 1 = off.
     prefill_mixer_pieces: int = 1
+    # --prefill-profile: log where each prefill forward's wall time goes, on every rank
+    # (utils/prefill_profile.py)
+    prefill_profile: bool = False
     # --kv-cache-dtype: "auto" (16-bit), "q8_0" or "q4_0". Narrows the paged KV slab so
     # --moe-cache-auto can hand the difference to the expert cache (see kvcache/kv_quant.py).
     kv_cache_dtype: str | None = None

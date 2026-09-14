@@ -746,6 +746,20 @@ def parse_args(
             "--pp-size) and single-GPU Qwen3.5-MoE."
         ),
     )
+
+    parser.add_argument(
+        "--prefill-profile",
+        action="store_true",
+        default=ServerArgs.prefill_profile,
+        help=(
+            "Log one line per prefill forward on every rank splitting its wall time into "
+            "waiting for the other pipeline rank, host copies of expert rows the GPU cannot "
+            "read directly (page faults on a --moe-bank-ram bank land here), per-layer "
+            "embedding reads, and the GPU plus the rest; with the GiB copied and their rate, "
+            "major page faults, storage reads, how much of the bank the page cache held, and "
+            "the achieved PCIe rate of the registered rows. Costs a device sync per forward."
+        ),
+    )
     parser.add_argument(
         "--prefill-chunk-budget",
         type=float,

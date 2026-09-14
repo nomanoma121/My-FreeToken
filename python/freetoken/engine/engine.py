@@ -1630,6 +1630,35 @@ class Engine:
             self._capture_spec_graph()
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        prof = self._prefill_profiler() if batch.is_prefill and not batch.spec_verify else None
+        if prof is None:
+            return self._forward_batch(batch, args)
+        prof.begin(int(batch.input_ids.numel()))
+        try:
+            out = self._forward_batch(batch, args)
+        except BaseException:
+            prof.abort()  # no sync and no line: the forward's own error is the one to see
+            raise
+        prof.end(self.device)
+        return out
+
+    def _prefill_profiler(self):
+        """``--prefill-profile``: this rank's profiler, built on first use (the bank tier and
+        the pipeline transport it reads are settled by then)."""
+        if not getattr(self.config, "prefill_profile", False):
+            return None
+        prof = getattr(self, "_prefill_prof", None)
+        if prof is None:
+            from freetoken.utils.prefill_profile import PrefillProfile
+
+            banks = getattr(getattr(self, "bank_tier", None), "banks", None)
+            residency = banks.cold_residency if banks is not None and getattr(banks, "cold_spans", None) else None
+            prof = self._prefill_prof = PrefillProfile(
+                self.config.tp_info.rank, self.config.tp_info.size, residency=residency, log=logger.info
+            )
+        return prof
+
+    def _forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         pp = self.pp_comm
