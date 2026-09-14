@@ -456,6 +456,15 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+def _encoder_bank_bytes(model) -> int:
+    """Pinned host bytes of an encoder tower whose blocks are streamed (--mm-encoder-weights
+    host): they come out of the same pin quota as the expert banks (WSL2 caps it), so the bank
+    residency planner has to see them."""
+    streamer = getattr(getattr(model, "visual", None), "_streamer", None)
+    bank = getattr(streamer, "bank", None)
+    return int(bank.numel() * bank.element_size()) if bank is not None else 0
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -648,6 +657,7 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        self._encoder_pinned_bytes = _encoder_bank_bytes(self.model)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -666,6 +676,7 @@ class Engine:
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         self._host_tables_bytes += self._mtp_bank_bytes  # the draft head's pinned bank layer
         self._host_tables_bytes += getattr(self, "_host_resident_bytes", 0)  # --host-embedding
+        self._host_tables_bytes += self._encoder_pinned_bytes  # the vision tower's streamed blocks
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
