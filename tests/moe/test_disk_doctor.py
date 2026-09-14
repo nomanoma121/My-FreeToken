@@ -225,12 +225,13 @@ def test_prefill_prediction_rereads_the_non_resident_rows_when_the_page_cache_is
     shape = _flash_next()
     rows = dd.predict(shape, [42 * GiB, shape.bank_bytes], 2, 61 * GiB)
     rep = dd.Report()
-    dd._prefill_prediction(rep, rows, 2, shape, fault_gbs=1.0, h2d_gbs=10.0)
+    dd._prefill_prediction(rep, rows, 2, shape, 1.0, h2d_gbs=10.0, fault_gbs=0.25)
     out = rep.render()
     short, full = rows
     assert short.page_cache / 2 < short.cold_bytes / 2
     cold = short.cold_bytes / 2
     assert f"{cold / GiB:12.1f}G" in out and f"{cold / 1e9:7.1f}s" in out
+    assert "with FREETOKEN_BANK_PREAD=0 the copy faults the rows in through the mapping instead: x 4.0" in out
     (finding,) = [text for level, text in rep.findings if level == "warn"]
     assert "every chunk reads them from the disk again" in finding and "42G" in finding
     # the whole bank resident: nothing to read, only the transfer
@@ -241,8 +242,8 @@ def test_prefill_prediction_without_rates_prints_question_marks():
     shape = _flash_next()
     rows = dd.predict(shape, [24 * GiB], 1, 30 * GiB)
     rep = dd.Report()
-    dd._prefill_prediction(rep, rows, 1, shape, fault_gbs=None, h2d_gbs=None)
+    dd._prefill_prediction(rep, rows, 1, shape, None, h2d_gbs=None)
     out = rep.render()
-    assert "not measured: a complete bank file nobody has mapped is needed" in out
+    assert "not measured: a complete bank file nobody has mapped is needed; --prefill-read-gbs gives one" in out
     assert "(not measured: --h2d-seconds)" in out
     assert rep.findings == []

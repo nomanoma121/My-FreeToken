@@ -403,3 +403,14 @@ def test_fault_read_copies_through_a_mapping(tmp_path):
         small = tmp_path / "small"
         small.write_bytes(b"\x00" * 4096)
         dp.fault_read(str(small), seconds=1.0)
+
+
+def test_piece_read_reads_the_range(tmp_path, monkeypatch):
+    from freetoken.moe import disk_probe as dp
+
+    monkeypatch.setenv("FREETOKEN_BANK_READ_THREADS", "2")
+    monkeypatch.setenv("FREETOKEN_BANK_READ_PIECE_MB", "1")
+    f = tmp_path / "bank.ftmb"
+    f.write_bytes(os.urandom(16 << 20))
+    gbs, how = dp.piece_read(str(f), seconds=5.0, nbytes=6 << 20)
+    assert gbs > 0 and how.startswith("2 threads x 1 MiB")
