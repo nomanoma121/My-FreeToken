@@ -22,6 +22,7 @@ import os
 from dataclasses import dataclass, field
 
 from freetoken.moe import disk_probe as dp
+from freetoken.moe import gpu_probe as gp
 
 GiB = dp.GiB
 MiB = 2**20
@@ -377,7 +378,53 @@ def _storage(rep: Report, label: str, path: str, proc: str, sys: str, gpus, need
     return s
 
 
-def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
+def _gpus(rep: Report, ns, shape: Shape, ranks: int, query, rate) -> None:
+    """Each GPU's PCIe link, idle and under a copy, and the pinned host -> GPU rate.
+
+    A prefill chunk streams every layer's whole expert bank to its rank's GPU, so the link is
+    paid once per chunk; decode only pays it for cache misses.
+    """
+    rep.section("GPUs")
+    links = query() if query is not None else None
+    if links is None:
+        rep.say("not read: nvidia-smi is missing or failed")
+        return
+    if not links:
+        rep.say("nvidia-smi lists no GPU")
+        return
+    per_rank = shape.bank_bytes / ranks if shape.bank_bytes else None
+    for link in links:
+        rep.say(f"GPU {link.index} ({link.name}, {link.bus_id}): {link.describe()} as reported now")
+        measured, under = None, None
+        if ns.h2d_seconds > 0:
+            try:
+                measured, under = rate(link, ns.h2d_seconds)
+            except Exception as exc:  # noqa: BLE001 -- no CUDA, a full or busy GPU: say so, go on
+                rep.say(f"  pinned host -> GPU rate not measured: {exc}")
+        else:
+            rep.say("  rate not measured (--h2d-seconds 0); a GPU at idle may report a lower generation "
+                    "than it trains to under load")
+        if under is not None:
+            rep.say(f"  during a copy: {under.describe()}")
+        eff = under or link
+        if measured:
+            nominal = eff.lane_gbs
+            rep.say(f"  pinned host -> GPU: {measured:.1f} GB/s"
+                    + (f" ({measured / nominal:.0%} of the link's nominal {nominal:.1f} GB/s)" if nominal else ""))
+            if per_rank:
+                rep.say(f"  a rank's expert banks ({_gib(per_rank)}) cross it in {per_rank / 1e9 / measured:.1f} s: "
+                        f"once per prefill chunk, whatever the chunk holds")
+        if under is None and measured is None:
+            continue
+        top_gen = min(g for g in (eff.gen_max, eff.gen_host) if g) if (eff.gen_max or eff.gen_host) else None
+        if eff.width and eff.width_max and eff.width < eff.width_max:
+            rep.find("warn", f"GPU {link.index} runs at x{eff.width} of its x{eff.width_max} under load: the slot (or a "
+                             f"shared chipset uplink) halves or quarters what every prefill chunk streams to it")
+        elif eff.gen and top_gen and eff.gen < top_gen:
+            rep.find("warn", f"GPU {link.index} trained to Gen{eff.gen} under load where GPU and slot allow Gen{top_gen}")
+
+
+def run(ns, proc: str = "/proc", sys: str = "/sys", *, gpu_query=None, gpu_rate=None) -> str:
     from freetoken.moe.bank_disk import load_freq
 
     rep = Report()
@@ -448,6 +495,11 @@ def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
             _storage(rep, "Checkpoint storage", ns.model, proc, sys, gpus)
             rep.say("its expert tensors are read only while the bank file lacks layers; the rest of it at every "
                     "start, and per token under --ple-backend disk")
+
+    # ---- GPUs (the real host only unless the caller hands in a fake)
+    if gpu_query is None and sys == "/sys":
+        gpu_query = gp.query_links
+    _gpus(rep, ns, shape, ranks, gpu_query, gpu_rate or gp.h2d_rate)
 
     # ---- readahead
     rep.section("Readahead")
@@ -640,6 +692,9 @@ def build_parser(prog: str) -> argparse.ArgumentParser:
     p.add_argument("--page-cache-factor", type=float, default=PAGE_CACHE_FACTOR,
                    help=f"share of the placed miss that reaches the disk once the page cache settles (default {PAGE_CACHE_FACTOR})")
     p.add_argument("--bench-seconds", type=float, default=3.0, help="per benchmark pass; 0 skips it")
+    p.add_argument("--h2d-seconds", type=float, default=2.0,
+                   help="per GPU: pinned host -> GPU copy benchmark, with the PCIe link read during it; 0 skips it "
+                        "(needs a GPU that a running server does not already fill)")
     p.add_argument("--threads", type=int, default=0, help="benchmark threads (default: physical cores x ranks)")
     p.add_argument("--bench-anyway", action="store_true",
                    help="benchmark even when another process maps the file")
