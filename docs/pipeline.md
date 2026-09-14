@@ -72,6 +72,13 @@ Ornith-1.5-35B-A3B; `qwen3_5_moe`) and gpt-oss (`gpt_oss`). Others raise
   minute while it lasts, and how long it took once it ends. Nothing times out. A wait of tens of
   seconds can be a long prefill chunk on the other rank; one that keeps growing means that rank
   has stopped, and its own log (or `py-spy dump`) says where.
+- At startup the ranks load different halves of the model and reach the points where they
+  agree on the KV page count and the prefill chunk at different times. Each of those points
+  starts with a barrier that waits up to `FREETOKEN_RANK_JOIN_TIMEOUT_SECONDS` (3600) for the
+  other ranks, and a wait of 10 s or more is logged (`waited N s for the other ranks before
+  ...`). Before, the first rank to get there gave up after the group's 60 s: on two RTX 3060s
+  with `--moe-bank-ram` and a page cache emptied by a WSL restart, rank 1 was still reading its
+  experts and the start failed with `Timed out waiting 60000ms for recv operation`.
 
 ## Running
 

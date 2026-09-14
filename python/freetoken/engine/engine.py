@@ -1422,6 +1422,10 @@ class Engine:
         same step. Found by reading, not by a failure; the larger pools give up at most that
         remainder.
         """
+        from freetoken.distributed.rendezvous import wait_for_ranks
+
+        # the first collective after loading: the ranks load different halves and get here apart
+        wait_for_ranks(self.tp_cpu_group, "agreeing on the KV page count")
         agreed = torch.tensor([num_pages], dtype=torch.int64)
         torch.distributed.all_reduce(
             agreed, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
@@ -2102,6 +2106,9 @@ class Engine:
             # different halves of the model and different runtime buffers, so their own
             # numbers differ by construction -- agree on the tightest: most transient per
             # token, least VRAM free, and no chunk at all if any rank's probe failed.
+            from freetoken.distributed.rendezvous import wait_for_ranks
+
+            wait_for_ranks(self.tp_cpu_group, "agreeing on the prefill chunk")
             agreed = torch.tensor([failed, per_token, -float(free_before)], dtype=torch.float64)
             torch.distributed.all_reduce(
                 agreed, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
@@ -2166,6 +2173,10 @@ class Engine:
         allocated = int(torch.cuda.memory_allocated(self.device))
         # cached-but-unused blocks count, as in prefill_chunk_now: the transient is served from them
         usable = free + max(0, reserved - allocated)
+        from freetoken.distributed.rendezvous import wait_for_ranks
+
+        # the --spec-mtp graph captures before this take longer on the rank holding the draft head
+        wait_for_ranks(self.tp_cpu_group, "re-checking the prefill chunk after the boot")
         agreed = torch.tensor([-float(usable)], dtype=torch.float64)
         torch.distributed.all_reduce(
             agreed, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group

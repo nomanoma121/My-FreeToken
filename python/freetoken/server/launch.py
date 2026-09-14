@@ -79,6 +79,11 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     with torch.inference_mode():
         try:
             scheduler = Scheduler(args)
+            from freetoken.distributed.rendezvous import wait_for_ranks
+
+            # the scheduler's own barrier keeps the serving timeout; the ranks finish their
+            # schedulers' setup apart, so meet here first with the startup one
+            wait_for_ranks(scheduler.tp_cpu_group, "the scheduler's first sync")
             scheduler.sync_all_ranks()
         except Exception as exc:  # noqa: BLE001 -- surface the reason, then let it propagate
             # A startup failure (bad config, OOM, corrupt weights) would otherwise reach the

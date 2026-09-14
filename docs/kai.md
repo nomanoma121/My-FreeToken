@@ -341,6 +341,7 @@ vocabularies only (Ornith's is untied); Qwen3.5-MoE family.
 | `FT_SPEC_NO_GRAPH` / `FT_SPEC_NO_MTP_GRAPH` | off | Keep the verify window / the draft head eager (A/B runs) |
 | `FT_SPEC_GRAPH_MIN_FREE_MB` | `256` | Drop the verify-window graphs when less VRAM than this is left after capture (`0` keeps them) |
 | `FREETOKEN_ADMISSION_WARN_SECONDS` | `30` | Warn when the request at the head of the prefill queue has been refused admission this long -- counting only time in which the requests it waits behind made no progress, or none is running -- with the reason and its numbers (request slots, KV, GDN state slots, sliding-window pool). Repeats every 60 s; `0` disables |
+| `FREETOKEN_RANK_JOIN_TIMEOUT_SECONDS` | `3600` | Multi-rank: how long a rank that reaches a startup agreement (KV page count, prefill chunk, the scheduler's first sync) waits for the others. The serving timeout between ranks is unchanged (see [pipeline.md](pipeline.md)) |
 | `FREETOKEN_RANK_WAIT_WARN_SECONDS` | `60` | Multi-rank: warn when a blocking send or receive between ranks has waited this long, naming what for; repeats every 60 s, nothing times out (see [pipeline.md](pipeline.md)); `0` disables |
 | `FREETOKEN_PREMAP_VRAM` | off | Pre-map the remaining VRAM into the allocator cache at startup; an experiment that did not help on the 2060 (per-stream pools), left as a knob |
 
