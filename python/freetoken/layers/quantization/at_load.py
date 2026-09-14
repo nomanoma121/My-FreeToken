@@ -25,10 +25,12 @@ AT_LOAD_FP8 = fp8_tensor_scheme("float", per_row=True)
 # indexer, the PLE table's key/value projections and the GatedDeltaNet b/a gates decide which
 # experts run, how streams mix, which keys are scored, which n-gram rows are read and how much
 # state decays. They are small, so they buy little VRAM, and they are the last place to spend
-# accuracy.
+# accuracy. The vision tower stays too: its blocks are streamed from pinned host banks, so fp8
+# would save host RAM, not VRAM, and every image feature the model sees comes out of it.
 KEEP_BF16 = name_set((
     "*.gate", "*.shared_expert_gate", "*hyper_connection*", "*.indexer", "*.ple",
     "*.in_proj_ba", "*.in_proj_b", "*.in_proj_a",
+    "visual", "*.visual",
 ))
 
 
