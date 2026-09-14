@@ -64,6 +64,38 @@ def _find_all(ids: list[int], target: list[int]) -> list[int]:
     return found
 
 
+# preprocessor_config.json image_processor_type (without Fast/Pil) -> the PIL backend of that processor
+_PIL_IMAGE_PROCESSORS = {
+    "Qwen2VLImageProcessor": ("transformers.models.qwen2_vl.image_processing_pil_qwen2_vl", "Qwen2VLImageProcessorPil"),
+}
+
+
+def _load_image_processor(model_path: str) -> Any:
+    """AutoImageProcessor, or -- where torchvision is not installed, which AutoImageProcessor itself
+    requires -- the PIL backend of the checkpoint's processor class. A server loads one or the other
+    in every process (same environment), so the pixel_values content hashes agree within it."""
+    try:
+        from transformers import AutoImageProcessor
+
+        return AutoImageProcessor.from_pretrained(model_path)
+    except ImportError as exc:
+        if "torchvision" not in str(exc).lower():
+            raise
+        import json
+        import os
+
+        from transformers.utils import cached_file
+
+        config_file = model_path if os.path.isfile(model_path) else cached_file(model_path, "preprocessor_config.json")
+        with open(config_file, encoding="utf-8") as f:
+            kind = str(json.load(f).get("image_processor_type") or "")
+        target = _PIL_IMAGE_PROCESSORS.get(kind.removesuffix("Fast").removesuffix("Pil"))
+        if target is None:
+            raise ImportError(f"{exc} (and {kind or 'this image processor'} has no PIL backend registered here)") from exc
+        module, name = target
+        return getattr(importlib.import_module(module), name).from_pretrained(model_path)
+
+
 class MMProcessor(ABC):
     """How a checkpoint's images become items, tokens and positions; apply is the family-agnostic driver, subclasses fill the hooks.
 
@@ -84,9 +116,7 @@ class MMProcessor(ABC):
         """The checkpoint's image processor, loaded on first use (tokenizer workers share the instance across threads)."""
         with self._image_processor_lock:
             if self._image_processor_instance is None:
-                from transformers import AutoImageProcessor
-
-                self._image_processor_instance = AutoImageProcessor.from_pretrained(self.model_path)
+                self._image_processor_instance = _load_image_processor(self.model_path)
             return self._image_processor_instance
 
     def get_mm_processor_kwargs(self, mm: MultimodalConfig) -> dict[str, Any]:
