@@ -217,3 +217,32 @@ def test_parse_nvidia_smi_links():
     assert a.describe() == "PCIe Gen4 x16" and a.lane_gbs == pytest.approx(31.5, abs=0.1)
     assert b.describe() == "PCIe Gen3 x4 (GPU Gen4 x16, slot Gen5)"
     assert gp.parse_links("garbage\n[N/A], x\n") == []
+
+
+def test_prefill_prediction_rereads_the_non_resident_rows_when_the_page_cache_is_short():
+    """The reported 64 GB host: Flash-Next, --pp-size 2, 42G cap. The page cache left per rank is
+    smaller than a rank's non-resident rows, so each chunk reads them all from the disk again."""
+    shape = _flash_next()
+    rows = dd.predict(shape, [42 * GiB, shape.bank_bytes], 2, 61 * GiB)
+    rep = dd.Report()
+    dd._prefill_prediction(rep, rows, 2, shape, fault_gbs=1.0, h2d_gbs=10.0)
+    out = rep.render()
+    short, full = rows
+    assert short.page_cache / 2 < short.cold_bytes / 2
+    cold = short.cold_bytes / 2
+    assert f"{cold / GiB:12.1f}G" in out and f"{cold / 1e9:7.1f}s" in out
+    (finding,) = [text for level, text in rep.findings if level == "warn"]
+    assert "every chunk reads them from the disk again" in finding and "42G" in finding
+    # the whole bank resident: nothing to read, only the transfer
+    assert full.cold_bytes == 0
+
+
+def test_prefill_prediction_without_rates_prints_question_marks():
+    shape = _flash_next()
+    rows = dd.predict(shape, [24 * GiB], 1, 30 * GiB)
+    rep = dd.Report()
+    dd._prefill_prediction(rep, rows, 1, shape, fault_gbs=None, h2d_gbs=None)
+    out = rep.render()
+    assert "not measured: a complete bank file nobody has mapped is needed" in out
+    assert "(not measured: --h2d-seconds)" in out
+    assert rep.findings == []

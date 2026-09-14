@@ -637,6 +637,45 @@ def random_row_read(path: str, row_bytes: int, threads: int, seconds: float) -> 
     return sum(done) / (time.perf_counter() - started) / 1e9
 
 
+def fault_read(path: str, seconds: float, nbytes: int = 1 << 30, piece: int = 32 << 20) -> tuple[float, int]:
+    """(GB/s, bytes) copying a range of ``path`` out of a mapping after dropping it from the page cache.
+
+    The shape of a prefill chunk's unregistered rows: ``_staged_h2d`` copies each layer's rows
+    past the resident prefix out of the bank mapping in file order, 32 MiB at a time, so every
+    miss is a page fault that reads one readahead window and waits for it. The rate follows
+    ``read_ahead_kb`` -- measured on an RTX 2060 host: 1.2 GiB/s at 8192 kB, 0.11 GiB/s with the
+    window off -- which is why it is measured here rather than taken from the O_DIRECT number.
+
+    Takes the range from the second half of the file (the non-resident side) and drops only
+    that range, with POSIX_FADV_DONTNEED, which leaves pages another process has mapped alone.
+    The caller checks that nobody has the file mapped, or the number would be a cache hit.
+    """
+    size = os.path.getsize(path)
+    span = min(nbytes, size // 2) // mmap.PAGESIZE * mmap.PAGESIZE
+    if span < piece:
+        raise OSError(f"{path} is too small to benchmark ({size} bytes)")
+    start = (size - span) // mmap.PAGESIZE * mmap.PAGESIZE
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, start, span, os.POSIX_FADV_DONTNEED)
+        mm = mmap.mmap(fd, span, mmap.MAP_SHARED, mmap.PROT_READ, offset=start)
+    finally:
+        os.close(fd)
+    try:
+        out = bytearray(piece)
+        view = memoryview(out)
+        done = 0
+        began = time.perf_counter()
+        while done < span and time.perf_counter() - began < seconds:
+            m = min(piece, span - done)
+            view[:m] = mm[done:done + m]
+            done += m
+        elapsed = time.perf_counter() - began
+    finally:
+        mm.close()
+    return done / elapsed / 1e9, done
+
+
 # ---------------------------------------------------------------------------------------
 # the startup complaint
 # ---------------------------------------------------------------------------------------

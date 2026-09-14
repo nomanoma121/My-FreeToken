@@ -390,3 +390,16 @@ def test_under_wsl_auto_stays_inside_the_cuda_pin_budget(monkeypatch):
     assert small.total_bytes == int(12 * GiB - 4.5 * GiB - 2 * GiB) and "MemAvailable 12.0" in small.reason()
     monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "12")
     assert dp.auto_bank_ram(mem, 1).total_bytes == 10 * GiB
+
+
+def test_fault_read_copies_through_a_mapping(tmp_path):
+    from freetoken.moe import disk_probe as dp
+
+    f = tmp_path / "bank.ftmb"
+    f.write_bytes(b"\x01" * (80 << 20))
+    gbs, done = dp.fault_read(str(f), seconds=5.0, nbytes=40 << 20, piece=8 << 20)
+    assert done == 40 << 20 and gbs > 0
+    with pytest.raises(OSError, match="too small"):
+        small = tmp_path / "small"
+        small.write_bytes(b"\x00" * 4096)
+        dp.fault_read(str(small), seconds=1.0)
