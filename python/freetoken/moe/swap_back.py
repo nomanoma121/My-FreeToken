@@ -144,5 +144,11 @@ class SelfSwap:
 
 
 def enabled_from_env() -> bool:
-    """``FREETOKEN_REWARM_SWAP=1``: experimental until the 2060/3060 runs in ``guides/33`` §7 decide."""
-    return os.environ.get("FREETOKEN_REWARM_SWAP", "").strip() not in ("", "0")
+    """On with ``--moe-bank-rewarm`` unless ``FREETOKEN_REWARM_SWAP=0``.
+
+    Measured with the server's own anonymous memory pushed to swap and nothing else disturbed (the
+    bank's page cache stayed at 100%): a short prompt after 90 s idle waited +15.9 s on an RTX 2060
+    (Ornith, 2 GiB swapped) and +0.3 s on two RTX 3060s (Flash-Next, 4 GiB) beyond an undisturbed
+    idle; paging it back in during the idle took both to the undisturbed figure. It only reads pages
+    the kernel reports as swapped, so with nothing in swap it costs one read of /proc/self/status."""
+    return os.environ.get("FREETOKEN_REWARM_SWAP", "1").strip() not in ("", "0")

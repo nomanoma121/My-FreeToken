@@ -28,8 +28,8 @@ is opt-in (``--moe-bank-rewarm``).
 
 The same pressure can push the server's own anonymous memory to swap, which the walk does not
 touch. Every walk line reports this process's ``VmSwap`` so a run shows whether that happened,
-and ``FREETOKEN_REWARM_SWAP=1`` also pages it back in after the walk (moe/swap_back.py) --
-experimental until ``guides/33`` §7 has measured whether it is what the remainder is.
+and the thread also pages that swap back in (moe/swap_back.py; ``FREETOKEN_REWARM_SWAP=0``
+turns it off).
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class BankRewarm:
                  max_backoff_s: float = 600.0, swap=None, min_swap_bytes: int = 256 << 20):
         self.banks = banks
         # ``swap``: an object with swapped_bytes() / swap_back(cancel), or None to leave this
-        # process's swap alone. Default: moe.swap_back.SelfSwap when FREETOKEN_REWARM_SWAP=1.
+        # process's swap alone. Default: moe.swap_back.SelfSwap unless FREETOKEN_REWARM_SWAP=0.
         if swap is None and _swap.enabled_from_env():
             swap = _swap.SelfSwap()
         self.swap = swap

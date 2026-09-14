@@ -1,4 +1,4 @@
-"""--moe-bank-rewarm with FREETOKEN_REWARM_SWAP=1: page this process's swap back in while idle.
+"""--moe-bank-rewarm also pages this process's swap back in while idle (FREETOKEN_REWARM_SWAP=0: off).
 
 What is pinned here: only pages the kernel reports as swapped are asked for (a walk over every
 readable mapping would populate the address space CUDA reserves and never uses), a request stops
@@ -199,8 +199,8 @@ def test_busy_interrupts_a_swap_pass():
     assert swap.stopped
 
 
-def test_off_by_default(monkeypatch):
+def test_on_by_default_and_off_with_zero(monkeypatch):
     monkeypatch.delenv("FREETOKEN_REWARM_SWAP", raising=False)
-    assert BankRewarm(_WarmBanks(), delay_s=1.0).swap is None
-    monkeypatch.setenv("FREETOKEN_REWARM_SWAP", "1")
     assert isinstance(BankRewarm(_WarmBanks(), delay_s=1.0).swap, swap_back.SelfSwap)
+    monkeypatch.setenv("FREETOKEN_REWARM_SWAP", "0")
+    assert BankRewarm(_WarmBanks(), delay_s=1.0).swap is None
