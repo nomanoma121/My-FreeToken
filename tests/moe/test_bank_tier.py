@@ -332,3 +332,23 @@ def test_build_tier_refuses_to_create_a_bank_on_a_filesystem_that_cannot_hold_on
     asked.clear()
     build_tier(_config(tmp_path), _Method(), log=lambda _m: None)
     assert asked == []
+
+
+def test_without_a_histogram_only_layers_the_file_lacks_are_warned_about(tmp_path, _no_register):
+    """Seen on the 3060s: a file holding all 48 layers in a histogram's order still drew "an arbitrary
+    resident slice" on every start without the flag, which the docs tell you to leave off by then."""
+    from freetoken.moe.bank_tier import build_tier
+
+    os.makedirs(tmp_path / "model")
+    infos, warns = [], []
+    build_tier(_config(tmp_path), _Method(), log=infos.append, warn=warns.append)
+    assert any("not in the bank file yet" in w for w in warns)
+
+    os.makedirs(tmp_path / "bankmap", exist_ok=True)
+    tier = _tier(tmp_path / "bankmap" / "bank.ftmb", range(L))
+    _serve(tier)
+    tier.banks.close()
+    infos, warns = [], []
+    build_tier(_config(tmp_path), _Method(), log=infos.append, warn=warns.append)
+    assert not any("moe-bank-stats" in w for w in warns), warns
+    assert any("keep the order already in" in line for line in infos), infos

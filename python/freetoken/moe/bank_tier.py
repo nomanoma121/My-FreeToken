@@ -15,6 +15,34 @@ from .bank_pack import bank_path_for, checkpoint_identity, method_meta, read_pac
 from .mapped_bank import MappedTier, _ranges
 
 
+def _say_order_without_stats(path, layers, log, warn) -> None:
+    """Without --moe-bank-stats a layer keeps the order the bank file holds, and only a layer the file
+    lacks gets checkpoint order. Warning on every start was wrong once a histogram had been applied
+    (the docs say to leave the flag off after that): seen on the 3060s, whose file held all 48 layers
+    in the order of three sessions' histograms."""
+    from .bank_file import BankFile
+
+    present: set[int] = set()
+    if os.path.exists(path):
+        try:
+            with BankFile.open(path, writable=False) as bf:
+                present = set(bf.present_layers())
+        except Exception:  # noqa: BLE001 -- unreadable or foreign: the start reports it properly later
+            present = set()
+    missing = [layer for layer in layers if layer not in present]
+    if not missing:
+        log(
+            f"--moe-bank-ram without --moe-bank-stats: layers {_ranges(layers)} keep the order already in "
+            f"{path} (the histograms it was last written or reordered with)"
+        )
+        return
+    warn(
+        f"--moe-bank-ram without --moe-bank-stats: layers {_ranges(missing)} are not in the bank file yet "
+        "and will be written in checkpoint order -- an arbitrary resident slice. Collect a histogram with "
+        "--moe-stats-out --disable-cuda-graph first, or pass one now."
+    )
+
+
 def build_tier(config, method, *, pp=None, log=print, warn=None):
     """``config``: the engine config (``model_path``, ``model_config``, ``full_model_config``,
     ``moe_bank_ram`` / ``_stats`` / ``_dir``, ``tp_info``). ``method``: the bound offload expert
@@ -100,12 +128,7 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
         elif len(covered) < len(layers):
             warn(f"--moe-bank-stats: no histogram for layers {_ranges(set(layers) - set(covered))}; they keep checkpoint order")
         wanted = bank_disk.plan_placement(layers, num_experts, hot, freq).order
-    elif packed is None:
-        warn(
-            "--moe-bank-ram without --moe-bank-stats: layers already in the bank file keep the order "
-            "they were written in, new ones take checkpoint order -- an arbitrary resident slice. "
-            "Collect a histogram with --moe-stats-out --disable-cuda-graph first."
-        )
+    no_stats = wanted is None and packed is None
 
     layout, meta = None, {}
     if method is not None and not resident_specs:
@@ -144,6 +167,8 @@ def build_tier(config, method, *, pp=None, log=print, warn=None):
 
         for line in disk_probe.storage_warnings(os.path.dirname(os.path.abspath(path))):
             warn(line)
+    if no_stats:
+        _say_order_without_stats(path, layers, log, warn)
     old = bank_disk.legacy_bank_files(os.path.dirname(path))
     if old:
         gib = sum(os.path.getsize(p) for p in old) / 2**30
