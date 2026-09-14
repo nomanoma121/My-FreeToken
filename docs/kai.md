@@ -72,9 +72,10 @@ The fork adds nine things upstream does not have:
    bank crosses the bus fewer times per prompt (a 20k-token prompt: 490 → 722 tok/s on a 2060,
    437 → 546 on two 3060s). See [prefill-chunk.md](prefill-chunk.md).
 
-Experimental, and **not yet measured on a GPU**: `--prefix-disk-cache DIR` keeps the prefix
-cache of a hybrid GDN model on disk, so a long prompt the in-memory cache has let go of -- or
-one sent before a restart -- is read back instead of prefilled again. It is aimed at
+Experimental: `--prefix-disk-cache DIR` keeps the prefix cache of a hybrid GDN model on disk,
+so a long prompt the in-memory cache has let go of -- or one sent before a restart -- is read back
+instead of prefilled again (an 8k-token prompt on an RTX 2060: 1.2-1.3 s from disk, 13-14 s to
+prefill). It is aimed at
 `--moe-bank-ram` machines, where a 4096-token prefill chunk of Flash-Next takes 10-45 s. See
 [prefix-reuse.md](prefix-reuse.md#keeping-prefixes-on-disk---prefix-disk-cache).
 

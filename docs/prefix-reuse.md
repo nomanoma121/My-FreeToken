@@ -74,8 +74,16 @@ The decode log prints the pool as `#mamba-slot: used/total`, and each prefill pr
 
 ## Keeping prefixes on disk (`--prefix-disk-cache`)
 
-> **Experimental. The logic is covered by CPU tests; it has not yet been run on a GPU**, so
-> there are no speed numbers here yet and the flag may still change.
+> **Experimental**: measured on one GPU and one model so far (an RTX 2060 with Ornith), and the
+> flag may still change.
+>
+> An 8,097-token prompt, time to first token: 13.0-14.1 s prefilled, 0.99 s from the in-memory
+> cache, **1.24-1.28 s from disk** after the cache had let it go (about 0.2 s reading, 0.1 s copying
+> to the GPU), 1.7-2.1 s from disk right after a restart. A marker planted at the start of the
+> prompt was answered correctly on all three paths, the reply text matched the in-memory hit's, and
+> `--spec-mtp` accepted as many draft tokens per step either way. A read that takes longer than
+> the prefill it saves (about 1 s plus the prefix at 2000 tokens a second) is abandoned and the
+> prompt is prefilled.
 
 Raising the ratio buys conversations with VRAM. The other way is to keep what the cache lets go
 of on disk:

@@ -79,8 +79,11 @@ a file holds.
 Files written by builds before this one (`bank.rank0of2.ftmb`, ...) are not read. The first start
 writes `bank.ftmb` and warns with the old files' names and size; delete them.
 
-This file layout is covered by CPU tests only so far; the measurements further down were taken
-with the per-rank files of the earlier builds.
+This layout has run on an RTX 2060 (Ornith: first start, a restart that read no expert tensor,
+a new budget and a new histogram, all serving the same text at temperature 0 as the per-rank files)
+and on two RTX 3060s (Flash-Next, `--pp-size 2`: both ranks wrote their halves of one 63.4 GiB file
+at once, and a later start with `--pp-layers 25` and a different budget wrote nothing). Most of the
+measurements further down were taken with the per-rank files of the earlier builds.
 
 ### The GPU never sees a row it cannot address
 
@@ -248,8 +251,9 @@ applied, later starts can leave `--moe-bank-stats` off. `--moe-bank-dir` moves t
 **Builds before this one placed rank 1 by rank 0's histograms.** The placement was keyed by each
 rank's own layer index (0-23 on both ranks of Flash-Next) while the histograms were keyed by the
 model's (rank 1's are 24-47), so rank 1 sorted its experts by the routing of layers 0-23. Every
-`--pp-size 2` figure below was measured that way; how much a correct rank 1 changes them has not
-been measured.
+`--pp-size 2` figure below was measured that way. Measured against the fix on the two RTX 3060s
+(64 GB-equivalent, 2500 tokens, A B A B), it did not make decode faster: the client saw 21.0 tok/s
+either way. The page cache holds most of what a poor placement sends to disk.
 
 ### 3. Set the device readahead
 
@@ -346,10 +350,25 @@ CPU executor, which touches expert rows out of order: 4 KiB random faults.
 
 The flag does not bring the warm figures all the way back. Part of what is left on the long
 prompts is the server's own memory: the pressure before those runs also pushed 2.4 GiB (2060)
-and 4.7 GiB (3060) of it into swap, and this flag only deals with the bank's page cache. The
-2-3 s left on the short prompts had almost no swap behind it and is not explained.
-Each pass's line now ends with the rank's own swap (`; this process has N.NN GiB in swap`), so a
-log shows whether the pressure that emptied the cache also reached the server itself.
+and 4.7 GiB (3060) of it into swap.
+
+So the same idle thread now also pages the rank's own swap back in, once the bank is back (or when
+the bank never left) and there is at least 256 MiB of it -- only the pages the kernel reports as
+swapped, never the address space around them. Each pass's line ends with the rank's swap, and a
+second line says what was paged back. `FREETOKEN_REWARM_SWAP=0` turns that part off. Measured by
+pushing only the server's anonymous memory to swap (`process_madvise(MADV_PAGEOUT)`), with the
+bank's page cache left at 100%, then idling 90 s before a short prompt:
+
+| | undisturbed idle | server memory in swap | swap, paged back while idle |
+|---|---|---|---|
+| RTX 2060, Ornith (2 GiB swapped) | +0.2 s | **+15.9 s**, decode 10 tok/s | +0.0 s |
+| 2x RTX 3060, Flash-Next (4 GiB swapped) | +1.4 s | +1.7 s | +1.4 s |
+
+How much swap costs depends on which pages went out; paging them back removed it on both. Two
+things are left: the other processes of the server (the frontend and the tokenizer, about 1 GiB
+between them) keep their swap, which a long prompt then waits on; and on the 3060s a short prompt
+after 90 s idle is 1.4 s slower than one sent right away with nothing disturbed at all -- neither
+disk nor swap, not explained yet.
 
 It is off by default because it reads the disk while nothing is running: 7.7 GiB per rank took
 1-12 s per pass on the Gen4 NVMe above. 5 s is the only delay that was measured. How fast
@@ -472,8 +491,18 @@ for particular rows, made per layer from the routing, and it does not depend on 
 
 What is known and what is not:
 
-- It has **not been measured end to end** yet -- no decode figure with and without it. The flag
-  is off by default until it has.
+- Measured, off/on/off/on, 2000 tokens each:
+
+  | | TTFT | tok/s, whole run | first 300 | last 300 | p99 gap |
+  |---|---|---|---|---|---|
+  | 2x RTX 3060, Flash-Next, `--moe-bank-ram 48G`, 40 GiB held (page cache short) | 9.1 → **5.2 s** | 23.9 → **25.7** | 14.0 → 15.7 | 36.6 → 37.8 | 220 → 188 ms |
+  | RTX 2060, Ornith, `--moe-bank-ram 6G`, cold rows paged out, RAM to spare | 10.0 / 5.8 → **2.0 s** | 33.4 → 29.8 | 30.1 → 26.4 | 37.4 → 30.9 | same |
+
+  Where the page cache cannot hold the non-resident rows -- the machines this is for -- it helps
+  everywhere. Where it can, the fault path's readahead fills the cache with the neighbouring rows
+  too and later tokens find them there; asking for exactly the routed rows gives that up, and decode
+  once warm was slower. That is why it stays off by default: turn it on for a host whose RAM is
+  short of the bank.
 - It needs a CPU executor reading the mapped file (`--moe-strategy cpu` or `hybrid`), Linux, and
   a `--moe-bank-ram` that actually split. The startup log says how many file-backed blocks it
   took; otherwise it says why it has nothing to do.
@@ -553,9 +582,11 @@ were worth about a factor of two, and should not have been quoted as if they wer
 
 ## Limits and caveats
 
-- **Prefill is 2-7x slower.** Each chunk still streams every expert of every layer, and the
-  quarter that is not registered goes through a pinned bounce buffer at about 1.7 GB/s. Three
-  quarters of it overlaps the previous layer's GEMMs; the rest does not.
+- **Prefill is slower.** Each chunk still streams every expert of every layer, and the quarter
+  that is not registered goes through a pinned bounce buffer. The 2-7x first measured here predates
+  the chunk work in [prefill-chunk.md](prefill-chunk.md): on the two RTX 3060s a 19.9k-token prompt
+  took 68.3 s at 64 GB-equivalent against 56.5 s with the same flag and all of the RAM, and
+  `--prefill-mixer-pieces 2` took those to 52.7 s and 45.0 s.
 - **Disk space.** The bank file is a second copy of the experts -- 63.4 GiB for Flash-Next, on
   top of a checkpoint whose other large part is 47.7 GiB of PLE -- until `ft bank pack` removes
   them from the checkpoint (section 5). The PLE is not copied: `--ple-backend disk` reads its rows
