@@ -165,6 +165,9 @@ class OffloadMoeCache:
         # device-addressable; the rest are host pages the GPU has no address for. None means
         # the usual all-or-nothing residency.
         self.prefix_pinned_rows: int | None = None
+        # --moe-bank-ram: reads a prefill's non-resident rows with parallel direct reads instead
+        # of faulting them in through the mapping (moe/bank_reader.py); None elsewhere
+        self.bank_reader = None
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -1125,6 +1128,9 @@ class OffloadMoeCache:
         ):
             dst.copy_(src)
             return
+        prof = _prefill_profile()
+        if self.bank_reader is not None and self.bank_reader.h2d(dst, src, prof):
+            return
         d = dst.reshape(-1).view(torch.uint8)
         s = src.reshape(-1).view(torch.uint8)
         assert d.numel() == s.numel(), (dst.shape, src.shape, dst.dtype, src.dtype)
@@ -1133,7 +1139,6 @@ class OffloadMoeCache:
         n = d.numel()
         off = 0
         i = 0
-        prof = _prefill_profile()
         while off < n:
             m = min(size, n - off)
             stage = bufs[i][:m]

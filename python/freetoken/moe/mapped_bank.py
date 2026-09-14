@@ -909,6 +909,15 @@ class MappedTier:
         cache.expert_perm = perm
         if self.banks is None:
             return
+        if self.banks.cold_spans and os.environ.get("FREETOKEN_BANK_PREAD", "1").strip() != "0":
+            try:
+                from freetoken.moe.bank_reader import BankReader
+
+                cache.bank_reader = BankReader(self.banks)
+                self.log(f"--moe-bank-ram: prefill reads the non-resident rows directly "
+                         f"({cache.bank_reader.describe()})")
+            except Exception as exc:  # noqa: BLE001 -- the mapping copy still works
+                self.log(f"--moe-bank-ram: direct prefill reads unavailable ({exc}); page faults as before")
         if self.banks.fully_registered:
             # Only rows [0, hot) are cudaHostRegistered; the rest is host memory the device
             # has no address for, and a GPU fetch of one is an illegal access inside the
