@@ -563,10 +563,12 @@ def parse_args(
 
     parser.add_argument(
         "--mm-encoder-weights",
-        choices=["gpu", "host"],
+        choices=["gpu", "host", "cpu"],
         default=MultimodalConfig.encoder_weights,
         help="Encoder tower block weights: pinned host banks streamed two blocks at a time behind the "
-        "compute (default, about 60 MiB of VRAM instead of the whole tower), or resident on the GPU.",
+        "compute (default, about 60 MiB of VRAM instead of the whole tower), or resident on the GPU. "
+        "cpu: the vision tower runs on the CPU in the tokenizer worker (no VRAM and no pinned memory, "
+        "a few seconds per image; the Qwen3.5/3.6 and Qwen3.8-Flash-Next towers).",
     )
 
     parser.add_argument(

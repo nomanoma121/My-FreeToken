@@ -55,6 +55,22 @@ def test_only_the_first_pipeline_rank_builds_the_tower(monkeypatch):
     assert later.model_config.rotary_config == first.model_config.rotary_config
 
 
+def test_a_cpu_tower_gathers_on_the_engine_but_builds_nothing_there(monkeypatch):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.mm.config import MultimodalConfig
+
+    make = _engine_config(monkeypatch)
+    cpu = make(tp_info=DistributedInfo(0, 1), mm=MultimodalConfig(encoder_weights="cpu"))
+    gpu = make(tp_info=DistributedInfo(0, 1))
+    # the tokenizer worker encodes; the engine still admits images and gathers their rows
+    assert cpu.served_modalities == {"image"} and cpu.encodes_here
+    assert not cpu.builds_tower and gpu.builds_tower
+    assert cpu.model_config.vision_config is None and gpu.model_config.vision_config is not None
+    assert cpu.model_config.rotary_config == gpu.model_config.rotary_config
+    later = make(tp_info=DistributedInfo(1, 2), parallel="pp", mm=MultimodalConfig(encoder_weights="cpu"))
+    assert not later.encodes_here and not later.builds_tower
+
+
 def test_text_model_only_encodes_nowhere(monkeypatch):
     from freetoken.distributed import DistributedInfo
     from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig

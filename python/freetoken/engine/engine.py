@@ -647,7 +647,7 @@ class Engine:
             )
         self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
-        if config.encodes_here:
+        if config.builds_tower:
             from freetoken.models.blocks import SupportsMultimodal
 
             if not isinstance(self.model, SupportsMultimodal):
@@ -698,7 +698,8 @@ class Engine:
                 f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
                 f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
             )
-            self._warmup_encoders()
+            if config.builds_tower:
+                self._warmup_encoders()
         elif any(getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS):
             logger.info_rank0(
                 "Multimodal disabled: --text-model-only"
@@ -1000,7 +1001,7 @@ class Engine:
             self.device,
             include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
             include_mtp=has_mtp,
-            include_vision=config.encodes_here,
+            include_vision=config.builds_tower,
         )
         remap = getattr(self.model, "remap_loaded_weight", None)
         if remap is not None:
@@ -1122,6 +1123,11 @@ class Engine:
             if not cache.has(item.hash):
                 if item.precomputed_embeddings is not None:
                     emb = item.precomputed_embeddings.to(self.device, non_blocking=True)
+                elif not getattr(getattr(self, "config", None), "builds_tower", True):
+                    raise RuntimeError(
+                        "--mm-encoder-weights cpu: an image arrived without its embeddings (the "
+                        "tokenizer worker encodes them; this engine builds no tower)"
+                    )
                 else:
                     emb = self.model.encode(item)
                 cache.put(item.hash, emb)

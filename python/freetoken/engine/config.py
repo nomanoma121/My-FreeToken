@@ -255,6 +255,13 @@ class EngineConfig:
         return bool(self.active_encoders) and self.pp_is_first
 
     @property
+    def builds_tower(self) -> bool:
+        """This process builds, loads and runs the encoder towers on the GPU: the encoding rank,
+        unless ``--mm-encoder-weights cpu`` moved the tower to the tokenizer worker (the items then
+        arrive with their embeddings, and this rank only gathers them)."""
+        return self.encodes_here and self.mm.encoder_weights != "cpu"
+
+    @property
     def pp_is_last(self) -> bool:
         """This process owns the head (the last pipeline rank, or the only process)."""
         return (not self.is_pp) or self.tp_info.rank == self.tp_info.size - 1
@@ -275,8 +282,8 @@ class EngineConfig:
             config = window_model_config(config, start, end, extra_full_layer=mtp_layer)
         if self.host_embedding and self.pp_is_first:
             config = replace(config, embed_host=True)
-        if config.vision_config is not None and not self.encodes_here:
-            # a later pipeline rank builds no tower; the rope sections parsed from it stay
+        if config.vision_config is not None and not self.builds_tower:
+            # a later pipeline rank, or a CPU tower, builds none; the rope sections parsed from it stay
             config = replace(config, vision_config=None)
         return config
 

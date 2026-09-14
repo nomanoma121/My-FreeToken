@@ -17,8 +17,9 @@ class MultimodalConfig:
     disabled_encoders: frozenset[str] = frozenset()
     # Where encoded items wait between prefill chunks. "cpu": pinned host memory, "cuda": the device.
     embed_cache_device: Literal["cpu", "cuda"] = "cpu"
-    # Encoder tower block weights. "host": pinned host banks streamed two blocks at a time behind the compute, "gpu": resident.
-    encoder_weights: Literal["gpu", "host"] = "host"
+    # Encoder tower block weights. "host": pinned host banks streamed two blocks at a time behind the compute, "gpu": resident,
+    # "cpu": the tower runs on the CPU in the tokenizer worker and the engine builds none (mm/cpu_tower.py).
+    encoder_weights: Literal["gpu", "host", "cpu"] = "host"
     # per-image token budget; the family's MMProcessor converts it to its image processor's own limits, None keeps the checkpoint defaults
     image_min_tokens: int | None = None
     image_max_tokens: int | None = None

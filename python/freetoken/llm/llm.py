@@ -43,6 +43,11 @@ class LLM(Scheduler):
         from freetoken.mm.processor import get_mm_processor
 
         self._mm_processor = get_mm_processor(model_path, config.mm)
+        self._image_encoder = None
+        if self._mm_processor is not None and config.mm.encoder_weights == "cpu":
+            from freetoken.mm.cpu_tower import CpuImageEncoder
+
+            self._image_encoder = CpuImageEncoder.for_checkpoint(model_path)
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
         if isinstance(prompt, str):
@@ -64,6 +69,8 @@ class LLM(Scheduler):
                 if self._mm_processor is None:
                     raise ValueError("image input is not supported for this model")
                 r = self._mm_processor.apply(input_ids, images)
+                if self._image_encoder is not None:
+                    self._image_encoder.encode_items(r.mm_items)
                 input_ids = r.input_ids
                 msg = UserMsg(
                     uid=0,

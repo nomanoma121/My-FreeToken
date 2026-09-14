@@ -85,8 +85,11 @@ def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
+    image_encoder: Any = None,
 ) -> tuple[List[UserMsg], List[UserReply]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
+    ``image_encoder`` (--mm-encoder-weights cpu) replaces each image's features with its
+    embeddings; a failure there is that request's error, like a tokenization failure.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
@@ -96,6 +99,8 @@ def _tokenize_requests(
     for msg in messages:
         try:
             user_msg = tokenize_manager.tokenize([msg])[0]
+            if image_encoder is not None and user_msg.mm_items:
+                image_encoder.encode_items(user_msg.mm_items)
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -149,7 +154,13 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
+    mm_processor = get_mm_processor(tokenizer_path, mm)
+    tokenize_manager = TokenizeManager(tokenizer, mm_processor)
+    image_encoder = None
+    if mm_processor is not None and mm is not None and mm.encoder_weights == "cpu":
+        from freetoken.mm.cpu_tower import CpuImageEncoder
+
+        image_encoder = CpuImageEncoder.for_checkpoint(tokenizer_path)
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -247,7 +258,7 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                backend, errors = _tokenize_requests(tokenize_manager, tokenize_msg, logger)
+                backend, errors = _tokenize_requests(tokenize_manager, tokenize_msg, logger, image_encoder)
                 if errors:
                     send_frontend.put(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
