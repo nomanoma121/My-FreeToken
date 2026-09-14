@@ -213,6 +213,8 @@ class Fixture:
         req.cached_len, req.device_len, req.extend_len = req.device_len, req.device_len + 1, 1
 
     def batch(self, reqs, phase: str) -> SimpleNamespace:
+        # get_attn_positions reads the batch it is called on, as Batch's method does: a copy of the
+        # batch with other positions (a --prefill-mixer-pieces piece) must rope at its own
         positions = torch.cat(
             [
                 torch.arange(r.cached_len, r.device_len, dtype=torch.int32, device=self.device)
@@ -222,7 +224,7 @@ class Fixture:
         out_loc = torch.cat(
             [self.page_table[r.table_idx, r.cached_len : r.device_len] for r in reqs]
         ).contiguous()
-        batch = SimpleNamespace(
+        batch = _FixtureBatch(
             reqs=reqs,
             padded_reqs=reqs,
             phase=phase,
@@ -231,7 +233,7 @@ class Fixture:
             is_prefill=phase == "prefill",
             is_decode=phase == "decode",
             positions=positions,
-            get_attn_positions=lambda: positions,
+            mrope_positions=None,
             mm_embeds=None,
             out_loc=out_loc,
             attn_metadata=None,
@@ -241,6 +243,11 @@ class Fixture:
         )
         self.backend.prepare_metadata(batch)
         return batch
+
+
+class _FixtureBatch(SimpleNamespace):
+    def get_attn_positions(self) -> torch.Tensor:
+        return self.mrope_positions if self.mrope_positions is not None else self.positions
 
 
 def selection_spy(monkeypatch, backend) -> dict:

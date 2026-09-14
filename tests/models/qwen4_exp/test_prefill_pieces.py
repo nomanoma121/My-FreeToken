@@ -72,6 +72,59 @@ def test_qsa_layer_in_pieces_equals_whole(n):
     assert torch.equal(got, whole)
 
 
+
+def _mrope_config():
+    """The toy geometry with vision served: 3-axis rope on the QSA layer (rotary_dim 64 = sections 11/11/10)."""
+    from types import SimpleNamespace
+
+    from freetoken.models.qwen4_exp.config import parse_config
+
+    from .common import hf_config
+
+    hf = hf_config(rope_parameters={
+        "rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25,
+        "mrope_interleaved": True, "mrope_section": [11, 11, 10],
+    })
+    hf.vision_config = SimpleNamespace(
+        hidden_size=64, depth=1, num_heads=4, intermediate_size=128, patch_size=16, temporal_patch_size=2,
+        spatial_merge_size=2, num_position_embeddings=16, out_hidden_size=256, in_channels=3,
+        deepstack_visual_indexes=[],
+    )
+    hf.image_token_id = 7
+    config = parse_config(hf)
+    assert config.model_is_mrope
+    return config
+
+
+@requires_cuda
+@pytest.mark.parametrize("n", [2, 3])
+def test_qsa_layer_in_pieces_equals_whole_under_mrope(n):
+    """An image prompt's rows rope at [t, h, w] positions that are not the sequence index; each
+    piece has to rope at its own columns, and the compressed keys at their groups' first tokens --
+    which, for a group a piece continues, an earlier piece wrote."""
+    config = _mrope_config()
+    fixture = Fixture(config, num_pages=512)
+    attn = fixture.layer(QSA_LAYER)
+    x = torch.randn(LENGTH, config.hidden_size, device=fixture.device, dtype=fixture.dtype) * 0.5
+    seq = torch.arange(LENGTH, dtype=torch.int32, device=fixture.device)
+    # an "image" of 40 x 30 rows starting at 500, then text at the shifted position
+    mrope = torch.stack([seq, seq, seq])
+    img = slice(500, 500 + 1200)
+    grid = torch.arange(1200, device=fixture.device)
+    mrope[0, img], mrope[1, img], mrope[2, img] = 500, 500 + grid // 30, 500 + grid % 30
+    mrope[:, 1700:] = seq[1700:] - 1200 + 40
+
+    whole_batch = _prefill_batch(fixture, 1, LENGTH)
+    whole_batch.mrope_positions = mrope
+    with fixture.ctx.forward_batch(whole_batch):
+        whole = attn.forward(x, whole_batch)
+
+    batch = _prefill_batch(fixture, 2, LENGTH)
+    batch.mrope_positions = mrope
+    with fixture.ctx.forward_batch(batch):
+        got = _pieced(fixture, batch, n, None, lambda s, e, piece: attn.forward(x[s:e], piece))
+    assert torch.equal(got, whole)
+
 def _gdn_layer(config, fixture):
     from freetoken.models.qwen4_exp.model import build_linear_mixer
     from freetoken.utils.torch_utils import torch_dtype
