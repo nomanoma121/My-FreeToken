@@ -603,6 +603,42 @@ ft serve --model ~/models/qwen38-flash-next-nvfp4 \
   (`required_bandwidth = target_tok/s × miss_rate × expert_bytes` 形式の
   見積り) は今回実施していない — 次回セッションで着手する価値あり
 
+## 【訂正】前回の「offloadはCPU計算でmissを解決する」という分析は誤り (2026-09-15)
+
+下の診断セクションで「`fetched_per_layer=0.0` だから offload は PCIe fetch を
+使わずCPU計算でmissを解決している」と結論したが、これは統計フィールドの
+アーティファクトを誤読した分析ミスだった。
+
+`python/freetoken/moe/offload_cache.py` を直接確認: `record_decode_stats`
+(plain "offload" 用) は **no-op** で `stat_fetched` を一切更新しない
+(コメント: "ensure_experts accumulates into lru_stats inside its own launch")。
+`stat_fetched` を実際に書き込むのは `record_decode_stats_hybrid` だけであり、
+これは hybrid戦略専用の計測。つまり `decode_miss_stats()` が返す
+`fetched_per_layer`/`cpu_per_layer` は **offload戦略では意味を持たない
+(常に0/missingと表示される)アーティファクト** であり、実際にoffload戦略が
+CPU計算でmissを解決している証拠にはならない。
+
+`ensure_experts` (offload用, `offload_kernels.py:19`) は `lru_ensure` を呼び、
+missした全experts分のスロットを確保して`copy_missing`用の`src_indices`等を
+セットする実装になっており、**offloadは元のドキュメント通り、missを常に
+PCIe fetch(GPU転送)で解決している** (CPU計算にフォールバックする分岐は無い)。
+
+**訂正後の結論**: PCIe帯域は引き続き重要な要因である。GPU1(速い25.8GB/s)に
+より多くの層を割り当てる非対称分割(`--pp-layers 30`)は、rank0(GPU1)が
+higher miss率(23.2%)を持つ代わりに速いPCIeで安く解決でき、rank1(GPU0)は
+遅いPCIeの代わりに低いmiss率(6.2%)で済む、という理にかなったトレードオフに
+なっていた可能性が高い。実際、per-step実効fetch時間を概算すると
+(1 expert ≈ 2.64MB):
+- rank0: 2.32/layer × 30層 ≈ 69.6 experts/step × 2.64MB ÷ 25.8GB/s ≈ 7.1ms/step
+- rank1: 0.62/layer × 18層 ≈ 11.2 experts/step × 2.64MB ÷ 6.2GB/s ≈ 4.8ms/step
+
+合計約12ms/step。実測ステップ時間(~25tok/s→40ms/step)の約30%がPCIe fetch、
+残り約70%がGPU計算(GEMM/attention/GDN等)とオーバーヘッドと推定される。
+`--pp-layers`によるさらなるチューニングが26/30/34で頭打ちだったのは、
+両rankの「miss率×fetch単価」がこの範囲で既にほぼバランスしていたためと
+考えられる。cache eviction policy改善(LRU→locality-aware)が依然として
+最有力の次の一手であるという結論自体は変わらない。
+
 ## 診断: `--moe-collect-stats` で実際のキャッシュmiss率を計測 (2026-09-15)
 
 `--moe-stats-out <path> --disable-cuda-graph` を付けて起動し(CUDA graph無効化は
