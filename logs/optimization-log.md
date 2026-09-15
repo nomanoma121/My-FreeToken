@@ -1103,6 +1103,96 @@ sched-k (13層) は独自の間隔で選んだ配置だったため、「13層�
 頑健な結果**であると結論づけられる。sched-h (12層) を per-layer top-k
 スケジュール探索の最終確定版とする。
 
+## FreeToken本体を改造その2: --spec-mtpのチェックポイント読み込みバグを修正 (2026-09-15)
+
+以前のセッションログに「spec-mtp blocked by checkpoint」(チェックポイントに
+MTPの重みがないため利用不可) という記述があったが、これを鵜呑みにせず
+`model.safetensors.index.json`を直接確認したところ、**`mtp.layers.0.mlp.
+experts.{0..511}.*`の重みは512エキスパート全て実在していた**ことが判明。
+「ない」のではなく、FreeToken側の読み込みコードが対応していない
+フォーマットだった。
+
+### 根本原因 (2つ)
+
+1. `python/freetoken/models/qwen4_exp/weight.py`の`_rename()`が使う
+   `_EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")`は`model.language_model.`
+   というプレフィックスを要求しない緩い正規表現で、本来メインモデルの
+   ルーティングエキスパート (別経路の`nvfp4_expert_sources`で読む) だけを
+   弾くつもりが、`mtp.layers.0.mlp.experts.0.gate_proj.weight`のような
+   MTPの個別エキスパートも巻き込んで無条件にドロップしていた。
+2. `python/freetoken/engine/engine.py`の`_capture_mtp_experts`/
+   `_quantize_mtp_experts`は、MTPエキスパートが**事前にfuse・stackされた
+   単一のbf16テンソル**(`mtp.layers.0.mlp.experts.{gate_up_proj,down_proj}`)
+   として来ることを前提にしていた。しかし実際のチェックポイントは
+   メインモデルのルーティングエキスパートと同じ「per-expert, unfuse」形式で、
+   しかも量子化方式もNVFP4ではなく**128x128ブロックFP8**
+   (`weight` + `weight_scale_inv`、DeepSeek-V3方式) だった。
+
+### 修正内容
+
+- `qwen4_exp/weight.py`: 新しい正規表現`_MTP_EXPERT_UNFUSED_RE`でMTPの
+  個別エキスパートキーを`_rename`/`_DenseFuser`に触れさせる前に横取りし、
+  生のテンソルのままyieldするよう変更 (`--spec-mtp`が有効な時のみ)。
+- `engine.py`: `_capture_mtp_experts`を拡張し、新形式のキーを
+  `(expert_id, proj, kind)`単位でバッファする`self._mtp_raw_unfused`を追加。
+  新設した`_fuse_mtp_experts_unfused()`が、既存の`dequant_block_fp8`
+  ヘルパー (dense fp8投影のブロックFP8デコードで既に使われている同じ
+  128x128ブロック規約) で各エキスパートのgate_proj/up_proj/down_projを
+  bf16へ逆量子化し、gate+upを結合、512エキスパート分をstackして、
+  既存の`_quantize_mtp_experts`が期待するbf16の`{gate_up_proj, down_proj}`
+  形状に変換する。**既存のbf16→NVFP4量子化パス自体は無改造**で、
+  「取り込み」の欠落部分だけを補った。
+
+### 動作確認
+
+起動ログに`MTP draft head: 512-expert layer quantized to NVFP4
+(1354 MB pinned)`と出力され、正常に量子化・キャッシュへの追加まで完走。
+算数チェック(17×24=408)も`--spec-mtp 1`有効時に正解を維持。
+
+投機的デコードの性質上、ドラフト側 (MTPヘッド) の品質が多少不正確でも、
+最終出力は検証パス (本体モデルによる棄却サンプリング) が保証するため、
+このデコード処理自体が誤っていても「最終出力が壊れる」方向のリスクは
+なく、「ドラフト採択率が下がって高速化しない」方向のリスクに留まる、
+という安全性の性質を踏まえて実装・検証した。
+
+### 実測: 採択率は良好だが、正味では遅くなる (負の結果)
+
+sched-h (12層top-k=2) 構成に`--spec-mtp 1`を追加、CUDA graph化に必要な
+VRAM余裕を確保するため`--memory-ratio 0.88`に調整 (0.95のままだと
+verify-windowのCUDA graphがVRAM不足でeager実行にフォールバックし、
+さらに遅くなることを確認済み)。
+
+| 構成 | decode tok/s (prose/code) | accepted/step | step time |
+|---|---|---|---|
+| sched-h (spec-mtp無し, 参考) | 37.49-37.79 / 37.46-38.40 | - | ~27ms |
+| sched-h + spec-mtp (eager, mr=0.95) | 22.10 / 23.10 | - | eager実行で更に遅い |
+| sched-h + spec-mtp (CUDA graph化, mr=0.88) | 28.36 / 30.71 | **1.55-1.88 / 2.0 (78-94%)** | ~54-90ms |
+| top-k=10 (元の設定, 参考) | 24.45 / 24.88 | - | ~41ms |
+| top-k=10 + spec-mtp (CUDA graph化, mr=0.88) | 19.49 / 19.69 | **1.55-1.88 / 2.0** | ~78-90ms |
+
+採択率自体は78-94%と非常に良好 (MTPヘッドの品質は健全) にも関わらず、
+**どちらの土台 (top-k=10でもsched-hでも) でも正味では遅くなった**。
+
+### 原因分析: このハードウェアはPCIe/キャッシュミス律速で、投機的デコードの前提が成立しない
+
+投機的デコードが速くなる前提は「K個のトークン候補をまとめて検証する
+コストが、1トークンだけ生成するコストとほぼ同じ」(主に重み読み込みが
+メモリ帯域律速で、K個の検証がその重み読み込みを使い回せるから)。
+しかし本構成 (`--moe-strategy offload`, RTX 3060 x2) は512-way MoEの
+ルーティングエキスパートをPCIe越しにフェッチするキャッシュミス律速で
+動いている。検証ウィンドウの2トークン候補は異なるexpertの組み合わせに
+ルーティングされる可能性が高く、1トークンだけ生成する場合よりも
+ユニークなexpertフェッチ数が2倍近くに増えてしまう。結果、
+「verify 1step ≈ 通常のdecode 1stepとほぼ同コスト」という投機的デコードの
+コアな前提が成立せず、実測のstep timeは通常の約2倍 (27ms→54-90ms) に
+悪化。accepted/stepが2.0に近い高い採択率でも、コスト側の悪化がそれを
+上回ってしまい、正味で遅くなる。
+
+**結論: `--spec-mtp`のバグ修正自体はFreeToken本体への正当な貢献として
+維持するが (他のハードウェア/構成では有効な可能性がある)、この
+RTX 3060 x2 + offload-cache構成では採用しない。** sched-h
+(12層top-k=2、spec-mtp無し、37-38 tok/s) が引き続き最終推奨。
+
 (下の表は一律top-k=3までの時点のまとめ。この後前掲の「FreeToken本体を
 改造: per-layer top-kスケジュール」セクションでsched-dによりさらに
 更新されたので、最終結論はそちらを参照)
