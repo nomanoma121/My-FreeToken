@@ -603,6 +603,53 @@ ft serve --model ~/models/qwen38-flash-next-nvfp4 \
   (`required_bandwidth = target_tok/s × miss_rate × expert_bytes` 形式の
   見積り) は今回実施していない — 次回セッションで着手する価値あり
 
+## 診断: `--moe-collect-stats` で実際のキャッシュmiss率を計測 (2026-09-15)
+
+`--moe-stats-out <path> --disable-cuda-graph` を付けて起動し(CUDA graph無効化は
+統計収集専用で、これ自体は本番設定ではない。実際decode速度もCUDA graph無しだと
+~13-14 tok/sまで落ちる = CUDA graphだけで+75-80%の効果があることも副次的に判明)、
+実際にprose/codeプロンプトで生成した後、SIGTERMでグレースフルシャットダウンして
+`.rank0`/`.rank1` の統計JSONを回収・解析した。
+
+### 重大な発見1: `offload` 戦略のmiss処理は **PCIe fetchではなくCPU計算**
+
+```
+rank0 (GPU1, layers[0,30), cache 2670 slots): miss_rate=23.2%, fetched_per_layer=0.0, cpu_per_layer=2.32
+rank1 (GPU0, layers[30,48), cache 3197 slots): miss_rate=6.2%,  fetched_per_layer=0.0, cpu_per_layer=0.62
+```
+
+`fetched_per_layer` が両rankとも **0.0** — つまりcache missは一貫してCPU計算で
+解決されており、PCIe経由のGPU転送は一切発生していない。これは「offload=PCIe転送」
+という自分の当初の理解(models.mdの説明や一般的なMoEオフロードの通念)と異なり、
+**このFreeToken(Kaiベース)の`offload`実装は実質的に「GPUキャッシュhit + CPU計算miss」
+のハイブリッド的挙動を、`hybrid`ストラテジー特有の同期オーバーヘッドを伴わずに実現している**。
+
+**これは`--pp-layers 30`が効いた理由の再解釈を要求する**: 当初「GPU1のPCIeが速いから
+多くの層を割り当てた」と考えていたが、実際にはmiss処理にPCIeは使われないため
+この理由付けは誤りだった。真の理由は次の発見2。
+
+### 重大な発見2: rank間でmiss率が大きく非対称 (23.2% vs 6.2%)
+
+rank1 (18層, cache 3197 slots) は rank0 (30層, cache 2670 slots) よりも
+**絶対キャッシュサイズは大きいのに層数が少ない分、層あたりの実効キャッシュ深度が
+深く、miss率が約1/4** (6.2% vs 23.2%)。つまり本質的なレバーは「PCIe帯域」ではなく
+「層数あたりのキャッシュ深度(=薄く広く512expertsをカバーする層が多いほどLRUの
+効きが悪化する)」だった。`--pp-layers`の非対称化が効いた真因は、レイヤー数を
+動かすことでVRAM配分(dense重み vs expertキャッシュ)のバランスを変え、結果的に
+両rankの層あたりキャッシュ深度をチューニングしていたから、という理解に修正する。
+
+### 今後の一手 (この発見を踏まえて)
+
+- rank0のmiss率23.2%が支配的なボトルネックである可能性が高い (rank1は既に6.2%と
+  優秀)。`--pp-layers`をさらに調整し、rank0の層数を減らす(=rank0のキャッシュ深度を
+  改善する)方向を試す価値がある — ただしrank1側の層数が増えればそちらのmiss率が
+  悪化するトレードオフがあるため、両rankのmiss率が拮抗する点が真の最適点のはず。
+  `--pp-layers 26`前後を次に検証する。
+- 根本的にはLRUだけでは512expertsに対するtop-10 routingの局所性の低さを
+  吸収しきれていない (5倍以上のキャッシュ深度があっても20%超miss)。
+  TinyLFUやstatic-hot+dynamic等の改良ポリシーへの改造は真に効果が見込めるが
+  相応の実装工数とリスクを伴う本格的なソース改造になる。
+
 ### git履歴
 
 本セッションの全作業は `~/My-FreeToken` にgitでコミット済み (コミット一覧は
