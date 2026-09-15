@@ -1159,3 +1159,5 @@ sched-lは既に定義済み (sched-hの12層削減にindex16を追加した13�
 - コード (quicksort): 空回答 (content="", finish=length) — 崩壊
 
 結論: sched-k (13層) と同じ「推論はできるが書き出せない」崩壊パターンを再現。**13層は配置によらず実質的な崖**と確定。sched-h (12層) を最終推奨として維持する。サーバーはtakeover用に起動したsched-lを停止し、sched-hに戻す。
+
+Takeover再計測 (sched-h, serve_final_sched_h.log, 同一フラグmemory-ratio 0.95): prose 35.94 tok/s / code 37.75 tok/s。再現性バンド36-38内に収束。最終推奨sched-h不変。サーバーは127.0.0.1:1919で稼働中。
