@@ -301,7 +301,7 @@ survive a reboot either; a udev rule does, e.g.
 `/etc/udev/rules.d/60-freetoken-readahead.rules`.
 
 The window no longer matters to prefill: a chunk reads the non-resident rows from the file
-directly instead of faulting them in (see Limits and caveats), so set it for decode.
+with parallel reads instead of faulting them in (see Limits and caveats), so set it for decode.
 
 Under WSL2 the window that counts is the virtual disk's (`/sys/block/sdX`), since that is the
 device the ext4 filesystem sits on. Being under the warning threshold does not mean the value
@@ -596,13 +596,20 @@ were worth about a factor of two, and should not have been quoted as if they wer
   that: reading one layer's rows evicts the previous layer's, so every chunk reads nearly all of
   them from the disk again. They used to be faulted in through the mapping, one thread and one
   readahead window at a time; they are now read from the file by several threads into the
-  bounce buffers, with `O_DIRECT` when the page cache could not hold them anyway (so a prefill
-  no longer pushes out the rows decode has cached) and buffered when it can (so it fills after
-  the first chunk). A piece the page cache already holds is copied from the mapping. On an
-  RTX 2060 host with Ornith at `--moe-bank-ram 6G` (11 GiB non-resident) and the server held to
-  13 GiB, the bank read per chunk went from 8.5 s to 5.4 s and prefill from 235 to 300 tok/s
-  (that host's virtual disk tops out near 2 GiB/s); with readahead turned off, from 28 to
-  230 tok/s. With RAM to spare it is unchanged (0.65 s per chunk from the page cache).
+  bounce buffers, through the page cache, so the decode that follows still finds them there. A
+  piece the page cache already holds is copied from the mapping. On an RTX 2060 host with Ornith
+  at `--moe-bank-ram 6G` and the server held to 13 GiB, prefill went from 204 to 304 tok/s
+  (that host's virtual disk tops out near 2 GiB/s); with readahead turned off entirely, from 28
+  to 230 tok/s. With RAM to spare it is unchanged (0.65 s per chunk from the page cache).
+  On the two RTX 3060s (Flash-Next, `--moe-bank-ram 42G`, readahead 256 kB) held to about a
+  64 GB host's page cache, prefill went from about 310 to 410 tok/s, with one prompt of the old
+  path down at 71, and decode stayed within the run-to-run spread (12-14 tok/s).
+
+  `FREETOKEN_BANK_PREAD=direct` reads with `O_DIRECT` instead and leaves the page cache alone. Where
+  the page cache is far short of the non-resident rows it is a little faster still (325 against
+  304 tok/s on the RTX 2060 host, 440 against 410 on the RTX 3060s, decode unchanged), and worth
+  trying on a 64 GB host. Where the page cache nearly holds them it costs decode, which no longer
+  finds the rows a prefill read: 15.9 -> 13.2 tok/s on the RTX 3060s with a lighter balloon.
   `--prefill-profile` shows the split per chunk; `FREETOKEN_BANK_PREAD` in
   [kai.md](kai.md#environment-variables-added-by-this-fork) selects the reads.
 - **Disk space.** The bank file is a second copy of the experts -- 63.4 GiB for Flash-Next, on

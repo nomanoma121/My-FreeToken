@@ -1,4 +1,4 @@
-"""Read a prefill chunk's non-resident bank rows with parallel direct reads, not page faults.
+"""Read a prefill chunk's non-resident bank rows with parallel reads, not page faults.
 
 A prefill chunk streams every layer's whole expert bank to the GPU. The rows past the
 --moe-bank-ram resident prefix are not registered with the device, so they go through pinned
@@ -11,32 +11,26 @@ non-resident rows, the server held to 13 GiB): 10.6 GiB re-read per chunk at 1.2
 8192 kB readahead window, 9.2 s of a 13 s chunk; 0.11 GiB/s with no window at all. The window
 that suits decode (256 kB) sits between the two.
 
-This reads the same bytes from the file with ``pread`` on an ``O_DIRECT`` descriptor, from
-several threads at once, straight into the pinned staging buffers:
+This reads the same bytes from the file with ``pread``, from several threads at once, into the
+pinned staging buffers. The rate is the drive's parallel rate rather than one fault at a time,
+and does not depend on ``read_ahead_kb``, so the window can stay where decode wants it.
 
-* the rate is the drive's parallel rate, not one fault at a time, and does not depend on
-  ``read_ahead_kb`` -- so the window can stay where decode wants it;
-* nothing goes through the page cache, so a prefill no longer evicts the non-resident rows
-  decode has been accumulating there (the reason a long generation speeds up as it goes).
+The reads are buffered by default: the rows land in the page cache as the fault path left them,
+and the decode that follows finds them there. ``O_DIRECT`` (``FREETOKEN_BANK_PREAD=direct``)
+reads a little faster under memory pressure and leaves the page cache alone, but that page
+cache is what the next decode reads from. Measured, RTX 2060 host held to 13 GiB (Ornith,
+16.9 GiB of rows per chunk on its path): prefill 204 tok/s through faults, 304 buffered, 325
+direct. Two RTX 3060s with a 40 GiB balloon (Flash-Next, --moe-bank-ram 42G, readahead 256 kB):
+direct cost decode 15.9 -> 13.2 tok/s against the fault path and bought no prefill; with RAM to
+spare, direct reads also kept re-reading from the disk every chunk what they never cached.
 
 A piece the page cache already holds (at least ``FREETOKEN_BANK_PREAD_CACHED``, default 0.9 of
-its pages, by ``mincore``) is copied out of the mapping instead, on the same threads: from RAM
-that is a memcpy at 10+ GiB/s, which no disk read beats. Deciding per piece rather than per
-range matters because what the page cache keeps is not spread evenly: with a third of the rows
-cached, deciding per range still read every byte from the disk.
+its pages, by ``mincore``) is copied out of the mapping on the same threads instead of read:
+with a third of the rows cached, deciding per range rather than per piece read every byte again.
 
-Direct reads never fill the page cache, which is the point on a host whose page cache cannot hold
-the non-resident rows anyway, and the wrong thing on one that can: there a piece that was not
-cached once would come from the disk on every chunk (measured on the RTX 2060 host with RAM to
-spare: 2.65 GiB per chunk, 0.7 -> 1.9 s of bank read). So the reads are direct only when the page
-cache left beside the resident rows is smaller than the non-resident rows (the arithmetic of
-``ft doctor disk``: the smaller of MemTotal and this process's cgroup limit, less every rank's
-resident rows and the rest of the server); otherwise they are buffered, still parallel, and the
-page cache fills after the first chunk. ``FREETOKEN_BANK_PREAD`` = ``auto`` (default),
-``direct``, ``buffered``, or ``0`` to turn the reader off;
+``FREETOKEN_BANK_PREAD`` = ``buffered`` (default), ``direct``, or ``0`` for the fault path;
 ``FREETOKEN_BANK_READ_THREADS`` (default 8) and ``FREETOKEN_BANK_READ_PIECE_MB`` (default 16)
-size it. Where the filesystem refuses ``O_DIRECT`` the reads are buffered: still parallel and
-still off the fault path, but they do fill the page cache.
+size it. Where the filesystem refuses ``O_DIRECT`` a ``direct`` request reads buffered.
 """
 
 from __future__ import annotations
@@ -161,56 +155,20 @@ class DirectRangeReader:
         return copied
 
 
-def _cgroup_limit(proc: str = "/proc", sys: str = "/sys") -> int | None:
-    """The tightest memory.high / memory.max on this process's cgroup v2 path, or None."""
-    try:
-        with open(os.path.join(proc, "self/cgroup"), encoding="ascii") as f:
-            path = next((line.split(":", 2)[2].strip() for line in f if line.startswith("0::")), None)
-    except OSError:
+def read_mode(value: str | None) -> str | None:
+    """``FREETOKEN_BANK_PREAD`` -> ``"buffered"``, ``"direct"``, or None for the fault path.
+    Anything else reads buffered (``auto`` and ``1`` from earlier builds included)."""
+    v = (value or "").strip().lower()
+    if v in ("0", "off", "no", "false"):
         return None
-    if path is None:
-        return None
-    best = None
-    parts = [p for p in path.split("/") if p]
-    for depth in range(len(parts), -1, -1):
-        base = os.path.join(sys, "fs/cgroup", *parts[:depth])
-        for name in ("memory.high", "memory.max"):
-            try:
-                with open(os.path.join(base, name), encoding="ascii") as f:
-                    value = f.read().strip()
-            except OSError:
-                continue
-            if value.isdigit():
-                best = int(value) if best is None else min(best, int(value))
-    return best
-
-
-def choose_direct(cold_bytes: int, resident_bytes: int, ranks: int, *, mem_total: int | None = None,
-                  limit: int | None = None) -> tuple[bool, str]:
-    """(read directly?, why): direct when the page cache beside every rank's resident rows cannot
-    hold every rank's non-resident rows, so buffered reads would only churn it."""
-    from freetoken.moe import disk_probe
-
-    if mem_total is None:
-        mem_total = disk_probe.meminfo().get("MemTotal", 0)
-    if limit is None:
-        limit = _cgroup_limit()
-    usable = min(mem_total, limit) if limit else mem_total
-    room = usable - ranks * (resident_bytes + disk_probe.NONBANK_PER_RANK_BYTES)
-    need = ranks * cold_bytes
-    gib = 2**30
-    direct = room < need
-    why = (f"page cache left {max(room, 0) / gib:.1f} GiB {'<' if direct else '>='} {need / gib:.1f} GiB non-resident "
-           f"({usable / gib:.1f} GiB {'cgroup limit' if limit and limit < mem_total else 'MemTotal'}, {ranks} rank"
-           f"{'s' if ranks > 1 else ''})")
-    return direct, why
+    return "direct" if v == "direct" else "buffered"
 
 
 class BankReader:
     """``OffloadMoeCache.bank_reader``: the prefill copy of a mapped bank's non-resident rows."""
 
     def __init__(self, banks, *, threads: int | None = None, piece_bytes: int | None = None,
-                 cached_share: float | None = None, direct: bool = True, why: str = "") -> None:
+                 cached_share: float | None = None, direct: bool = False, why: str = "") -> None:
         from freetoken.kernel.pinned import alloc_pinned_tensor
 
         self.banks = banks

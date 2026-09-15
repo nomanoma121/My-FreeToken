@@ -114,33 +114,13 @@ def test_a_reader_built_under_inference_mode_copies_on_its_threads(blob):
         reader.close()
 
 
-def test_direct_only_when_the_page_cache_cannot_hold_the_rows():
-    from freetoken.moe.bank_reader import choose_direct
 
-    G = 2**30
-    # the RTX 2060 host with RAM to spare: 23.5 GiB, 6 resident, 11 non-resident -> buffered
-    direct, why = choose_direct(11 * G, 6 * G, 1, mem_total=int(23.5 * G), limit=None)
-    assert not direct and "MemTotal" in why
-    # the same server held to 13 GiB by its cgroup -> direct
-    direct, why = choose_direct(11 * G, 6 * G, 1, mem_total=int(23.5 * G), limit=13 * G)
-    assert direct and "cgroup limit" in why
-    # the reported host: 64 GB, two ranks of 21 GiB resident and 10.7 non-resident -> direct
-    assert choose_direct(int(10.7 * G), 21 * G, 2, mem_total=64 * G, limit=None)[0]
+def test_read_mode_defaults_to_buffered():
+    from freetoken.moe.bank_reader import read_mode
 
-
-def test_cgroup_limit_takes_the_tightest_level(tmp_path):
-    from freetoken.moe.bank_reader import _cgroup_limit
-
-    proc, sys = tmp_path / "proc", tmp_path / "sys"
-    (proc / "self").mkdir(parents=True)
-    (proc / "self" / "cgroup").write_text("0::/user.slice/run.scope\n")
-    root = sys / "fs" / "cgroup"
-    (root / "user.slice" / "run.scope").mkdir(parents=True)
-    (root / "user.slice" / "memory.max").write_text("max\n")
-    (root / "user.slice" / "run.scope" / "memory.high").write_text(str(13 * 2**30) + "\n")
-    (root / "user.slice" / "run.scope" / "memory.max").write_text("max\n")
-    assert _cgroup_limit(str(proc), str(sys)) == 13 * 2**30
-    (root / "user.slice" / "memory.max").write_text(str(8 * 2**30) + "\n")
-    assert _cgroup_limit(str(proc), str(sys)) == 8 * 2**30
-    (proc / "self" / "cgroup").write_text("1:name=systemd:/\n")
-    assert _cgroup_limit(str(proc), str(sys)) is None
+    assert read_mode(None) == "buffered"
+    assert read_mode("") == "buffered"
+    assert read_mode("auto") == "buffered"  # an earlier build's default
+    assert read_mode("1") == "buffered"
+    assert read_mode(" Direct ") == "direct"
+    assert read_mode("0") is None and read_mode("off") is None

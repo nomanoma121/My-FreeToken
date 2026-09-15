@@ -678,18 +678,26 @@ def fault_read(path: str, seconds: float, nbytes: int = 1 << 30, piece: int = 32
 
 def piece_read(path: str, seconds: float, nbytes: int = 2 << 30) -> tuple[float, str]:
     """(GB/s, how) reading a range of ``path`` the way a prefill chunk reads the non-resident rows:
-    ``moe/bank_reader.DirectRangeReader`` with the server's thread count and piece size, O_DIRECT
-    where the filesystem allows it. The page cache is neither read nor filled."""
-    from freetoken.moe.bank_reader import DirectRangeReader, _env_int
+    ``moe/bank_reader.DirectRangeReader`` with the server's thread count, piece size and mode
+    (``FREETOKEN_BANK_PREAD``, buffered by default). A buffered read starts from a range dropped
+    from the page cache, as the fault benchmark does, so it measures the disk."""
+    from freetoken.moe.bank_reader import DirectRangeReader, _env_int, read_mode
 
     size = os.path.getsize(path)
     span = min(nbytes, size // 2) // 4096 * 4096
     reader = DirectRangeReader(path, threads=_env_int("FREETOKEN_BANK_READ_THREADS", 8),
-                               piece_bytes=_env_int("FREETOKEN_BANK_READ_PIECE_MB", 16) << 20)
+                               piece_bytes=_env_int("FREETOKEN_BANK_READ_PIECE_MB", 16) << 20,
+                               direct=read_mode(os.environ.get("FREETOKEN_BANK_PREAD")) == "direct")
     try:
         if span < reader.piece:
             raise OSError(f"{path} is too small to benchmark ({size} bytes)")
         start = (size - span) // 4096 * 4096
+        if not reader.direct:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, start, span, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
         done = 0
         began = time.perf_counter()
         step = reader.piece * reader.threads

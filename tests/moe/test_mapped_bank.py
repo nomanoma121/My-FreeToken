@@ -240,6 +240,7 @@ def test_a_view_of_a_prefix_registered_block_is_not_pinned(tmp_path, monkeypatch
 
         class _Stage:  # just what the staged copy uses
             _staging = OffloadMoeCache._staging
+            bank_reader = None  # the fault-in path: this test is about the registered prefix, not the parallel reads
 
         dst = torch.empty((64, 131072), dtype=torch.uint8, device="cuda")
         # what copy_missing does with a whole layer of a prefix-registered bank

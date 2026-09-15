@@ -229,9 +229,9 @@ and no root; reads `/proc` and `/sys` and nothing else unless it benchmarks.
 - **Read benchmark**: whole expert rows at random from the bank file once it holds every layer
   (otherwise the checkpoint's largest file -- unwritten layers read back as zeros),
   O_DIRECT, one thread and then one per physical core per rank; then, from a complete bank
-  file, the reads a prefill chunk makes of the non-resident rows (the server's threads and piece
-  size, `O_DIRECT`), and a range dropped from the page cache and copied out of a mapping, which
-  is how it read them before and follows `read_ahead_kb`. Skipped when another process
+  file, the reads a prefill chunk makes of the non-resident rows (the server's threads, piece
+  size and `FREETOKEN_BANK_PREAD`, from a range dropped from the page cache), and the same range
+  copied out of a mapping, which is how it read them before and follows `read_ahead_kb`. Skipped when another process
   maps the file (a running server), unless `--bench-anyway`. `--bench-seconds 0` skips it.
 - **Prediction per RAM cap**: resident share, routes covered (from `--moe-bank-stats`, counted
   on `--eval-stats` when given -- the same histogram overstates it), page cache left, disk read
