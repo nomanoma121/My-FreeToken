@@ -1301,6 +1301,30 @@ decode時の毎ステップのディスクI/Oが消え、追加の高速化が�
 安定性リスクが明確に上回るため、`--ple-backend disk` (デフォルト) を
 維持する。これでCLIの主要フラグは文字通り全て評価済みとなった。
 
+## 最終監査: `--attention-backend`に代替肢はあるか、CLIフラグ全数チェック
+
+`ft serve --help`が列挙する全フラグ (70種類超) を棚卸しし、未検証の
+ものが残っていないか最終確認した。
+
+- `--moe-backend`: `--moe-strategy`の非推奨エイリアスと判明 (検証済み扱い)
+- `--num-tokenizer`: detokenizerプロセス数の設定で、decode tok/sとは無関係
+- その他 (multimodal系, TP系, `--moe-bank-*`系[bank-ram専用でoffload戦略には
+  無関係], prefill専用系, ネットワーク/ロギング系) は全て検証済みか
+  アーキテクチャ上適用対象外と確認
+
+最後に残っていた疑問: `--attention-backend`は現在自動選択で`qsa_sparse`
+になっているが、より軽量な代替バックエンドはないか？
+`python/freetoken/engine/engine.py`のバックエンド解決コードを直接確認した
+ところ、`qsa_sparse`はQwen3.8-Flash-Nextの`QSA` attention typeを提供できる
+**唯一の**バックエンドであり (コード中のコメント: "triton serves FULL/SWA,
+not QSA")、他の全てのバックエンド(`triton`, `fa`, `fi`, `trtllm`等)は
+QSA型を宣言しておらず、選択の余地なく拒否される。つまりこれは
+「試していないだけ」ではなく「原理的に選択肢が存在しない」ことが
+ソースコードから確定した。
+
+これにより、CLIフラグ・attention backend選択の両面で、本当に
+これ以上調整できる余地がないことを確認した。
+
 (下の表は一律top-k=3までの時点のまとめ。この後前掲の「FreeToken本体を
 改造: per-layer top-kスケジュール」セクションでsched-dによりさらに
 更新されたので、最終結論はそちらを参照)
