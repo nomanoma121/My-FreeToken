@@ -137,6 +137,29 @@ Qwen3.8-Flash-Next を自分のマシンで 4bit 量子化して動かし、デ�
 - Marlin vs flashinfer/sglang-kernel の sm_86 性能比較や、FreeToken論文自体の
   低VRAM環境ベンチマーク数値は検索でヒットせず (未確認のまま)。
 
+## `ft bench bw` 実測結果 (2026-09-15, --dtype nvfp4)
+
+インストール完了後、モデルダウンロード完了を待たずに実行 (bench bwはモデル非依存)。
+
+| GPU | UUID | CPU STREAM read | PCIe H2D | PCIe D2H | CPU-MoE | PCIe-gather | CPU/PCIe比 | 推奨backend |
+|---|---|---|---|---|---|---|---|---|
+| GPU0 | GPU-118ee0a5... | 41.4 GB/s | **6.2 GB/s** | 6.5 GB/s | 39.1 GB/s | 6.5 GB/s | 6.05x | hybrid |
+| GPU1 | GPU-f4d5a088... | 41.3 GB/s | **25.8 GB/s** | 25.5 GB/s | 39.4 GB/s | 26.2 GB/s | 1.50x | offload |
+
+**重大な発見**: GPU0とGPU1でPCIe実効帯域が **4倍以上違う** (6.2 vs 25.8 GB/s)。
+おそらく物理スロットのレーン数/世代が異なる (GPU0が細いリンクに刺さっている)。
+`nvidia-smi -q -d PCI` でのリンク幅確認は今回のnvidia-smi版のフラグ仕様不一致で
+失敗したため未確認だが、実測ベンチ(より信頼できる)でこの差は明確。
+
+→ **サービングは `--gpu 1` (UUID GPU-f4d5a088-ba66-485c-ae5b-274b69de50f1) を
+既定にする。** offloadのミスフェッチはPCIe経由なので、ここがボトルネックに直結する。
+GPU0(デフォルトの--gpu省略時の挙動)のままだと大きく損をする可能性が高い。
+
+またGPU1では実測でも `offload` (比1.50x < 閾値2.0x) が推奨で、Web調査で見つけた
+Ampereでの hybrid 不具合 (#151) の懸念とも整合する。GPU0はhybrid推奨だが
+Web調査の知見を踏まえ、実サービングでは両GPUとも `--moe-strategy offload` を
+明示指定してA/B比較する方針とする。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
