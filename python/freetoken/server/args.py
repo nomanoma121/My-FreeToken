@@ -575,7 +575,8 @@ def parse_args(
         "--mm-encoder-dtype",
         choices=["auto", "float32", "float16", "bfloat16"],
         default=MultimodalConfig.encoder_dtype,
-        help="Compute dtype of a GPU encoder tower (not --mm-encoder-weights cpu, which is float32). auto: "
+        help="Compute dtype of the Qwen VL vision tower on the GPU (not --mm-encoder-weights cpu, which is "
+        "float32; other families' towers follow the model dtype). auto: "
         "float32 when the model runs bfloat16 -- the Qwen VL vision tower loses about 9%% of its output in "
         "bfloat16 -- otherwise the model dtype.",
     )

@@ -1,8 +1,9 @@
 # Image input
 
-Upstream FreeToken serves images on the Qwen VL families since `08d728d` (#454): OpenAI
-`image_url`, Anthropic `image` blocks and Responses `input_image` parts, as an http(s) URL or
-base64, with the flags in [cli.md](cli.md#image-input). This fork used to carry its own image
+Upstream FreeToken serves images since `08d728d` (#454), first on the Qwen VL families and since
+then on Gemma-4, GLM-5.3-Flash, Muse-Glimmer and MiniMax-M3 too ([models.md](models.md#image-input)
+lists them): OpenAI `image_url`, Anthropic `image` blocks and Responses `input_image` parts, as an
+http(s) URL or base64, with the flags in [cli.md](cli.md#image-input). This fork used to carry its own image
 path; since the merge at `e0886cc` it runs upstream's, and adds what a small card needs on top.
 
 ```json
@@ -28,9 +29,9 @@ every token is roped on three axes, text included.
 | `--pp-size` | Only the first rank builds, loads and runs the tower; the other ranks rope the image rows and admit or refuse image requests alike |
 | `--spec-mtp` | The verify window, the draft head and their CUDA graphs rope on three axes; the draft head embeds the placeholder token where an image row's successor is a content pad id |
 | `--prefill-mixer-pieces` | An image chunk splits like a text one |
-| `--mm-encoder-dtype` | A GPU vision tower computes in float32 when the model runs bfloat16 (below) |
+| `--mm-encoder-dtype` | The Qwen VL vision tower on the GPU computes in float32 when the model runs bfloat16 (below) |
 | `--dense-quant fp8` | Leaves the vision tower bf16 (its blocks are streamed from host memory, so fp8 would save RAM, not VRAM) |
-| Pin budget | With `--mm-encoder-weights host` the tower's pinned block bank counts against the pin quota the expert bank planner uses (WSL2 caps it) |
+| Pin budget | With `--mm-encoder-weights host` the Qwen VL vision tower's pinned block bank counts against the pin quota the expert bank planner uses (WSL2 caps it) |
 
 ## `--mm-encoder-weights cpu`
 
@@ -53,8 +54,8 @@ chunked prefill, `--pp-size` and `--spec-mtp` behave the same.
   content hash, since chat clients resend a conversation's images every turn and again for
   title generation.
 - Supported: Qwen3.8-Flash-Next (`qwen4_exp`), the Qwen3.5-MoE family (Qwen3.6-35B-A3B,
-  Ornith-1.5-35B-A3B) and dense Qwen3.5. A tower with DeepStack (Qwen3-VL proper) is refused at
-  start.
+  Ornith-1.5-35B-A3B) and dense Qwen3.5. A tower with DeepStack (Qwen3-VL proper) and the
+  other image families (Gemma-4, GLM-5.3-Flash, Muse-Glimmer, MiniMax-M3) are refused at start.
 - Use `--image-max-tokens` to bound the CPU time and the prompt length: the Qwen VL processor's
   own limit is 16384 tokens per image (a 4032x3024 photo becomes 11844 tokens). `256` keeps one
   image at 512x512 or less.
@@ -82,13 +83,14 @@ tower in float32 on the CPU,
 Upstream's tower is exact; the loss is the format's. It still names colours right, but the text model
 is less sure of what it saw: on two RTX 3060s (Qwen3.8-Flash-Next, bfloat16, `--spec-mtp 5`), a
 description of a four-quadrant image kept the end-of-turn token second, within 1-4 logits, on most rows
-and ended mid-list; with the CPU tower (float32) it stayed out of reach. So by default (`auto`) a GPU
-tower computes in float32 whenever the model runs bfloat16, and in the model dtype otherwise (float16 on
-Turing is left as it is). float32 doubles what the tower keeps on the GPU (the merger, the embeddings and
+and ended mid-list; with the CPU tower (float32) it stayed out of reach. So by default (`auto`) the Qwen VL
+tower on the GPU computes in float32 whenever the model runs bfloat16, and in the model dtype otherwise
+(float16 on Turing is left as it is). Other families' towers follow the model dtype. float32 doubles what the tower keeps on the GPU (the merger, the embeddings and
 two block-sized staging buffers: 0.19 GiB for Ornith-1.5's tower in float16 on the RTX 2060) and its
 pinned block bank.
 
 ## Not covered
 
 - Video.
-- DeepStack towers with `--mm-encoder-weights cpu`.
+- `--mm-encoder-weights cpu` with DeepStack towers or with the families outside the Qwen VL line
+  (Gemma-4, GLM-5.3-Flash, Muse-Glimmer, MiniMax-M3).
