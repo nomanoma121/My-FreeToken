@@ -1080,6 +1080,14 @@ sched-d (8層)からsched-h/sched-g (11-12層) へ更新。2回の独立実行�
 「推論はできるが最終回答を書き出せない」という新しい種類の崩壊が
 繰り返し確認されており、この探索方向はここが実質的な天井と判断する。
 
+念のため、sched-j (14層崩壊) が`reasoning_effort=low`強制によるアーティ
+ファクトでないか確認するため、デフォルトの`reasoning_effort=xhigh`
+(`chat_template_kwargs`を指定しない) でも同じ算数・コード問題を再テスト
+した。結果は同じく空回答 (算数: finish=stop, content=''; コード:
+finish=length, content='') で、reasoning_effort設定に関わらず14層崩壊は
+再現した。「13層以上での崩壊」はreasoning_effortの副作用ではなく、
+モデル自体の実質的な限界と確定できる。
+
 (下の表は一律top-k=3までの時点のまとめ。この後前掲の「FreeToken本体を
 改造: per-layer top-kスケジュール」セクションでsched-dによりさらに
 更新されたので、最終結論はそちらを参照)
