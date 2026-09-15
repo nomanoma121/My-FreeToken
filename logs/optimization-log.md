@@ -394,6 +394,33 @@ ft serve --model ~/models/qwen38-flash-next-nvfp4 --pp-size 2 --gpu 1,0 \
 次: `--pp-layers`でGPU0(遅いPCIe)/GPU1(速いPCIe)の非対称性を反映した分割を試す、
 `--spec-mtp`でMTP投機デコードを試す。
 
+## `--pp-layers` でPCIe非対称性を活かす (2026-09-15, 独自チューニング)
+
+均等分割(24/24)ではなく、実測PCIe帯域 (GPU1=25.8GB/s >> GPU0=6.2GB/s, 本ログ上部参照)
+を根拠に、速いGPU1(rank0)によりレイヤーを多く割り当てる非対称分割を試した。
+これはFreeToken-Kaiのドキュメントには無い、本機固有のボトルネック分析に基づく調整。
+
+```
+--pp-size 2 --gpu 1,0 --pp-layers 30   # rank0(GPU1,速い)=layers[0,30), rank1(GPU0,遅い)=layers[30,48)
+```
+
+`--moe-cache-auto resolved moe_cache_size=2224` (rank0側。層が増えた分dense重みが増え、
+均等分割時の2491よりは小さいが、rank1側は逆に大きくなっているはず)。
+
+### 実測
+
+| decode step | gen throughput (tok/s) |
+|---|---|
+| step2 | 23.41 |
+| step3 | 24.93 |
+| step4 | 24.93 |
+| step5 | 22.75 |
+| step6 | 25.33 |
+
+**平均 ~24.3 tok/s。** 均等分割(~22 tok/s)から **さらに+10%**。
+ベースライン(~15.5 tok/s)からは **+57%**。PCIe非対称性を考慮した分割が実際に効いている
+ことを確認。さらに非対称にできるか (32や34など) 次に試す。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
