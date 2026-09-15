@@ -201,7 +201,8 @@ ft serve --model-path /models/Qwen3.8-Flash-Next-NVFP4 --pp-size 2 --gpu 0,1 \
   --disable-cuda-graph --moe-stats-out ~/moe-stats.json
 ```
 
-`~/moe-stats.rank0.json` and `~/moe-stats.rank1.json` are written on shutdown. Pass **every
+`~/moe-stats.rank0.json` and `~/moe-stats.rank1.json` are rewritten each time the server goes idle
+(after a request finishes), so they hold the whole session however the server is stopped. Pass **every
 rank's** file to `--moe-bank-stats`: each holds only its own rank's layers.
 
 **Routing is domain-dependent.** Measured out-of-sample on three sessions: a histogram taken
@@ -298,6 +299,9 @@ server does not put the old value back when it exits (the log line names both). 
 survive a reboot either; a udev rule does, e.g.
 `ACTION=="add|change", KERNEL=="nvme0n1", ATTR{queue/read_ahead_kb}="256"` in
 `/etc/udev/rules.d/60-freetoken-readahead.rules`.
+
+The window no longer matters to prefill: a chunk reads the non-resident rows from the file
+with parallel reads instead of faulting them in (see Limits and caveats), so set it for decode.
 
 Under WSL2 the window that counts is the virtual disk's (`/sys/block/sdX`), since that is the
 device the ext4 filesystem sits on. Being under the warning threshold does not mean the value
@@ -587,6 +591,27 @@ were worth about a factor of two, and should not have been quoted as if they wer
   the chunk work in [prefill-chunk.md](prefill-chunk.md): on the two RTX 3060s a 19.9k-token prompt
   took 68.3 s at 64 GB-equivalent against 56.5 s with the same flag and all of the RAM, and
   `--prefill-mixer-pieces 2` took those to 52.7 s and 45.0 s.
+
+  Where the page cache is smaller than the non-resident rows, the chunk's bank read is most of
+  that: reading one layer's rows evicts the previous layer's, so every chunk reads nearly all of
+  them from the disk again. They used to be faulted in through the mapping, one thread and one
+  readahead window at a time; they are now read from the file by several threads into the
+  bounce buffers, through the page cache, so the decode that follows still finds them there. A
+  piece the page cache already holds is copied from the mapping. On an RTX 2060 host with Ornith
+  at `--moe-bank-ram 6G` and the server held to 13 GiB, prefill went from 204 to 304 tok/s
+  (that host's virtual disk tops out near 2 GiB/s); with readahead turned off entirely, from 28
+  to 230 tok/s. With RAM to spare it is unchanged (0.65 s per chunk from the page cache).
+  On the two RTX 3060s (Flash-Next, `--moe-bank-ram 42G`, readahead 256 kB) held to about a
+  64 GB host's page cache, prefill went from about 310 to 410 tok/s, with one prompt of the old
+  path down at 71, and decode stayed within the run-to-run spread (12-14 tok/s).
+
+  `FREETOKEN_BANK_PREAD=direct` reads with `O_DIRECT` instead and leaves the page cache alone. Where
+  the page cache is far short of the non-resident rows it is a little faster still (325 against
+  304 tok/s on the RTX 2060 host, 440 against 410 on the RTX 3060s, decode unchanged), and worth
+  trying on a 64 GB host. Where the page cache nearly holds them it costs decode, which no longer
+  finds the rows a prefill read: 15.9 -> 13.2 tok/s on the RTX 3060s with a lighter balloon.
+  `--prefill-profile` shows the split per chunk; `FREETOKEN_BANK_PREAD` in
+  [kai.md](kai.md#environment-variables-added-by-this-fork) selects the reads.
 - **Disk space.** The bank file is a second copy of the experts -- 63.4 GiB for Flash-Next, on
   top of a checkpoint whose other large part is 47.7 GiB of PLE -- until `ft bank pack` removes
   them from the checkpoint (section 5). The PLE is not copied: `--ple-backend disk` reads its rows

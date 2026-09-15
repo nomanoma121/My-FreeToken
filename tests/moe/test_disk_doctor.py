@@ -181,3 +181,69 @@ def test_under_wsl_the_report_shows_the_windows_drive_and_flags_a_short_one():
     dd._wsl_host(rep, "Bank storage", storage, "/proc", 0, host=dp.WslHostDisk(
         "Ubuntu", r"C:\wsl\ext4.vhdx", "C:", "/mnt/c", 200 * GiB, 953 * GiB, None, True))
     assert rep.findings == [] and "not returned" not in "\n".join(rep.lines)
+
+
+def _link(**kw):
+    from freetoken.moe import gpu_probe as gp
+
+    base = dict(index=1, bus_id="00000000:05:00.0", name="RTX 3060", gen=1, gen_max=4, gen_host=4, width=4, width_max=16)
+    base.update(kw)
+    return gp.GpuLink(**base)
+
+
+def test_the_gpu_section_reads_the_link_under_load(tree, tmp_path):  # noqa: F811
+    sys, proc = tree
+    ns = dd.build_parser("ft doctor disk").parse_args(["--bench-seconds", "0", "--pp-size", "2"])
+    out = dd.run(ns, proc, sys, gpu_query=lambda: [_link()], gpu_rate=lambda link, s: (6.3, _link(gen=4)))
+    assert "GPU 1 (RTX 3060, 00000000:05:00.0): PCIe Gen1 x4 (GPU Gen4 x16, slot Gen4) as reported now" in out
+    assert "during a copy: PCIe Gen4 x4" in out
+    assert "pinned host -> GPU: 6.3 GB/s (80% of the link's nominal 7.9 GB/s)" in out
+    assert "GPU 1 runs at x4 of its x16 under load" in out.split("Findings")[1]
+
+
+def test_the_gpu_section_without_a_rate_does_not_judge_the_idle_link(tree, tmp_path):  # noqa: F811
+    sys, proc = tree
+    ns = dd.build_parser("ft doctor disk").parse_args(["--bench-seconds", "0", "--h2d-seconds", "0"])
+    out = dd.run(ns, proc, sys, gpu_query=lambda: [_link()])
+    assert "rate not measured (--h2d-seconds 0)" in out
+    assert "GPU 1 runs" not in out
+
+
+def test_parse_nvidia_smi_links():
+    from freetoken.moe import gpu_probe as gp
+
+    (a, b) = gp.parse_links("0, 00000000:01:00.0, NVIDIA GeForce RTX 3060, 4, 4, 4, 16, 16\n"
+                            "1, 00000000:05:00.0, NVIDIA GeForce RTX 3060, 3, 4, 5, 4, 16\n")
+    assert a.describe() == "PCIe Gen4 x16" and a.lane_gbs == pytest.approx(31.5, abs=0.1)
+    assert b.describe() == "PCIe Gen3 x4 (GPU Gen4 x16, slot Gen5)"
+    assert gp.parse_links("garbage\n[N/A], x\n") == []
+
+
+def test_prefill_prediction_rereads_the_non_resident_rows_when_the_page_cache_is_short():
+    """The reported 64 GB host: Flash-Next, --pp-size 2, 42G cap. The page cache left per rank is
+    smaller than a rank's non-resident rows, so each chunk reads them all from the disk again."""
+    shape = _flash_next()
+    rows = dd.predict(shape, [42 * GiB, shape.bank_bytes], 2, 61 * GiB)
+    rep = dd.Report()
+    dd._prefill_prediction(rep, rows, 2, shape, 1.0, h2d_gbs=10.0, fault_gbs=0.25)
+    out = rep.render()
+    short, full = rows
+    assert short.page_cache / 2 < short.cold_bytes / 2
+    cold = short.cold_bytes / 2
+    assert f"{cold / GiB:12.1f}G" in out and f"{cold / 1e9:7.1f}s" in out
+    assert "with FREETOKEN_BANK_PREAD=0 the copy faults the rows in through the mapping instead: x 4.0" in out
+    (finding,) = [text for level, text in rep.findings if level == "warn"]
+    assert "every chunk reads them from the disk again" in finding and "42G" in finding
+    # the whole bank resident: nothing to read, only the transfer
+    assert full.cold_bytes == 0
+
+
+def test_prefill_prediction_without_rates_prints_question_marks():
+    shape = _flash_next()
+    rows = dd.predict(shape, [24 * GiB], 1, 30 * GiB)
+    rep = dd.Report()
+    dd._prefill_prediction(rep, rows, 1, shape, None, h2d_gbs=None)
+    out = rep.render()
+    assert "not measured: a complete bank file nobody has mapped is needed; --prefill-read-gbs gives one" in out
+    assert "(not measured: --h2d-seconds)" in out
+    assert rep.findings == []

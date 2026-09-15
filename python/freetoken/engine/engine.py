@@ -1723,6 +1723,35 @@ class Engine:
             self._capture_spec_graph()
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        prof = self._prefill_profiler() if batch.is_prefill and not batch.spec_verify else None
+        if prof is None:
+            return self._forward_batch(batch, args)
+        prof.begin(int(batch.input_ids.numel()))
+        try:
+            out = self._forward_batch(batch, args)
+        except BaseException:
+            prof.abort()  # no sync and no line: the forward's own error is the one to see
+            raise
+        prof.end(self.device)
+        return out
+
+    def _prefill_profiler(self):
+        """``--prefill-profile``: this rank's profiler, built on first use (the bank tier and
+        the pipeline transport it reads are settled by then)."""
+        if not getattr(self.config, "prefill_profile", False):
+            return None
+        prof = getattr(self, "_prefill_prof", None)
+        if prof is None:
+            from freetoken.utils.prefill_profile import PrefillProfile
+
+            banks = getattr(getattr(self, "bank_tier", None), "banks", None)
+            residency = banks.cold_residency if banks is not None and getattr(banks, "cold_spans", None) else None
+            prof = self._prefill_prof = PrefillProfile(
+                self.config.tp_info.rank, self.config.tp_info.size, residency=residency, log=logger.info
+            )
+        return prof
+
+    def _forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan and self.encoder_cache is not None:
             self._run_mm_encoder(batch)
@@ -2497,21 +2526,38 @@ class Engine:
             config, method, pp=try_get_pp_info(), log=logger.info, warn=logger.warning
         )
 
-    def _write_moe_stats(self) -> None:
-        """Dump the decode instrumentation to ``--moe-stats-out`` on an orderly stop.
+    def write_moe_stats_idle(self) -> None:
+        """Rewrite ``--moe-stats-out`` with everything counted so far (the scheduler went idle).
 
-        Ctrl+C / SIGTERM reach here via uvicorn's lifespan; a hard kill loses the window,
-        which is acceptable for an opt-in instrumentation run.
+        The stop path alone is not enough: it runs only when the scheduler worker itself takes
+        a KeyboardInterrupt, i.e. Ctrl+C in the terminal the server runs in the foreground of.
+        ``kill`` / ``systemctl stop`` make the API process terminate the workers first, and a
+        launcher that starts the server with SIGINT ignored passes that on to them, so the
+        file was never written -- silently. Idle is when nothing is on the device, the
+        histogram is a few tens of KB, and it is rewritten only after the server did something.
         """
+        if not getattr(self, "_moe_stats_out", None):
+            return
+        cache = getattr(self.ctx, "moe_offload_cache", None)
+        if cache is not None and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        first = not getattr(self, "_moe_stats_written", False)
+        if self._write_moe_stats(quiet=not first) and first:
+            self._moe_stats_written = True
+            logger.info("--moe-stats-out: rewritten each time the server goes idle, and on stop")
+
+    def _write_moe_stats(self, quiet: bool = False) -> str | None:
+        """Dump the decode instrumentation to ``--moe-stats-out`` (idle and orderly stop)."""
         from freetoken.engine.moe_stats import write_moe_stats
 
         rank, size = getattr(self, "_moe_stats_rank", (0, 1))
-        write_moe_stats(
+        return write_moe_stats(
             getattr(self.ctx, "moe_offload_cache", None),
             getattr(self, "_moe_stats_out", None),
             rank,
             size,
             getattr(self, "_moe_stats_layer_range", None),
+            quiet=quiet,
         )
 
 

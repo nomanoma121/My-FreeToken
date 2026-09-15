@@ -96,6 +96,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--kv-cache-dtype` | auto | Store the paged KV as block-quantized codes: `q8_0` (1.88x smaller) or `q4_0` (3.56x). Plain paged-attention models on `--attention-backend triton`, Flash-Next on its own `qsa_sparse` backend, or gpt-oss (both its full and its sliding-window layers; resolves to Triton by itself; use `q8_0`, `q4_0` breaks its answers); refused at startup otherwise. See [kv-cache-quant.md](kv-cache-quant.md); whether the freed VRAM buys you anything depends on your machine, see [vram-and-speed.md](vram-and-speed.md) |
 | `--prefill-chunk-budget` | 0.55 | Share of free VRAM one prefill chunk's transient may take. The engine measures that cost per token at startup, sizes `--max-prefill-length` to fit, and re-solves before every prefill against the VRAM free right then. 0 disables and the flag is used as given. Under `--pp-size` the chunk is agreed across the ranks at startup, checked once more after the `--spec-mtp` graphs are captured (it can only shrink), and then frozen, because it sizes a cross-rank message. See [prefill-chunk.md](prefill-chunk.md) |
 | `--prefill-mixer-pieces` | 1 | Run each prefill chunk's GDN / attention over this many consecutive pieces and its MoE over the whole chunk. The mixers set the transient that `--prefill-chunk-budget` sizes the chunk from, so the chunk comes out wider and an offloaded MoE streams its banks fewer times per prompt; raise `--max-prefill-length` with it. Qwen3.8-Flash-Next (one GPU or `--pp-size`; use 2, 4 measured no better) and single-GPU Qwen3.5-MoE (4 with a 16384 ceiling); other models ignore it. See [prefill-chunk.md](prefill-chunk.md#wider-chunks---prefill-mixer-pieces) |
+| `--prefill-profile` | off | Log one line per prefill forward on every rank: its wall time split into waiting for the other pipeline rank, host copies of expert rows the GPU cannot read directly (the `--moe-bank-ram` remainder; page faults on the bank file land here), per-layer-embedding disk reads, and the GPU plus the rest; then the GiB those copies moved and their rate, major faults and storage reads, the page cache's share of the non-resident rows when the forward began, and the achieved PCIe rate of the registered rows. Go by the storage reads, not the share: a chunk can re-read nearly all of the rows while a third are cached, because reading one layer evicts the one before. On an RTX 2060 host with Ornith at `--moe-bank-ram 6G`: 0.7 s of a 4.5 s chunk with RAM to spare; with the server held to 13 GiB, 9.2 s of 13 s, 10.6 GiB re-read from the disk each chunk at 1.2 GiB/s. One device sync per prefill forward |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
@@ -107,7 +108,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-bank-readahead` | off | With `--moe-bank-ram`: `auto` writes the recommended device `read_ahead_kb` for the model's block geometry, a number writes that many kB; `off` only logs the current window and the command to change it. Each rank sets it before opening its mapping, since an open mapping keeps the window it was opened with. Device-wide and left set after exit. See [bank-ram.md](bank-ram.md#3-set-the-device-readahead) |
 | `--moe-bank-rewarm` | 0 | With `--moe-bank-ram`: after this many seconds idle, each rank reads back the non-resident rows the page cache has lost (below 95%), in file order, and pages its own swapped memory back in, stopping when a request arrives; backs off while memory stays under pressure. `FREETOKEN_REWARM_SWAP=0` leaves the swap alone. 0 = off, because it reads the disk while idle. See [bank-ram.md](bank-ram.md#4-optional-read-the-cold-rows-back-while-idle---moe-bank-rewarm) |
 | `--moe-bank-prefetch` | off | Experimental. With `--moe-bank-ram` and cpu/hybrid decode, Linux: before the CPU executor computes a layer, it asks the kernel for exactly the non-resident expert rows that layer routes to (`mincore`, then `MADV_WILLNEED` per row), instead of leaving them to 4 KiB faults and readahead windows. For hosts whose RAM is short of the bank: on two RTX 3060s at 64 GB-equivalent, time to first token 9.1 → 5.2 s and decode +7%; on a host with RAM to spare decode was slower. See [bank-ram.md](bank-ram.md#6-experimental-ask-for-the-rows-each-step-routes-to---moe-bank-prefetch) |
-| `--moe-stats-out` | off | Write the per-expert decode routing histogram on shutdown (pass `--disable-cuda-graph`) |
+| `--moe-stats-out` | off | Write the per-expert decode routing histogram, rewritten each time the server goes idle (pass `--disable-cuda-graph`) |
 | `--moe-collect-stats` | off | Accumulate the cache's decode miss-rate counters device-side, captured into the decode graph; `--moe-stats-out` reads them back |
 | `--disable-cuda-graph` | graphs on | Decode eagerly; needed for `--moe-stats-out` to see real routing |
 
@@ -247,14 +248,28 @@ and no root; reads `/proc` and `/sys` and nothing else unless it benchmarks.
 - **Readahead**: the current window against the one recommended for this model's widest
   expert-row block, and the exact command to set it (before starting the server).
 - **Memory**: MemTotal/MemAvailable, swap, `ulimit -l`, and what `--moe-bank-ram auto` would choose.
+- **GPUs**: each GPU's PCIe link as `nvidia-smi` reports it, and again during pinned host -> GPU
+  copies timed for `--h2d-seconds` (default 2; 0 skips) -- an idle GPU may report a lower
+  generation. A width or generation below what the GPU and slot allow, under load, is a finding:
+  every prefill chunk streams the rank's whole bank through that link. The copies need a GPU a
+  running server does not already fill.
 - **Read benchmark**: whole expert rows at random from the bank file once it holds every layer
   (otherwise the checkpoint's largest file -- unwritten layers read back as zeros),
-  O_DIRECT, one thread and then one per physical core per rank. Skipped when another process
+  O_DIRECT, one thread and then one per physical core per rank; then, from a complete bank
+  file, the reads a prefill chunk makes of the non-resident rows (the server's threads, piece
+  size and `FREETOKEN_BANK_PREAD`, from a range dropped from the page cache), and the same range
+  copied out of a mapping, which is how it read them before and follows `read_ahead_kb`. Skipped when another process
   maps the file (a running server), unless `--bench-anyway`. `--bench-seconds 0` skips it.
 - **Prediction per RAM cap**: resident share, routes covered (from `--moe-bank-stats`, counted
   on `--eval-stats` when given -- the same histogram overstates it), page cache left, disk read
   per token, and with a read rate and `--base-step-ms` a step time. The assumptions are printed
   under the table; the model was within about 2x of the measurements it was checked against.
+- **Prefill data movement per chunk, per rank**: for each cap, the rank's non-resident rows, the
+  page cache beside them, what comes from the disk (all of them each chunk when the page cache is
+  smaller -- reading one layer evicts the one before), the copy time at the prefill read rate
+  (`--prefill-read-gbs` to supply it) and the factor the page-cache rate would cost, and the
+  transfer time at the slowest host -> GPU rate. Data
+  movement only; compare with the server's `--prefill-profile` lines.
 
 ## ft bench bw
 

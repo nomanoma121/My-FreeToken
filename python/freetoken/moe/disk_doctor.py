@@ -22,6 +22,7 @@ import os
 from dataclasses import dataclass, field
 
 from freetoken.moe import disk_probe as dp
+from freetoken.moe import gpu_probe as gp
 
 GiB = dp.GiB
 MiB = 2**20
@@ -377,7 +378,56 @@ def _storage(rep: Report, label: str, path: str, proc: str, sys: str, gpus, need
     return s
 
 
-def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
+def _gpus(rep: Report, ns, shape: Shape, ranks: int, query, rate) -> float | None:
+    """Each GPU's PCIe link, idle and under a copy, and the pinned host -> GPU rate.
+
+    A prefill chunk streams every layer's whole expert bank to its rank's GPU, so the link is
+    paid once per chunk; decode only pays it for cache misses.
+    """
+    rep.section("GPUs")
+    links = query() if query is not None else None
+    if links is None:
+        rep.say("not read: nvidia-smi is missing or failed")
+        return None
+    if not links:
+        rep.say("nvidia-smi lists no GPU")
+        return None
+    rates = []
+    per_rank = shape.bank_bytes / ranks if shape.bank_bytes else None
+    for link in links:
+        rep.say(f"GPU {link.index} ({link.name}, {link.bus_id}): {link.describe()} as reported now")
+        measured, under = None, None
+        if ns.h2d_seconds > 0:
+            try:
+                measured, under = rate(link, ns.h2d_seconds)
+            except Exception as exc:  # noqa: BLE001 -- no CUDA, a full or busy GPU: say so, go on
+                rep.say(f"  pinned host -> GPU rate not measured: {exc}")
+        else:
+            rep.say("  rate not measured (--h2d-seconds 0); a GPU at idle may report a lower generation "
+                    "than it trains to under load")
+        if under is not None:
+            rep.say(f"  during a copy: {under.describe()}")
+        eff = under or link
+        if measured:
+            rates.append(measured)
+            nominal = eff.lane_gbs
+            rep.say(f"  pinned host -> GPU: {measured:.1f} GB/s"
+                    + (f" ({measured / nominal:.0%} of the link's nominal {nominal:.1f} GB/s)" if nominal else ""))
+            if per_rank:
+                rep.say(f"  a rank's expert banks ({_gib(per_rank)}) cross it in {per_rank / 1e9 / measured:.1f} s: "
+                        f"once per prefill chunk, whatever the chunk holds")
+        if under is None and measured is None:
+            continue
+        top_gen = min(g for g in (eff.gen_max, eff.gen_host) if g) if (eff.gen_max or eff.gen_host) else None
+        if eff.width and eff.width_max and eff.width < eff.width_max:
+            rep.find("warn", f"GPU {link.index} runs at x{eff.width} of its x{eff.width_max} under load: the slot (or a "
+                             f"shared chipset uplink) halves or quarters what every prefill chunk streams to it")
+        elif eff.gen and top_gen and eff.gen < top_gen:
+            rep.find("warn", f"GPU {link.index} trained to Gen{eff.gen} under load where GPU and slot allow Gen{top_gen}")
+    return min(rates) if rates else None
+
+
+def run(ns, proc: str = "/proc", sys: str = "/sys", *, gpu_query=None, gpu_rate=None) -> str:
     from freetoken.moe.bank_disk import load_freq
 
     rep = Report()
@@ -449,6 +499,11 @@ def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
             rep.say("its expert tensors are read only while the bank file lacks layers; the rest of it at every "
                     "start, and per token under --ple-backend disk")
 
+    # ---- GPUs (the real host only unless the caller hands in a fake)
+    if gpu_query is None and sys == "/sys":
+        gpu_query = gp.query_links
+    h2d_gbs = _gpus(rep, ns, shape, ranks, gpu_query, gpu_rate or gp.h2d_rate)
+
     # ---- readahead
     rep.section("Readahead")
     ra = dp.readahead(s.dev, sys) if s.dev else None
@@ -507,6 +562,8 @@ def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
     # ---- benchmark
     rep.section("Read benchmark")
     gbs = ns.disk_gbs
+    fault_gbs = ns.fault_gbs
+    pread_gbs = ns.prefill_read_gbs
     # Not a bank file with layers still to write: its holes read back as zeros at memory speed.
     complete = bank is not None and not bank.error and bank.all_layers and len(bank.layers) == bank.all_layers
     bench_file = bank_path if complete else _largest_file(ns.model)
@@ -536,6 +593,20 @@ def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
                 many = dp.random_row_read(bench_file, row, threads, ns.bench_seconds)
                 rep.say(f"1 thread: {one:.2f} GB/s; {threads} threads (the decode workers): {many:.2f} GB/s")
                 gbs = many
+                if bench_file == bank_path and fault_gbs is None:
+                    try:
+                        fault_gbs, fault_bytes = dp.fault_read(bench_file, ns.bench_seconds)
+                        rep.say(f"through the page cache (a mapping, faults, readahead {ra[0] if ra else '?'} kB, one "
+                                f"thread; how a prefill read them with FREETOKEN_BANK_PREAD=0): {fault_gbs:.2f} GB/s "
+                                f"over {fault_bytes / GiB:.2f} GiB")
+                    except OSError as exc:
+                        rep.say(f"page-cache read not measured: {exc.strerror or exc}")
+                if bench_file == bank_path and pread_gbs is None:
+                    try:
+                        pread_gbs, how_read = dp.piece_read(bench_file, ns.bench_seconds)
+                        rep.say(f"as a prefill chunk reads them ({how_read}): {pread_gbs:.2f} GB/s")
+                    except OSError as exc:
+                        rep.say(f"prefill read not measured: {exc.strerror or exc}")
                 if bench_file != bank_path:
                     rep.say("(read from the checkpoint, the bank file being absent or incomplete: the same device "
                             "as the bank only if the storage above says so)")
@@ -599,7 +670,71 @@ def run(ns, proc: str = "/proc", sys: str = "/sys") -> str:
         rep.say("- step: unknown base for this model. Pass --base-step-ms = 1000 / the decode tok/s you get with the "
                 "banks fully in RAM (or with a cap that covers them)")
     rep.say("- the VRAM expert cache is not in this: it holds the hottest experts, which are resident anyway")
+    _prefill_prediction(rep, rows, ranks, shape, pread_gbs, h2d_gbs, fault_gbs=fault_gbs)
     return rep.render()
+
+
+# page cache host copy rate assumed when the rows are already in RAM (a single-thread memcpy;
+# measured 14-17 GiB/s on the RTX 2060 host, so this is on the low side)
+PREFILL_MEMCPY_GBS = 10.0
+
+
+def _prefill_prediction(rep: Report, rows: list[Row], ranks: int, shape: Shape,
+                        read_gbs: float | None, h2d_gbs: float | None, *, fault_gbs: float | None = None) -> None:
+    """Data movement per prefill chunk, per rank: what the chunk costs before the GPU computes anything.
+
+    Every chunk longer than the CPU prefill cut-off streams each layer's whole bank to the GPU:
+    the resident rows straight from registered memory, the rest copied out of the mapping first.
+    When the page cache cannot hold a rank's non-resident rows the copy re-reads nearly all of
+    them each chunk -- measured on the RTX 2060 host with a third of them cached, 10.6 of 11 GiB
+    came from the disk every chunk, because reading one layer evicts the one before.
+    """
+    rep.section("Prediction: prefill data movement per chunk, per rank")
+    head = f"  {'cap':>9} {'non-resident':>13} {'page cache':>11} {'from disk':>10} {'copy':>8} {'to GPU':>8} {'total':>8}"
+    rep.lines.append(head)
+    worst = None
+    for r in rows:
+        cold = r.cold_bytes / ranks
+        page = r.page_cache / ranks
+        fits = page >= cold
+        disk = 0.0 if fits else cold
+        copy = None
+        if cold == 0:
+            copy = 0.0
+        elif fits:
+            copy = cold / (PREFILL_MEMCPY_GBS * 1e9)
+        elif read_gbs:
+            copy = cold / (read_gbs * 1e9)
+        gpu = shape.bank_bytes / ranks / (h2d_gbs * 1e9) if h2d_gbs else None
+        total = copy + gpu if copy is not None and gpu is not None else None
+        rep.lines.append(
+            f"  {r.cap / GiB:8.1f}G {cold / GiB:12.1f}G {page / GiB:10.1f}G {disk / GiB:9.1f}G "
+            + (f"{copy:7.1f}s" if copy is not None else f"{'?':>8}")
+            + (f" {gpu:7.1f}s" if gpu is not None else f" {'?':>8}")
+            + (f" {total:7.1f}s" if total is not None else f" {'?':>8}")
+        )
+        if not fits and copy is not None:
+            worst = (r, cold, copy)
+    rep.say("")
+    rep.say("assumed, and each of these can be off:")
+    rep.say("- non-resident = the rank's bank rows past the resident prefix; page cache as in the table above, split per rank")
+    rep.say("- from disk: all of them each chunk when the page cache is smaller than them (measured once, see above), "
+            "none when it is larger (after the first chunk)")
+    rep.say("- copy = from disk / the prefill read rate above" + (f" ({read_gbs:.2f} GB/s)" if read_gbs else
+            " (not measured: a complete bank file nobody has mapped is needed; --prefill-read-gbs gives one)")
+            + f", or / {PREFILL_MEMCPY_GBS:g} GB/s from RAM")
+    if fault_gbs and read_gbs:
+        rep.say(f"- with FREETOKEN_BANK_PREAD=0 the copy faults the rows in through the mapping instead: x "
+                f"{read_gbs / fault_gbs:.1f} the copy time here")
+    rep.say("- to GPU = the rank's whole bank / the slowest pinned host -> GPU rate above"
+            + ("" if h2d_gbs else " (not measured: --h2d-seconds)"))
+    rep.say("- total is data movement only: the GPU's compute comes on top, and a pipeline rank also waits for "
+            "the other. Compare with --prefill-profile's per-chunk line on the server")
+    if worst is not None:
+        r, cold, copy = worst
+        rep.find("warn", f"prefill at --moe-bank-ram {r.cap / GiB:.0f}G: the page cache cannot hold a rank's "
+                         f"{cold / GiB:.1f} GiB of non-resident rows, so every chunk reads them from the disk again "
+                         f"(~{copy:.0f} s per chunk per rank at the prefill read rate)")
 
 
 def _largest_file(model_path: str | None) -> str | None:
@@ -637,9 +772,16 @@ def build_parser(prog: str) -> argparse.ArgumentParser:
     p.add_argument("--base-step-ms", type=float, default=None,
                    help="decode step with the banks fully in RAM on this machine (1000 / tok/s)")
     p.add_argument("--disk-gbs", type=float, default=None, help="skip the benchmark and assume this read rate")
+    p.add_argument("--fault-gbs", type=float, default=None,
+                   help="assume this rate for reads through the page cache (FREETOKEN_BANK_PREAD=0) instead of measuring it")
+    p.add_argument("--prefill-read-gbs", type=float, default=None,
+                   help="assume this rate for a prefill's direct reads of the non-resident rows instead of measuring it")
     p.add_argument("--page-cache-factor", type=float, default=PAGE_CACHE_FACTOR,
                    help=f"share of the placed miss that reaches the disk once the page cache settles (default {PAGE_CACHE_FACTOR})")
     p.add_argument("--bench-seconds", type=float, default=3.0, help="per benchmark pass; 0 skips it")
+    p.add_argument("--h2d-seconds", type=float, default=2.0,
+                   help="per GPU: pinned host -> GPU copy benchmark, with the PCIe link read during it; 0 skips it "
+                        "(needs a GPU that a running server does not already fill)")
     p.add_argument("--threads", type=int, default=0, help="benchmark threads (default: physical cores x ranks)")
     p.add_argument("--bench-anyway", action="store_true",
                    help="benchmark even when another process maps the file")

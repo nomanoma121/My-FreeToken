@@ -815,7 +815,8 @@ def parse_args(
         default=ServerArgs.moe_stats_out,
         help=(
             "Write the decode routing histogram (per layer, per expert) and the realized "
-            "miss rates to this JSON path at shutdown; implies --moe-collect-stats. One "
+            "miss rates to this JSON path, rewritten each time the server goes idle and on "
+            "shutdown; implies --moe-collect-stats. One "
             "file per pipeline rank (.rank<N>.json) when --pp-size > 1. The histogram is "
             "only accumulated outside a captured graph, so pair it with "
             "--disable-cuda-graph for a collection run."
@@ -842,6 +843,20 @@ def parse_args(
             "Measured on an RTX 2060 (Ornith, 19.9k-token prompt): 490 -> 649 tok/s at 2, "
             "722 tok/s at 4 with --max-prefill-length 16384. Qwen3.8-Flash-Next (one GPU or "
             "--pp-size) and single-GPU Qwen3.5-MoE."
+        ),
+    )
+
+    parser.add_argument(
+        "--prefill-profile",
+        action="store_true",
+        default=ServerArgs.prefill_profile,
+        help=(
+            "Log one line per prefill forward on every rank splitting its wall time into "
+            "waiting for the other pipeline rank, host copies of expert rows the GPU cannot "
+            "read directly (page faults on a --moe-bank-ram bank land here), per-layer "
+            "embedding reads, and the GPU plus the rest; with the GiB copied and their rate, "
+            "major page faults, storage reads, how much of the bank the page cache held, and "
+            "the achieved PCIe rate of the registered rows. Costs a device sync per forward."
         ),
     )
     parser.add_argument(

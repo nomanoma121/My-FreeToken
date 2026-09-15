@@ -20,8 +20,12 @@ logs the wait once it passes FREETOKEN_RANK_WAIT_WARN_SECONDS.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.distributed as dist
+
+from freetoken.utils.prefill_profile import active as _prefill_profile
 
 from .info import PipelineInfo
 from .watchdog import rank_wait_watchdog
@@ -77,8 +81,10 @@ class PipelineComm:
         self._waits.begin(
             "rank {peer} to take the hidden states ({detail} rows)", dst, hidden.shape[0]
         )
+        prof = _prefill_profile()
         try:
-            dist.send(buf, dst=dst, group=self.group, tag=_TAG_HIDDEN)
+            with prof.peer_wait() if prof is not None else nullcontext():
+                dist.send(buf, dst=dst, group=self.group, tag=_TAG_HIDDEN)
         finally:
             self._waits.end()
 
@@ -89,8 +95,10 @@ class PipelineComm:
         buf = self._staging("recv", nbytes)
         src = self.info.rank - 1
         self._waits.begin("the hidden states ({detail} rows) from rank {peer}", src, rows)
+        prof = _prefill_profile()
         try:
-            dist.recv(buf, src=src, group=self.group, tag=_TAG_HIDDEN)
+            with prof.peer_wait() if prof is not None else nullcontext():
+                dist.recv(buf, src=src, group=self.group, tag=_TAG_HIDDEN)
         finally:
             self._waits.end()
         # synchronous H2D so the staging buffer can be reused by the next recv
@@ -104,8 +112,10 @@ class PipelineComm:
             self._waits.begin(
                 "rank {peer} to take the sampled tokens ({detail})", dst, tokens_cpu.numel()
             )
+            prof = _prefill_profile()
             try:
-                dist.send(tokens_cpu, dst=dst, group=self.group, tag=_TAG_TOKENS)
+                with prof.peer_wait() if prof is not None else nullcontext():
+                    dist.send(tokens_cpu, dst=dst, group=self.group, tag=_TAG_TOKENS)
             finally:
                 self._waits.end()
 
@@ -114,8 +124,10 @@ class PipelineComm:
         buf = torch.empty(count, dtype=torch.int32)
         src = self.info.size - 1
         self._waits.begin("the sampled tokens ({detail}) from rank {peer}", src, count)
+        prof = _prefill_profile()
         try:
-            dist.recv(buf, src=src, group=self.group, tag=_TAG_TOKENS)
+            with prof.peer_wait() if prof is not None else nullcontext():
+                dist.recv(buf, src=src, group=self.group, tag=_TAG_TOKENS)
         finally:
             self._waits.end()
         return buf
