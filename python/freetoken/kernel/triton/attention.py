@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
@@ -18,7 +19,9 @@ def _optin_smem_bytes(device_index: int) -> int:
     return int(getattr(props, "shared_memory_per_block_optin", 0))
 
 
-def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[int, int]:
+def _select_extend_tile(
+    head_dim: int, block_d: int, smem_optin: int, split: bool = False
+) -> tuple[int, int]:
     """Pick ``(BLOCK_M, BLOCK_N)`` for the extend/prefill kernel, shared-memory aware.
 
     Larger tiles run materially faster (~2x for head_dim 512 on H100) but their bf16
@@ -27,6 +30,12 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
     Keep the fast tiles where the device's opt-in shared memory fits them (datacenter
     A100/H100); shrink only where it does not. ``smem_optin == 0`` (unknown) conservatively
     selects the small tiles, i.e. the prior consumer-safe behavior.
+
+    ``split``: the extend kernel that also reads the cached prefix stages K/V tiles for
+    both sources, i.e. ``(BLOCK_M + 4 * BLOCK_N)`` rows instead of ``(BLOCK_M + 2 * BLOCK_N)``.
+    Whatever the preference above picked is finally halved until it fits the device's hard
+    opt-in limit (Turing: 64 KB), since Triton refuses to launch a kernel whose static shared
+    memory exceeds it.
     """
     budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
 
@@ -34,12 +43,20 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
         return (block_m + 2 * block_n) * block_d * 2 <= budget
 
     if head_dim <= 128:
-        return 128, 64
-    if head_dim <= 256:
-        return (128, 64) if fits(128, 64) else (64, 32)
-    if head_dim <= 384:
-        return (32, 64) if fits(32, 64) else (32, 32)
-    return (32, 64) if fits(32, 64) else (16, 16)
+        block_m, block_n = 128, 64
+    elif head_dim <= 256:
+        block_m, block_n = (128, 64) if fits(128, 64) else (64, 32)
+    elif head_dim <= 384:
+        block_m, block_n = (32, 64) if fits(32, 64) else (32, 32)
+    else:
+        block_m, block_n = (32, 64) if fits(32, 64) else (16, 16)
+    if smem_optin > 0:
+        kv_tiles = 4 if split else 2
+        while (block_m + kv_tiles * block_n) * block_d * 2 > smem_optin and (
+            block_m > 16 or block_n > 16
+        ):
+            block_m, block_n = max(16, block_m // 2), max(16, block_n // 2)
+    return block_m, block_n
 
 
 @triton.jit
@@ -47,6 +64,8 @@ def _paged_attention_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    ks_ptr,
+    vs_ptr,
     o_ptr,
     indptr_ptr,
     indices_ptr,
@@ -60,8 +79,14 @@ def _paged_attention_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_ot,
     stride_oh,
+    QBITS: tl.constexpr,
+    QBLOCK: tl.constexpr,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -107,14 +132,28 @@ def _paged_attention_kernel(
         skip_tile = tl.max(mask_n.to(tl.int32), axis=0) == 0
         if not skip_tile:
             slots = tl.load(indices_ptr + kv_start + offs_n, mask=offs_n < kv_len, other=0)
-            k = tl.load(
-                k_ptr
-                + slots[:, None] * stride_ks
-                + kv_head * stride_kh
-                + offs_d[None, :],
-                mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
+            if QBITS == 0:
+                k = tl.load(
+                    k_ptr
+                    + slots[:, None] * stride_ks
+                    + kv_head * stride_kh
+                    + offs_d[None, :],
+                    mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                byte_d = offs_d // 2 if QBITS == 4 else offs_d
+                k = _dequant_tile(
+                    k_ptr,
+                    slots[:, None] * stride_ks + kv_head * stride_kh + byte_d[None, :],
+                    ks_ptr,
+                    slots[:, None] * stride_kss
+                    + kv_head * stride_ksh
+                    + (offs_d // QBLOCK)[None, :],
+                    ((offs_d % 2) == 1)[None, :],
+                    (offs_n[:, None] < kv_len) & mask_d[None, :],
+                    QBITS,
+                )
             scores = tl.sum(q[None, :] * k, axis=1) * sm_scale
             scores = tl.where(mask_n, scores, -float("inf"))
 
@@ -124,14 +163,28 @@ def _paged_attention_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new)
 
-            v = tl.load(
-                v_ptr
-                + slots[:, None] * stride_vs
-                + kv_head * stride_vh
-                + offs_d[None, :],
-                mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
+            if QBITS == 0:
+                v = tl.load(
+                    v_ptr
+                    + slots[:, None] * stride_vs
+                    + kv_head * stride_vh
+                    + offs_d[None, :],
+                    mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                byte_d = offs_d // 2 if QBITS == 4 else offs_d
+                v = _dequant_tile(
+                    v_ptr,
+                    slots[:, None] * stride_vs + kv_head * stride_vh + byte_d[None, :],
+                    vs_ptr,
+                    slots[:, None] * stride_vss
+                    + kv_head * stride_vsh
+                    + (offs_d // QBLOCK)[None, :],
+                    ((offs_d % 2) == 1)[None, :],
+                    (offs_n[:, None] < kv_len) & mask_d[None, :],
+                    QBITS,
+                )
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             m_i = m_new
@@ -145,10 +198,39 @@ def _paged_attention_kernel(
 
 
 @triton.jit
+def _dequant_tile(
+    code_ptr,
+    code_off,
+    scale_ptr,
+    scale_off,
+    nib_hi,
+    mask,
+    QBITS: tl.constexpr,
+):
+    """One K or V tile read back out of the block-quantized slabs (``--kv-cache-dtype``).
+
+    The caller owns the offsets because K arrives transposed ([D, N]) and V does not
+    ([N, DV]); everything that differs between the two is in how those are broadcast, and
+    everything that differs between 4- and 8-bit is here. ``other=0`` on both loads makes a
+    masked lane dequantize to a clean 0 rather than to garbage times a stale scale.
+    """
+    b = tl.load(code_ptr + code_off, mask=mask, other=0).to(tl.int32)
+    if QBITS == 8:
+        code = tl.where(b > 127, b - 256, b)
+    else:
+        nib = tl.where(nib_hi, (b >> 4) & 0xF, b & 0xF)
+        code = tl.where(nib > 7, nib - 16, nib)
+    s = tl.load(scale_ptr + scale_off, mask=mask, other=0.0).to(tl.float32)
+    return code.to(tl.float32) * s
+
+
+@triton.jit
 def _decode_grouped_stage1_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    ks_ptr,
+    vs_ptr,
     sm_scale,
     indptr_ptr,
     indices_ptr,
@@ -162,12 +244,18 @@ def _decode_grouped_stage1_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
     stride_lse_b,
     stride_lse_h,
     stride_lse_s,
+    QBITS: tl.constexpr,
+    QBLOCK: tl.constexpr,
     GROUP: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -219,12 +307,24 @@ def _decode_grouped_stage1_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_DV), dtype=tl.float32)
 
     q_offsets = batch_id * stride_qt + q_heads[:, None] * stride_qh + offs_d[None, :]
-    k_base_offsets = kv_head * stride_kh + offs_d[:, None]
-    v_base_offsets = kv_head * stride_vh + offs_dv[None, :]
+    if QBITS == 0:
+        k_base_offsets = kv_head * stride_kh + offs_d[:, None]
+        v_base_offsets = kv_head * stride_vh + offs_dv[None, :]
+    else:
+        # code byte per element: 8-bit is one byte each, 4-bit packs a pair low nibble first
+        byte_d = offs_d // 2 if QBITS == 4 else offs_d
+        byte_dv = offs_dv // 2 if QBITS == 4 else offs_dv
+        k_base_offsets = kv_head * stride_kh + byte_d[:, None]
+        v_base_offsets = kv_head * stride_vh + byte_dv[None, :]
+        k_scale_base = kv_head * stride_ksh + (offs_d // QBLOCK)[:, None]
+        v_scale_base = kv_head * stride_vsh + (offs_dv // QBLOCK)[None, :]
+        k_nib_hi = ((offs_d % 2) == 1)[:, None]
+        v_nib_hi = ((offs_dv % 2) == 1)[None, :]
 
     if split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
-        q = q.to(k_ptr.dtype.element_ty)
+        if QBITS == 0:
+            q = q.to(k_ptr.dtype.element_ty)
 
         for rel_start in tl.range(split_start, split_end, BLOCK_N):
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
@@ -232,19 +332,41 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0)
 
-            k = tl.load(
-                k_ptr + slots[None, :] * stride_ks + k_base_offsets,
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
+            if QBITS == 0:
+                k = tl.load(
+                    k_ptr + slots[None, :] * stride_ks + k_base_offsets,
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
+            else:
+                k = _dequant_tile(
+                    k_ptr,
+                    slots[None, :] * stride_ks + k_base_offsets,
+                    ks_ptr,
+                    slots[None, :] * stride_kss + k_scale_base,
+                    k_nib_hi,
+                    mask_n[None, :] & mask_d[:, None],
+                    QBITS,
+                ).to(q.dtype)
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
-            v = tl.load(
-                v_ptr + slots[:, None] * stride_vs + v_base_offsets,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if QBITS == 0:
+                v = tl.load(
+                    v_ptr + slots[:, None] * stride_vs + v_base_offsets,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+            else:
+                v = _dequant_tile(
+                    v_ptr,
+                    slots[:, None] * stride_vs + v_base_offsets,
+                    vs_ptr,
+                    slots[:, None] * stride_vss + v_scale_base,
+                    v_nib_hi,
+                    mask_n[:, None] & mask_dv[None, :],
+                    QBITS,
+                ).to(q.dtype)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -364,8 +486,15 @@ def decode_paged_attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
+    kv_quant=None,
 ) -> torch.Tensor:
-    """SGLang-style split-k grouped decode attention for one query per request."""
+    """SGLang-style split-k grouped decode attention for one query per request.
+
+    With ``kv_quant`` set (``--kv-cache-dtype``), ``k_cache``/``v_cache`` are uint8 code
+    slabs and ``k_scales``/``v_scales`` their fp16 block scales; the tiles are dequantized
+    inside the kernel, so nothing downstream of this call changes."""
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -373,7 +502,13 @@ def decode_paged_attention(
     num_kv_heads = k_cache.shape[1]
     assert batch == indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    if kv_quant is None:
+        assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    else:
+        assert k_scales is not None and v_scales is not None, "quantized slab without scales"
+        want = kv_quant.code_bytes_per_row(head_dim)
+        assert k_cache.shape[-1] == want and v_cache.shape[-1] == want
+        assert k_scales.shape[-1] == kv_quant.blocks_per_row(head_dim)
     assert num_q_heads % num_kv_heads == 0
     assert attn_logits.shape[0] >= batch
     assert attn_logits.shape[1] >= num_q_heads
@@ -405,6 +540,10 @@ def decode_paged_attention(
         q,
         k_cache,
         v_cache,
+        # unquantized: the slab itself stands in for the scale pointer (QBITS == 0 prunes
+        # every use of it) so the launch keeps one shape for both paths
+        k_scales if k_scales is not None else k_cache,
+        v_scales if v_scales is not None else v_cache,
         sm_scale,
         indptr,
         indices,
@@ -418,12 +557,18 @@ def decode_paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scales.stride(0) if k_scales is not None else 0,
+        k_scales.stride(1) if k_scales is not None else 0,
+        v_scales.stride(0) if v_scales is not None else 0,
+        v_scales.stride(1) if v_scales is not None else 0,
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
         attn_lse.stride(0),
         attn_lse.stride(1),
         attn_lse.stride(2),
+        QBITS=0 if kv_quant is None else kv_quant.bits,
+        QBLOCK=1 if kv_quant is None else kv_quant.block,
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
@@ -471,6 +616,8 @@ def _extend_attention_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    ks_ptr,
+    vs_ptr,
     o_ptr,
     qo_indptr_ptr,
     kv_indptr_ptr,
@@ -485,8 +632,14 @@ def _extend_attention_kernel(
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_ot,
     stride_oh,
+    QBITS: tl.constexpr,
+    QBLOCK: tl.constexpr,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -555,14 +708,28 @@ def _extend_attention_kernel(
         skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
         if not skip_tile:
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
-            k = tl.load(
-                k_ptr
-                + slots[None, :] * stride_ks
-                + kv_head * stride_kh
-                + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
+            if QBITS == 0:
+                k = tl.load(
+                    k_ptr
+                    + slots[None, :] * stride_ks
+                    + kv_head * stride_kh
+                    + offs_d[:, None],
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
+            else:
+                byte_d = offs_d // 2 if QBITS == 4 else offs_d
+                k = _dequant_tile(
+                    k_ptr,
+                    slots[None, :] * stride_ks + kv_head * stride_kh + byte_d[:, None],
+                    ks_ptr,
+                    slots[None, :] * stride_kss
+                    + kv_head * stride_ksh
+                    + (offs_d // QBLOCK)[:, None],
+                    ((offs_d % 2) == 1)[:, None],
+                    mask_n[None, :] & mask_d[:, None],
+                    QBITS,
+                ).to(q.dtype)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -572,14 +739,28 @@ def _extend_attention_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
 
-            v = tl.load(
-                v_ptr
-                + slots[:, None] * stride_vs
-                + kv_head * stride_vh
-                + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if QBITS == 0:
+                v = tl.load(
+                    v_ptr
+                    + slots[:, None] * stride_vs
+                    + kv_head * stride_vh
+                    + offs_dv[None, :],
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+            else:
+                byte_dv = offs_dv // 2 if QBITS == 4 else offs_dv
+                v = _dequant_tile(
+                    v_ptr,
+                    slots[:, None] * stride_vs + kv_head * stride_vh + byte_dv[None, :],
+                    vs_ptr,
+                    slots[:, None] * stride_vss
+                    + kv_head * stride_vsh
+                    + (offs_dv // QBLOCK)[None, :],
+                    ((offs_dv % 2) == 1)[None, :],
+                    mask_n[:, None] & mask_dv[None, :],
+                    QBITS,
+                ).to(q.dtype)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -595,6 +776,159 @@ def _extend_attention_kernel(
     )
 
 
+# ---------------------------------------------------------------------------------------
+# Prefill attention through cuBLAS, for cards the fused kernel does not fit
+# ---------------------------------------------------------------------------------------
+# The fused kernel stages q and four k/v tiles in shared memory, so its tile is bounded by
+# what the device has: at head_dim 256 a Turing card (64 KB) is cut to (32, 16) and runs the
+# prefill at 0.47 TFLOPS, while the same card does 19 TFLOPS of fp16 cuBLAS. This path spends
+# memory to get that back -- materialize the scores, softmax them, matmul again -- which is
+# what --dense-quant fp8 and the NVFP4 MoE already do on this hardware.
+#
+# Measured on an RTX 2060 (Ornith: 16 q heads, 2 kv heads, head_dim 256), one layer, 2048 new
+# tokens behind an 8192-token prefix: 658 ms fused -> 51 ms here, output bit-identical.
+_ATTN_SCRATCH_ENV = "FREETOKEN_ATTN_SCRATCH"
+_ATTN_SCRATCH_MB_ENV = "FREETOKEN_ATTN_SCRATCH_MB"
+# The score tile is the knob. Everything else this path allocates is fixed by the request.
+_ATTN_SCRATCH_MB = 48
+# Below this many rows the fused kernel is the better shape (a verify window, a chat turn
+# behind a cached prefix): the GEMMs are thin and the gather is paid for a handful of rows.
+_ATTN_SCRATCH_MIN_ROWS = 128
+# The gathered contiguous K/V is the one allocation not bounded by the score budget -- it is
+# the whole context. Past this multiple of the budget, leave it to the fused kernel, whose
+# footprint is its tile.
+_ATTN_SCRATCH_GATHER_LIMIT = 4
+
+
+def _attn_scratch_bytes() -> int:
+    return max(1, int(os.getenv(_ATTN_SCRATCH_MB_ENV) or _ATTN_SCRATCH_MB)) << 20
+
+
+@functools.lru_cache(maxsize=1)
+def _attn_scratch_default() -> bool:
+    """On by default where the fused tile had to be cut: pre-Ampere (64 KB of shared memory).
+
+    Ampere and later fit (128, 64) and run the fused kernel at rates this path cannot reach,
+    so they keep it. ``FREETOKEN_ATTN_SCRATCH=1`` forces this path on for a card that was not
+    measured, ``=0`` forces it off.
+    """
+    from freetoken.utils.arch import is_pre_ampere
+
+    return is_pre_ampere()
+
+
+def _scratch_attention_applies(
+    q: torch.Tensor,
+    k_extend: torch.Tensor | None,
+    v_extend: torch.Tensor | None,
+    sliding_window: int | None,
+    sinks: torch.Tensor | None,
+    kv_quant,
+    num_rows: int,
+    kv_len: int,
+    head_dim: int,
+    num_kv_heads: int,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
+) -> bool:
+    """Whether the cuBLAS path can serve this call.
+
+    Everything it cannot express falls through to the fused kernel rather than growing a
+    second implementation of it: a sliding window, attention sinks, and the non-split call
+    where this forward's own K/V are already in the cache. A quantized cache
+    (``--kv-cache-dtype``) IS served here -- the prefix is decoded as part of the gather.
+    """
+    forced = os.getenv(_ATTN_SCRATCH_ENV)
+    if forced is not None:
+        if forced.strip() not in ("1", "true", "yes", "on"):
+            return False
+    elif not _attn_scratch_default():
+        return False
+    if k_extend is None or v_extend is None:
+        return False
+    if kv_quant is not None and (k_scales is None or v_scales is None):
+        return False        # a quantized slab without its scales cannot be decoded
+    if sliding_window or sinks is not None:
+        return False
+    if num_rows < _ATTN_SCRATCH_MIN_ROWS:
+        return False
+    gather = 2 * num_kv_heads * kv_len * head_dim * q.element_size()
+    return gather <= _ATTN_SCRATCH_GATHER_LIMIT * _attn_scratch_bytes()
+
+
+def _extend_attention_scratch(
+    q: torch.Tensor,
+    k_extend: torch.Tensor,
+    v_extend: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    o: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    sm_scale: float,
+    kv_quant=None,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Causal extend attention as three cuBLAS calls per tile, over a materialized score tile.
+
+    Per sequence and per KV head: gather the prefix rows out of the paged cache, append this
+    forward K/V so the keys are one contiguous matrix, then walk the query rows in tiles whose
+    score block fits ``FREETOKEN_ATTN_SCRATCH_MB``. The whole key range is scored at once, so
+    the softmax is the plain one -- no running maximum, nothing to rescale.
+
+    The mask is only ever needed on the last ``rows`` columns: every prefix key precedes every
+    query row in this forward, and within the forward row i takes keys 0..i.
+    """
+    num_q_heads = q.shape[1]
+    num_kv_heads = k_cache.shape[1]
+    group = num_q_heads // num_kv_heads
+    budget = _attn_scratch_bytes()
+    # one .tolist() per call, not one .item() per index: these are tiny host-side loop bounds
+    starts = qo_indptr.tolist()
+    kv_starts = kv_indptr.tolist()
+    prefixes = prefix_lens.tolist()
+
+    for seq, prefix in enumerate(prefixes):
+        q0, q1 = starts[seq], starts[seq + 1]
+        rows = q1 - q0
+        if rows <= 0:
+            continue
+        kv_len = prefix + rows
+        # bytes one query row costs in the score block: the fp16 scores, the fp32 softmax
+        # torch materializes, and the cast back
+        per_row = group * kv_len * (2 * q.element_size() + 4)
+        block = max(16, min(rows, int(budget // max(1, per_row))))
+        cols = torch.arange(rows, device=q.device)
+        slots = kv_indices[kv_starts[seq] : kv_starts[seq] + prefix].long()
+        for head in range(num_kv_heads):
+            prefix_k, prefix_v = k_cache[slots, head], v_cache[slots, head]
+            if kv_quant is not None:
+                # The slabs hold packed codes; decode the rows this sequence actually reads,
+                # once, into the gather that was going to be built anyway. The result is the
+                # same fp16 matrix the unquantized path produces, so nothing downstream
+                # changes -- and the transient does not grow either.
+                from freetoken.kvcache.kv_quant import dequantize_rows
+
+                prefix_k = dequantize_rows(prefix_k, k_scales[slots, head], kv_quant, q.dtype)
+                prefix_v = dequantize_rows(prefix_v, v_scales[slots, head], kv_quant, q.dtype)
+            keys = torch.cat([prefix_k, k_extend[q0:q1, head]]).transpose(0, 1)
+            values = torch.cat([prefix_v, v_extend[q0:q1, head]])
+            lo, hi = head * group, (head + 1) * group
+            for start in range(0, rows, block):
+                end = min(start + block, rows)
+                # [group, tile, head_dim] @ [head_dim, kv_len] -> [group, tile, kv_len]
+                scores = torch.matmul(q[q0 + start : q0 + end, lo:hi].permute(1, 0, 2), keys)
+                scores.mul_(sm_scale)
+                future = cols[None, :] > cols[start:end, None]
+                scores[:, :, prefix:].masked_fill_(future, -float("inf"))
+                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+                o[q0 + start : q0 + end, lo:hi] = torch.matmul(probs, values).permute(1, 0, 2)
+    return o
+
+
 @triton.jit
 def _extend_attention_split_kernel(
     q_ptr,
@@ -602,6 +936,8 @@ def _extend_attention_split_kernel(
     v_extend_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    ks_ptr,
+    vs_ptr,
     o_ptr,
     qo_indptr_ptr,
     kv_indptr_ptr,
@@ -620,8 +956,14 @@ def _extend_attention_split_kernel(
     stride_kch,
     stride_vcs,
     stride_vch,
+    stride_kss,
+    stride_ksh,
+    stride_vss,
+    stride_vsh,
     stride_ot,
     stride_oh,
+    QBITS: tl.constexpr,
+    QBLOCK: tl.constexpr,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -684,14 +1026,28 @@ def _extend_attention_split_kernel(
 
         if not skip_tile:
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
-            k = tl.load(
-                k_cache_ptr
-                + slots[None, :] * stride_kcs
-                + kv_head * stride_kch
-                + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
-            )
+            if QBITS == 0:
+                k = tl.load(
+                    k_cache_ptr
+                    + slots[None, :] * stride_kcs
+                    + kv_head * stride_kch
+                    + offs_d[:, None],
+                    mask=mask_n[None, :] & mask_d[:, None],
+                    other=0.0,
+                )
+            else:
+                byte_d = offs_d // 2 if QBITS == 4 else offs_d
+                k = _dequant_tile(
+                    k_cache_ptr,
+                    slots[None, :] * stride_kcs + kv_head * stride_kch + byte_d[:, None],
+                    ks_ptr,
+                    slots[None, :] * stride_kss
+                    + kv_head * stride_ksh
+                    + (offs_d // QBLOCK)[:, None],
+                    ((offs_d % 2) == 1)[:, None],
+                    mask_n[None, :] & mask_d[:, None],
+                    QBITS,
+                ).to(q.dtype)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -701,14 +1057,28 @@ def _extend_attention_split_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
 
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_vcs
-                + kv_head * stride_vch
-                + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
+            if QBITS == 0:
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vcs
+                    + kv_head * stride_vch
+                    + offs_dv[None, :],
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+            else:
+                byte_dv = offs_dv // 2 if QBITS == 4 else offs_dv
+                v = _dequant_tile(
+                    v_cache_ptr,
+                    slots[:, None] * stride_vcs + kv_head * stride_vch + byte_dv[None, :],
+                    vs_ptr,
+                    slots[:, None] * stride_vss
+                    + kv_head * stride_vsh
+                    + (offs_dv // QBLOCK)[None, :],
+                    ((offs_dv % 2) == 1)[None, :],
+                    mask_n[:, None] & mask_dv[None, :],
+                    QBITS,
+                ).to(q.dtype)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -793,9 +1163,19 @@ def extend_paged_attention(
     out: torch.Tensor | None = None,
     k_extend: torch.Tensor | None = None,
     v_extend: torch.Tensor | None = None,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
+    kv_quant=None,
     block_ends: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Block-tiled causal prefill/extend attention over paged KV cache; block_ends holds per query token the end of the multimodal span it sits in (0 for none), whose later keys the row also attends."""
+    """Block-tiled causal prefill/extend attention over paged KV cache; block_ends holds per query
+    token the end of the multimodal span it sits in (0 for none), whose later keys the row also attends.
+
+    ``kv_quant`` (``--kv-cache-dtype``) makes ``k_cache``/``v_cache`` uint8 code slabs read
+    through ``k_scales``/``v_scales``. Only the PREFIX comes from the cache: this forward's
+    own K/V arrive unquantized in ``k_extend``/``v_extend`` and stay that way, so the tokens
+    being written this step are attended at full precision.
+    """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -804,7 +1184,12 @@ def extend_paged_attention(
     assert qo_indptr.numel() == kv_indptr.numel()
     assert prefix_lens.numel() == qo_indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    if kv_quant is None:
+        assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    else:
+        assert k_scales is not None and v_scales is not None, "quantized slab without scales"
+        want = kv_quant.code_bytes_per_row(head_dim)
+        assert k_cache.shape[-1] == want and v_cache.shape[-1] == want
     assert num_q_heads % num_kv_heads == 0
     if sinks is not None:
         assert sinks.is_cuda
@@ -816,6 +1201,25 @@ def extend_paged_attention(
         assert block_ends.is_cuda and block_ends.dtype == torch.int32 and block_ends.numel() == num_q_tokens
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    if block_ends is None and _scratch_attention_applies(
+        q,
+        k_extend,
+        v_extend,
+        sliding_window,
+        sinks,
+        kv_quant,
+        num_rows=num_q_tokens // max(1, qo_indptr.numel() - 1),
+        kv_len=int(prefix_lens.max()) + num_q_tokens,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+        k_scales=k_scales,
+        v_scales=v_scales,
+    ):
+        return _extend_attention_scratch(
+            q, k_extend, v_extend, k_cache, v_cache, o,
+            qo_indptr, kv_indptr, kv_indices, prefix_lens, sm_scale,
+            kv_quant=kv_quant, k_scales=k_scales, v_scales=v_scales,
+        )
     block_ends_arg = block_ends if block_ends is not None else qo_indptr
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
@@ -823,7 +1227,7 @@ def extend_paged_attention(
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
     block_m, block_n = _select_extend_tile(
-        head_dim, block_d, _optin_smem_bytes(q.device.index)
+        head_dim, block_d, _optin_smem_bytes(q.device.index), split=k_extend is not None
     )
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
     if k_extend is not None or v_extend is not None:
@@ -839,6 +1243,8 @@ def extend_paged_attention(
             v_extend,
             k_cache,
             v_cache,
+            k_scales if k_scales is not None else k_cache,
+            v_scales if v_scales is not None else v_cache,
             o,
             qo_indptr,
             kv_indptr,
@@ -857,8 +1263,14 @@ def extend_paged_attention(
             k_cache.stride(1),
             v_cache.stride(0),
             v_cache.stride(1),
+            k_scales.stride(0) if k_scales is not None else 0,
+            k_scales.stride(1) if k_scales is not None else 0,
+            v_scales.stride(0) if v_scales is not None else 0,
+            v_scales.stride(1) if v_scales is not None else 0,
             o.stride(0),
             o.stride(1),
+            QBITS=0 if kv_quant is None else kv_quant.bits,
+            QBLOCK=1 if kv_quant is None else kv_quant.block,
             GROUP=num_q_heads // num_kv_heads,
             D=head_dim,
             BLOCK_D=block_d,
@@ -877,6 +1289,8 @@ def extend_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scales if k_scales is not None else k_cache,
+        v_scales if v_scales is not None else v_cache,
         o,
         qo_indptr,
         kv_indptr,
@@ -891,8 +1305,14 @@ def extend_paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scales.stride(0) if k_scales is not None else 0,
+        k_scales.stride(1) if k_scales is not None else 0,
+        v_scales.stride(0) if v_scales is not None else 0,
+        v_scales.stride(1) if v_scales is not None else 0,
         o.stride(0),
         o.stride(1),
+        QBITS=0 if kv_quant is None else kv_quant.bits,
+        QBLOCK=1 if kv_quant is None else kv_quant.block,
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,
@@ -921,12 +1341,21 @@ def paged_attention(
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_n: int = 32,
+    k_scales: torch.Tensor | None = None,
+    v_scales: torch.Tensor | None = None,
+    kv_quant=None,
 ) -> torch.Tensor:
     """Paged causal attention for one layer.
 
     ``q`` is ``[num_query_tokens, num_q_heads, head_dim]``. KV cache tensors are
     flattened to ``[num_slots, num_kv_heads, head_dim]``. ``indptr`` and
     ``indices`` describe each request's logical KV slots in order.
+
+    ``kv_quant`` (``--kv-cache-dtype``): code slabs read through ``k_scales``/``v_scales``.
+    This is the fallback path -- the backend only reaches it for a head_dim the tiled extend
+    kernel will not take -- but it carries the quantized read too, because a path that
+    silently interpreted codes as 16-bit floats would produce plausible garbage rather than
+    an error.
     """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
@@ -934,7 +1363,12 @@ def paged_attention(
     num_tokens, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    if kv_quant is None:
+        assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    else:
+        assert k_scales is not None and v_scales is not None, "quantized slab without scales"
+        want = kv_quant.code_bytes_per_row(head_dim)
+        assert k_cache.shape[-1] == want and v_cache.shape[-1] == want
     assert num_q_heads % num_kv_heads == 0
     if sinks is not None:
         assert sinks.is_cuda
@@ -950,6 +1384,8 @@ def paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scales if k_scales is not None else k_cache,
+        v_scales if v_scales is not None else v_cache,
         o,
         indptr,
         indices,
@@ -963,8 +1399,14 @@ def paged_attention(
         k_cache.stride(1),
         v_cache.stride(0),
         v_cache.stride(1),
+        k_scales.stride(0) if k_scales is not None else 0,
+        k_scales.stride(1) if k_scales is not None else 0,
+        v_scales.stride(0) if v_scales is not None else 0,
+        v_scales.stride(1) if v_scales is not None else 0,
         o.stride(0),
         o.stride(1),
+        QBITS=0 if kv_quant is None else kv_quant.bits,
+        QBLOCK=1 if kv_quant is None else kv_quant.block,
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,

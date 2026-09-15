@@ -343,3 +343,105 @@ def test_streaming_support_flags():
     # test_streaming_model_matrix.py::test_non_streaming_detector_falls_back_to_buffered_parse).
     for name in SUPPORTED_TOOL_CALL_PARSERS:
         assert FunctionCallParser(TOOLS, tool_call_parser=name).supports_streaming() is True
+
+
+# --------------------------------------------------------------------------- #
+# qwen3_coder: Hermes-style JSON body inside <tool_call>
+# --------------------------------------------------------------------------- #
+_QWEN_XML_READ = (
+    "<tool_call>\n<function=read>\n<parameter=filePath>\n/tmp/a.py\n</parameter>\n"
+    "</function>\n</tool_call>"
+)
+_QWEN_JSON_READ = '<tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/a.py"}}\n</tool_call>'
+_QWEN_JSON_GLOB = '<tool_call>{"name": "glob", "arguments": {"pattern": "*.py"}}</tool_call>'
+
+
+def _qwen3_coder_stream(text, step):
+    """Stream ``text`` in ``step``-char chunks, then run the end-of-stream drain the
+    serving layer runs. Returns (content, [(name, args)])."""
+    parser = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="qwen3_coder")
+    texts, fragments = _feed(parser, [text[i : i + step] for i in range(0, len(text), step)])
+    calls = []
+    for frag in fragments:
+        if frag.name is not None:
+            calls.append([frag.name, ""])
+        calls[-1][1] += frag.parameters
+    for item in parser.recover_truncated_call():
+        calls.append([item.name, item.parameters])
+    content = "".join(texts) + parser.finish_stream()
+    return content, [(name, json.loads(args)) for name, args in calls]
+
+
+def _qwen3_coder_one_shot(text):
+    result = FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="qwen3_coder").parse_non_stream(text)
+    return result.normal_text, [(c.name, json.loads(c.parameters)) for c in result.calls]
+
+
+def _norm(text):
+    return " ".join(text.split())
+
+
+@pytest.mark.parametrize("block", [_QWEN_XML_READ, _QWEN_JSON_READ], ids=["xml", "json"])
+@pytest.mark.parametrize("step", [1, 4, 1000])
+def test_qwen3_coder_xml_and_json_calls_agree_across_paths(block, step):
+    text = "Checking. " + block + "\nDone."
+    expected = [("read", {"filePath": "/tmp/a.py"})]
+
+    one_shot_text, one_shot_calls = _qwen3_coder_one_shot(text)
+    stream_text, stream_calls = _qwen3_coder_stream(text, step)
+
+    assert one_shot_calls == stream_calls == expected
+    assert _norm(one_shot_text) == _norm(stream_text) == "Checking. Done."
+
+
+@pytest.mark.parametrize("step", [1, 5, 1000])
+def test_qwen3_coder_mixed_xml_and_json_calls_keep_order(step):
+    text = _QWEN_XML_READ + "\n" + _QWEN_JSON_GLOB
+    expected = [("read", {"filePath": "/tmp/a.py"}), ("glob", {"pattern": "*.py"})]
+
+    assert _qwen3_coder_one_shot(text)[1] == expected
+    assert _qwen3_coder_stream(text, step)[1] == expected
+    ordinals = [
+        c.tool_index
+        for c in FunctionCallParser(OPENCODE_TOOLS, tool_call_parser="qwen3_coder")
+        .parse_non_stream(text)
+        .calls
+    ]
+    assert ordinals == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        '<tool_call>\n{"name": "read", "arguments": {"filePath": }\n</tool_call>',  # malformed
+        '<tool_call>\n{"arguments": {"filePath": "/tmp/a.py"}}\n</tool_call>',  # no name
+        '<tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/a.py"}',  # truncated
+    ],
+    ids=["malformed", "no-name", "truncated-malformed"],
+)
+@pytest.mark.parametrize("step", [1, 3, 1000])
+def test_qwen3_coder_invalid_json_block_passes_through_in_both_paths(block, step):
+    text = "Let me look. " + block
+
+    one_shot_text, one_shot_calls = _qwen3_coder_one_shot(text)
+    stream_text, stream_calls = _qwen3_coder_stream(text, step)
+
+    assert one_shot_calls == stream_calls == []
+    assert one_shot_text == stream_text == text
+
+
+@pytest.mark.parametrize("step", [1, 7, 1000])
+def test_qwen3_coder_unterminated_json_call_recovers_in_both_paths(step):
+    text = 'Reading. <tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/a.py"}}\n'
+    expected = [("read", {"filePath": "/tmp/a.py"})]
+
+    assert _qwen3_coder_one_shot(text)[1] == expected
+    stream_text, stream_calls = _qwen3_coder_stream(text, step)
+    assert stream_calls == expected
+    assert "<tool_call>" not in stream_text
+
+
+def test_qwen3_coder_json_like_text_outside_tool_call_is_content():
+    text = 'Here is JSON: {"name": "read", "arguments": {}}'
+    assert _qwen3_coder_one_shot(text) == (text, [])
+    assert _qwen3_coder_stream(text, 3) == (text, [])

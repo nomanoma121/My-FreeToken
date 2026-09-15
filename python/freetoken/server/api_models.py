@@ -89,6 +89,10 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     function_call: Any | None = None
     logit_bias: dict[str, float] | None = None
+    # Declared so they can be refused: the engine samples token ids and keeps no probabilities,
+    # and with extra="allow" an undeclared logprobs used to be accepted and dropped.
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
     response_format: dict[str, Any] | None = None
 
     @model_validator(mode="after")

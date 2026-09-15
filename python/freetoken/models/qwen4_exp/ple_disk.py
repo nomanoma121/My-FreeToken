@@ -6,7 +6,8 @@ Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hi
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -18,6 +19,7 @@ from freetoken.mm import MM_PAD_SHIFT_VALUE, restore_placeholder
 from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.utils import init_logger
+from freetoken.utils.prefill_profile import active as _prefill_profile
 
 from .weight import (
     _PLE_SCALE_SUFFIX,
@@ -29,6 +31,7 @@ from .weight import (
 
 _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
+_PROFILE_ENV = "FREETOKEN_PLE_PROFILE"  # >0: log the host fill cost every N fills
 
 logger = init_logger(__name__)
 
@@ -37,6 +40,20 @@ def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
     """The two token ids before ``position``; eos pads past the start."""
     return [int(ids[position - 2]) if position >= 2 else eos,
             int(ids[position - 1]) if position >= 1 else eos]
+
+
+def _extend_ids(req) -> torch.Tensor:
+    """This forward's tokens of ``req`` (host): ``input_ids[cached_len:device_len]``, plus the
+    draft ids of an open MTP verify window (they sit in the device token pool, not in the host
+    id list, but the hash windows are computed here)."""
+    ids = req.input_ids[req.cached_len : req.device_len]
+    drafts = getattr(req, "spec_drafts", None)
+    if drafts and getattr(req, "spec_base_len", None) is not None:
+        ids = torch.cat((ids, torch.tensor(list(drafts), dtype=ids.dtype)))
+    assert ids.numel() == req.device_len - req.cached_len, (
+        f"PLE staging: {ids.numel()} ids for an extend of {req.device_len - req.cached_len}"
+    )
+    return ids
 
 
 @dataclass(frozen=True)
@@ -161,6 +178,10 @@ class DiskRowTable:
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
+        self._profile_every = int(os.getenv(_PROFILE_ENV, "0") or 0)
+        self._fill_seconds = 0.0
+        self._fill_tokens = 0
+        self._fill_count = 0
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
@@ -187,12 +208,45 @@ class DiskRowTable:
 
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
+        started = time.perf_counter() if self._profile_every else 0.0
         pinned = self._graph_pinned if graph else self._eager_pinned
         offset = 0
-        for run in runs:
-            self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
-            offset += run.numel() - 2
-        self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
+        prof = _prefill_profile()
+        with prof.ple_fill() if prof is not None else nullcontext():
+            for run in runs:
+                self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
+                offset += run.numel() - 2
+            self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
+        if self._profile_every:
+            self._note_fill(time.perf_counter() - started, offset)
+
+    def _note_fill(self, seconds: float, tokens: int) -> None:
+        """Accumulate host fill cost.
+
+        WHAT THIS MEASURES DEPENDS ON THE SYNC MODE, so the log names it.
+
+        * launch-gating (``FREETOKEN_PLE_SYNC=gate``): ``flush`` waits for the reads, so this
+          is submit + completion -- the actual disk latency.
+        * flag-sync: ``flush`` hands the completion signal to the store and returns, so this
+          is SUBMISSION ONLY. A constant cost per token here says nothing about how long the
+          reads took; the graph absorbs that at its WAIT.
+
+        Read cold-vs-warm numbers from the gating run. The first measurement taken here was
+        under flag-sync and showed 0.10 ms/token either side of drop_caches, which is the
+        submission being cache-independent, not the reads being free.
+        """
+        self._fill_seconds += seconds
+        self._fill_tokens += tokens
+        self._fill_count += 1
+        if self._fill_count % self._profile_every:
+            return
+        n = self._fill_count
+        mode = "submit-only (flag-sync)" if self._wait_sync else "submit+complete (gating)"
+        logger.info(
+            f"PLE fill [{mode}]: {n} fills, {self._fill_seconds / n * 1e3:.2f} ms each "
+            f"({self._fill_tokens / n:.1f} tokens per fill, "
+            f"{self._fill_seconds / max(1, self._fill_tokens) * 1e3:.2f} ms per token)"
+        )
 
     def _ple_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.image_token_id is None:
@@ -238,11 +292,14 @@ class DiskRowTable:
         runs = [
             torch.cat((
                 torch.tensor(self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64),
-                self._ple_ids(req.input_ids[req.cached_len : req.device_len]).to(torch.int64),
+                self._ple_ids(_extend_ids(req)).to(torch.int64),
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        # an extend replayed as a graph (the MTP verify window) consumes the graph staging
+        # buffer under the same flag handshake as decode; its ids are host-known, so the fill
+        # (and its signal) go out before the replay is launched
+        self.fill(runs, graph=use_graph)
         return None
 
     @contextmanager

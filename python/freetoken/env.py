@@ -75,6 +75,16 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # Stall diagnostics, in seconds (<= 0 turns one off). ADMISSION: the head of the prefill
+    # queue has been refused this long. RANK_WAIT: a gloo send/recv between ranks has blocked
+    # this long -- keep it above the longest prefill chunk, which the other rank may be running.
+    # Both repeat every max(threshold, 60 s) while the condition lasts.
+    ADMISSION_WARN_SECONDS = EnvFloat(30.0)
+    RANK_WAIT_WARN_SECONDS = EnvFloat(60.0)
+    # How long a rank that reaches a startup collective early waits for the others (seconds). The
+    # gloo group's own timeout stays at --distributed-timeout for serving; loading can leave the
+    # ranks minutes apart (distributed/rendezvous.py).
+    RANK_JOIN_TIMEOUT_SECONDS = EnvFloat(3600.0)
 
     def __new__(cls):
         # single instance

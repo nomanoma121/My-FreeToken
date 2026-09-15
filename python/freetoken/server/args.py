@@ -27,6 +27,20 @@ class _DeprecatedAlias(argparse.Action):
         setattr(namespace, self.dest, self.convert(values) if self.convert else values)
 
 
+def _parse_bank_readahead(value: str) -> str:
+    """--moe-bank-readahead: off, auto, or a positive number of kB."""
+    v = str(value).strip().lower()
+    if v in ("off", "auto"):
+        return v
+    try:
+        kb = int(v)
+    except ValueError:
+        kb = 0
+    if kb <= 0:
+        raise argparse.ArgumentTypeError(f"expected off, auto or a positive kB value, got {value!r}")
+    return str(kb)
+
+
 def _nvfp4_entry(value: str) -> str:
     """The --quant-backend entry an old --nvfp4-backend value stands for; auto stands for none."""
     if value == "auto":
@@ -281,6 +295,66 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-embedding",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep the input embedding table in pinned host memory; the GPU gathers the rows it "
+            "needs in place over PCIe (also inside CUDA graphs). Frees the table's VRAM (about "
+            "1 GB for a 250k x 2048 vocabulary) for KV pages on small cards. Qwen3.5-MoE family."
+        ),
+    )
+
+    parser.add_argument(
+        "--pp-size",
+        type=int,
+        default=1,
+        help=(
+            "Pipeline (layer-split) parallelism: run the decoder layers as N contiguous "
+            "blocks, one process per GPU (--gpu lists them in rank order). Rank 0 owns the "
+            "embedding, the last rank owns the head; the residual stream crosses ranks over "
+            "gloo, so no NCCL/P2P is needed. Mutually exclusive with --tp-size > 1."
+        ),
+    )
+
+    parser.add_argument(
+        "--dense-quant",
+        type=str,
+        default="none",
+        choices=["none", "fp8"],
+        help=(
+            "Quantize the checkpoint's bf16 dense (non-expert) weights at load: 'fp8' = per-row "
+            "fp8-e4m3 W8A16 for attention, GDN, shared expert, lm_head and the embedding "
+            "(roughly halves their VRAM and per-token read traffic). A projection the checkpoint "
+            "already quantized keeps its own format, and the router, hyper-connection, QSA indexer, "
+            "PLE and GDN b/a gates stay bf16. Measured on qwen4_exp (Qwen3.8-Flash-Next)."
+        ),
+    )
+
+    parser.add_argument(
+        "--spec-mtp",
+        type=int,
+        default=0,
+        help=(
+            "MTP speculative decoding: verify K drafts from the checkpoint's own MTP head per "
+            "step (0 = off). Single-request decode (use --max-running-req 1); the draft head "
+            "runs on the head-owning rank and adds one full-attention layer and one expert-bank "
+            "layer (its bf16 experts are quantized to NVFP4 at load). Qwen3.5-MoE family and "
+            "Qwen3.8-Flash-Next NVFP4 checkpoints."
+        ),
+    )
+
+    parser.add_argument(
+        "--pp-layers",
+        type=str,
+        default=None,
+        help=(
+            "Layer boundaries of the --pp-size split, comma-separated (N-1 values): '24' "
+            "gives rank 0 layers [0,24) and rank 1 [24,48). Default: even split."
+        ),
+    )
+
+    parser.add_argument(
         "--gpu",
         type=_lazy_gpu_arg,
         default=ServerArgs.gpu,
@@ -489,10 +563,22 @@ def parse_args(
 
     parser.add_argument(
         "--mm-encoder-weights",
-        choices=["gpu", "host"],
+        choices=["gpu", "host", "cpu"],
         default=MultimodalConfig.encoder_weights,
         help="Encoder tower block weights: pinned host banks streamed two blocks at a time behind the "
-        "compute (default, about 60 MiB of VRAM instead of the whole tower), or resident on the GPU.",
+        "compute (default, about 60 MiB of VRAM instead of the whole tower), or resident on the GPU. "
+        "cpu: the vision tower runs on the CPU in the tokenizer worker (no VRAM and no pinned memory, "
+        "a few seconds per image; the Qwen3.5/3.6 and Qwen3.8-Flash-Next towers).",
+    )
+
+    parser.add_argument(
+        "--mm-encoder-dtype",
+        choices=["auto", "float32", "float16", "bfloat16"],
+        default=MultimodalConfig.encoder_dtype,
+        help="Compute dtype of the Qwen VL vision tower on the GPU (not --mm-encoder-weights cpu, which is "
+        "float32; other families' towers follow the model dtype). auto: "
+        "float32 when the model runs bfloat16 -- the Qwen VL vision tower loses about 9%% of its output in "
+        "bfloat16 -- otherwise the model dtype.",
     )
 
     parser.add_argument(
@@ -671,10 +757,206 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=float,
+        default=ServerArgs.linear_state_cache_ratio,
+        help=(
+            "Hybrid GDN models (Qwen3.5-MoE, Qwen3.8-Flash-Next): GDN-state snapshots kept for "
+            "prefix reuse, per running request, on top of the 4 slots each request needs to "
+            "run (floor 4). A prefix can only be resumed from a live snapshot, so this -- not "
+            "the KV budget -- bounds how many conversations stay reusable: at the default 2.0 "
+            "with --max-running-req 1 the cache holds 4 snapshots, and switching between more "
+            "conversations than that re-prefills them. How many snapshots a conversation "
+            "costs is per model; see docs/prefix-reuse.md. Each slot is one GDN state in VRAM "
+            "(every GDN layer's recurrent + conv state; about 62 MiB for 30 GDN layers)."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-disk-cache",
+        default=ServerArgs.prefix_disk_cache,
+        metavar="DIR",
+        help=(
+            "Hybrid GDN models (Qwen3.5-MoE, Qwen3.8-Flash-Next), one GPU: keep prefix-cache "
+            "entries -- a prompt's KV pages and the GDN state snapshot at its end -- in this "
+            "directory, written while the server is idle, and read them back instead of "
+            "prefilling again when a prompt starts with one the in-memory cache no longer "
+            "holds, including after a restart. Only prefixes of 1024+ tokens are written. "
+            "Entries are keyed by the exact tokens and by the model, weights and cache layout; "
+            "anything else is never read. Refused with --pp-size / --tp-size > 1. "
+            "See docs/prefix-reuse.md."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-disk-cache-size",
+        default=ServerArgs.prefix_disk_cache_size,
+        metavar="SIZE",
+        help=(
+            "Cap for --prefix-disk-cache's directory (e.g. 32G, the default). The least "
+            "recently used entries are removed to stay under it."
+        ),
+    )
+    parser.add_argument(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
         help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+    )
+
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Accumulate decode miss-rate counters in the offload MoE cache (device-side, "
+            "captured into the decode graph). Read back by --moe-stats-out."
+        ),
+    )
+    parser.add_argument(
+        "--moe-stats-out",
+        default=ServerArgs.moe_stats_out,
+        help=(
+            "Write the decode routing histogram (per layer, per expert) and the realized "
+            "miss rates to this JSON path, rewritten each time the server goes idle and on "
+            "shutdown; implies --moe-collect-stats. One "
+            "file per pipeline rank (.rank<N>.json) when --pp-size > 1. The histogram is "
+            "only accumulated outside a captured graph, so pair it with "
+            "--disable-cuda-graph for a collection run."
+        ),
+    )
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        help=(
+            "Run decode eagerly (no CUDA graph capture). Much slower; for instrumentation "
+            "runs whose counters must see the real per-step routing."
+        ),
+    )
+
+    parser.add_argument(
+        "--prefill-mixer-pieces",
+        type=int,
+        default=ServerArgs.prefill_mixer_pieces,
+        help=(
+            "Run each prefill chunk's GDN / attention over this many consecutive pieces and its "
+            "MoE over the whole chunk (default 1 = off). The mixers are what cap a chunk's width "
+            "on a small card, so with pieces the chunk-budget probe measures less and picks wider "
+            "chunks, and an offloaded MoE streams its expert banks fewer times per prompt. "
+            "Measured on an RTX 2060 (Ornith, 19.9k-token prompt): 490 -> 649 tok/s at 2, "
+            "722 tok/s at 4 with --max-prefill-length 16384. Qwen3.8-Flash-Next (one GPU or "
+            "--pp-size) and single-GPU Qwen3.5-MoE."
+        ),
+    )
+
+    parser.add_argument(
+        "--prefill-profile",
+        action="store_true",
+        default=ServerArgs.prefill_profile,
+        help=(
+            "Log one line per prefill forward on every rank splitting its wall time into "
+            "waiting for the other pipeline rank, host copies of expert rows the GPU cannot "
+            "read directly (page faults on a --moe-bank-ram bank land here), per-layer "
+            "embedding reads, and the GPU plus the rest; with the GiB copied and their rate, "
+            "major page faults, storage reads, how much of the bank the page cache held, and "
+            "the achieved PCIe rate of the registered rows. Costs a device sync per forward."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-chunk-budget",
+        type=float,
+        default=ServerArgs.prefill_chunk_budget,
+        help=(
+            "Share of the free VRAM one prefill chunk's transient may take (default 0.55; "
+            "0 disables and --max-prefill-length is used as given). The chunk is what the "
+            "linear-attention kernels size their per-forward buffers from, and a chunk whose "
+            "transient is the size of the free VRAM runs slow before it runs out; the engine "
+            "measures that cost per token at startup and re-solves the chunk before every "
+            "prefill against the VRAM free right then. The rest is headroom for whatever else "
+            "uses the card: a dedicated box can run 0.8-0.9, a desktop that opens a browser "
+            "mid-request wants less."
+        ),
+    )
+
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", "q8_0", "q4_0"],
+        help=(
+            "Store the paged KV cache as block-quantized codes instead of 16-bit: q8_0 is "
+            "1.88x smaller, q4_0 3.56x. The point on a small card is not context length but "
+            "the expert cache -- --moe-cache-auto hands the freed VRAM to MoE slots, and a "
+            "deeper expert cache is what decode time is made of. Plain paged-attention "
+            "models, Qwen3.8-Flash-Next and gpt-oss (both its full and its sliding-window "
+            "layers); refused at startup otherwise. q4_0 costs measurable accuracy."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-bank-ram",
+        default=ServerArgs.moe_bank_ram,
+        help=(
+            "Cap host RAM for the expert banks (e.g. 50G), across the whole host: a "
+            "--pp-size 2 run splits it between the two ranks. Experts past the cap move to "
+            "a cold bank file on disk, chosen by measured routing frequency. Needs an NVMe: "
+            "the cold half is read per token. 'auto' takes MemAvailable at startup less "
+            "4.5 GiB per rank for the rest of the server and a page cache margin, and logs "
+            "the arithmetic. 'ft doctor disk' says whether this host suits it."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-stats",
+        nargs="+",
+        default=ServerArgs.moe_bank_stats,
+        help=(
+            "--moe-stats-out histogram(s) ordering the --moe-bank-ram placement (one file "
+            "per pipeline rank). Without them the ordering ignores routing entirely."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-dir",
+        default=ServerArgs.moe_bank_dir,
+        help=(
+            "Directory for the bank file (bank.ftmb, every MoE layer in one file). Defaults to "
+            "the one a packed checkpoint names, else ~/.cache/freetoken/bankmap/<model>."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-readahead",
+        type=_parse_bank_readahead,
+        default=ServerArgs.moe_bank_readahead,
+        help=(
+            "With --moe-bank-ram: the device readahead window, which decides how much a fault "
+            "on a non-resident row reads (measured 2.5x on decode). 'off' (default) only logs it "
+            "against the model's block geometry; 'auto' writes the recommended window to sysfs "
+            "and a number writes that many kB. Needs permission to write "
+            "/sys/block/<dev>/queue/read_ahead_kb (otherwise the exact command is logged once); "
+            "applies to the whole device and stays set after the server exits. An open mapping "
+            "keeps the window it was opened with, so a change by hand needs a restart."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-rewarm",
+        type=float,
+        default=ServerArgs.moe_bank_rewarm,
+        help=(
+            "With --moe-bank-ram: after this many seconds idle, check how much of the bank's "
+            "file-backed rows the page cache still holds, and if it has dropped (memory "
+            "pressure, WSL2 autoMemoryReclaim), read them back in file order until a request "
+            "arrives. Measured on an RTX 2060: the first follow-up after the cache was emptied "
+            "took 31 s to its first token instead of 1 s. 0 (default) = off."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-prefetch",
+        action="store_true",
+        dest="moe_bank_prefetch",
+        default=ServerArgs.moe_bank_prefetch,
+        help=(
+            "With --moe-bank-ram and cpu/hybrid decode: before the CPU executor computes a "
+            "layer, ask the kernel for exactly the non-resident expert rows that layer routes "
+            "to (mincore, then MADV_WILLNEED), so the workers wait on reads already in flight "
+            "instead of faulting 4 KiB at a time through readahead windows that also read "
+            "neighbouring experts. Linux only. Experimental, off by default."
+        ),
     )
 
     parser.add_argument(
@@ -783,10 +1065,53 @@ def parse_args(
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
+    # --pp-size N: the N ranks split the layers; tp_info carries the world (rank, size) as
+    # for TP, `parallel` tells the engine how to use it.
+    pp_size = kwargs.pop("pp_size")
+    pp_layers = kwargs.pop("pp_layers")
+    kwargs["pp_split"] = None
+    if pp_size > 1:
+        if kwargs["tensor_parallel_size"] > 1:
+            parser.error("--pp-size and --tp-size cannot both be > 1")
+        kwargs["parallel"] = "pp"
+        kwargs["tensor_parallel_size"] = pp_size
+        if pp_layers:
+            try:
+                split = tuple(int(x) for x in pp_layers.split(",") if x.strip())
+            except ValueError:
+                parser.error(f"--pp-layers must be comma-separated integers, got {pp_layers!r}")
+            if len(split) != pp_size - 1 or any(b <= a for a, b in zip(split, split[1:])):
+                parser.error(
+                    f"--pp-layers needs {pp_size - 1} strictly increasing boundaries for "
+                    f"--pp-size {pp_size}, got {pp_layers!r}"
+                )
+            kwargs["pp_split"] = split
+    elif pp_layers:
+        parser.error("--pp-layers needs --pp-size > 1")
+
+    if kwargs["prefix_disk_cache"]:
+        if kwargs["tensor_parallel_size"] > 1:
+            parser.error(
+                "--prefix-disk-cache runs on one GPU only for now: it is refused with "
+                f"{'--pp-size' if pp_size > 1 else '--tp-size'} > 1 (every rank would have to "
+                "restore the same prefix at the same step)"
+            )
+        from freetoken.moe.bank_disk import parse_size
+
+        try:
+            size = parse_size(kwargs["prefix_disk_cache_size"])
+        except ValueError as exc:
+            parser.error(f"--prefix-disk-cache-size: {exc}")
+        if not size or size <= 0:
+            parser.error("--prefix-disk-cache-size must be a positive size, e.g. 32G")
+
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
         if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
+            parser.error(
+                "tensor parallelism is not supported yet: --gpu takes one entry "
+                "(give --pp-size N to split the layers over N GPUs)"
+            )
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
@@ -830,6 +1155,36 @@ def parse_args(
         kwargs["reasoning_parser"] = _infer_reasoning_parser(kwargs["model_path"])
     elif kwargs["reasoning_parser"] == "off":
         kwargs["reasoning_parser"] = None
+
+    # --disable-cuda-graph is spelled as its own flag rather than exposing cuda_graph_bs:
+    # an empty bs list is already the "graphs off" contract downstream (CudaGraphRunner
+    # returns early on max_graph_bs == 0), and a list-valued CLI flag would invite
+    # half-disabled states.
+    if kwargs.pop("disable_cuda_graph", False):
+        kwargs["cuda_graph_bs"] = []
+
+    # --moe-stats-out is the only reader of the miss-rate counters, so asking for the dump
+    # is asking for the counters; requiring both flags would only produce empty files.
+    if kwargs.get("moe_stats_out"):
+        kwargs["moe_collect_stats"] = True
+
+    # Fail on a malformed size here rather than deep in the loader, after the weights have
+    # been read.
+    if kwargs.get("moe_bank_ram"):
+        from freetoken.moe.bank_disk import parse_size
+
+        if str(kwargs["moe_bank_ram"]).strip().lower() == "auto":
+            # Resolved here, once, in the launcher: the ranks start together, and each reading
+            # MemAvailable while the others allocate would split different numbers.
+            from freetoken.moe import disk_probe
+
+            try:
+                auto = disk_probe.auto_bank_ram(disk_probe.meminfo(), kwargs["tensor_parallel_size"])
+            except ValueError as exc:
+                parser.error(str(exc))
+            logger.info(auto.reason())
+            kwargs["moe_bank_ram"] = auto.as_flag()
+        parse_size(kwargs["moe_bank_ram"])
 
     # Offload-family backends (offload/cpu/hybrid) need a slot cache; if the user gave no
     # sizing flag at all, default to --moe-cache-auto so a bare `ft serve <FTW MoE>` works
@@ -888,6 +1243,7 @@ def parse_args(
         disabled_encoders=frozenset(disabled),
         embed_cache_device=kwargs.pop("mm_embed_cache_device"),
         encoder_weights=kwargs.pop("mm_encoder_weights"),
+        encoder_dtype=kwargs.pop("mm_encoder_dtype"),
         image_min_tokens=image_min_tokens,
         image_max_tokens=image_max_tokens,
         processor_kwargs=kwargs.pop("mm_processor_kwargs") or {},

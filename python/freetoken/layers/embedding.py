@@ -58,6 +58,42 @@ class VocabParallelEmbedding(BaseOP):
         return y
 
 
+class HostEmbedding(BaseOP):
+    """An input embedding table that lives in pinned + mapped host memory; the GPU gathers the
+    looked-up rows in place over PCIe (``kernel/triton/host_embed``), inside CUDA graphs like
+    any other kernel. Frees the table's VRAM (1 GB for a 250k x 2048 fp16 vocabulary) for KV
+    pages on small cards. The engine materializes the keys under ``host_resident_prefixes`` in
+    pinned host memory (see ``_materialize_loaded_weight_state_dict``). TP=1, untied only."""
+
+    host_resident = True
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        assert get_tp_info().size == 1, "host embedding is TP=1 only"
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = torch.empty(num_embeddings, embedding_dim)
+        self._table_ptr: int | None = None
+
+    def _ptr(self) -> int:
+        if self._table_ptr is None:
+            from freetoken.kernel.pinned import device_ptr
+
+            w = self.weight
+            assert not w.is_cuda and w.is_pinned(), "host embedding table must be pinned host memory"
+            self._table_ptr = device_ptr(w)
+        return self._table_ptr
+
+    @nvtx_annotate("Embedding")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.host_embed import host_gather_rows
+
+        ids = x.reshape(-1)
+        out = torch.empty(ids.numel(), self.embedding_dim, dtype=self.weight.dtype, device=x.device)
+        host_gather_rows(self._ptr(), self.num_embeddings, self.embedding_dim, ids, out)
+        return out.view(*x.shape, self.embedding_dim)
+
+
 class ParallelLMHead(VocabParallelEmbedding):
     """The head is a linear layer over the vocab shard: its weights come from ``quant_method``
     unless they are tied to the input embedding."""
@@ -126,7 +162,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if batch.is_prefill:
+        if batch.is_prefill and not getattr(batch, "spec_all_rows", False):
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
@@ -147,3 +183,30 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Raw head GEMM over the rows given (no batch bookkeeping; TP=1). The MTP draft head
+        scores its own hidden states through the shared head with this."""
+        if self.tied_embedding is not None:
+            return F.linear(x, self.tied_embedding.weight, self.bias)
+        return self.quant_method.apply(self, x)
+
+
+class Fp8VocabParallelEmbedding(VocabParallelEmbedding):
+    """Embedding table held as fp8-e4m3 rows + a per-row fp32 scale (quantized at load, see
+    ``--dense-quant fp8``); rows are gathered and dequantized per lookup. TP=1 only."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim)
+        assert self.tp_size == 1, "fp8 embedding is TP=1 only"
+        self.weight = torch.empty(self.num_embeddings_tp, embedding_dim, dtype=torch.float8_e4m3fn)
+        self.weight_scale = torch.empty(self.num_embeddings_tp, dtype=torch.float32)
+        # the model dtype: __init__ runs under the engine's torch_dtype(config.dtype)
+        self._out_dtype = torch.get_default_dtype()
+
+    @nvtx_annotate("Embedding")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        idx = x.long()
+        # gather on the byte view (index kernels for fp8 dtypes are not universal), then dequant
+        rows = self.weight.view(torch.uint8)[idx].view(torch.float8_e4m3fn).to(self._out_dtype)
+        return rows * self.weight_scale[idx].to(self._out_dtype)[:, None]

@@ -28,6 +28,8 @@ class VisionConfig:
     in_channels: int
     # ViT block indices whose merged features are added to the first decoder layers; () disables DeepStack
     deepstack_visual_indexes: tuple[int, ...] = ()
+    # torch dtype name the tower is built and run in; None follows the model (set by EngineConfig from --mm-encoder-dtype)
+    dtype: str | None = None
 
 
 def parse_vision_config(hf_config: Any) -> VisionConfig | None:

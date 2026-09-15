@@ -20,6 +20,7 @@ accurate than the previous ``weight.to(bf16) * scale`` materialization, which it
 from __future__ import annotations
 
 import functools
+import os
 import re
 
 import torch
@@ -35,6 +36,23 @@ from freetoken.kernel.triton.e4m3_compat import (
 
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
+_FP8_MAX = 448.0  # e4m3 dynamic range
+
+
+def quantize_fp8_per_row(w: torch.Tensor, chunk_rows: int = 8192) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-row fp8-e4m3 weight quantization for the W8A16 path: ``w ~= q * scale[:, None]``.
+
+    Row-chunked so a full-vocab head (lm_head / embedding, ~1.3 GB bf16) never needs a whole
+    fp32 copy at once. Same recipe glm_moe_dsa applies to its MLA projections at load."""
+    assert w.dim() == 2, w.shape
+    q = torch.empty(w.shape, dtype=FP8, device=w.device)
+    scale = torch.empty(w.shape[0], dtype=torch.float32, device=w.device)
+    for r0 in range(0, w.shape[0], chunk_rows):
+        wf = w[r0:r0 + chunk_rows].float()
+        s = (wf.abs().amax(dim=1) / _FP8_MAX).clamp(min=1e-12)
+        q[r0:r0 + chunk_rows] = (wf / s[:, None]).clamp(-_FP8_MAX, _FP8_MAX).to(FP8)
+        scale[r0:r0 + chunk_rows] = s
+    return q, scale
 
 
 # Row-wise _scaled_mm on sm_89 with torch < 2.12 launches its CUTLASS stream-K kernel off the
@@ -207,6 +225,63 @@ def _gemm_kernel(
     tl.store(c_ptrs, acc.to(compute_type), mask=m_mask[:, None] & n_mask[None, :])
 
 
+# Every M > 1 takes the scratch path below Ampere. Measured on the RTX 2060 with a 4-row MTP
+# verify window: the inline kernel's software e4m3 unpack costs ~400 ms per forward of the
+# 1.3B-parameter dense stack (its 0.15 TFLOPS is unpack-bound, not tile-bound), the scratch
+# path ~40 ms. The threshold stays as a knob (2 = always scratch for M > 1).
+_SCRATCH_GEMM_MIN_M = 2
+
+
+@functools.cache
+def _scratch_gemm_preferred() -> bool:
+    """Whether M>1 W8A16 GEMMs go through ``_gemm_scratch`` instead of the inline-dequant
+    Triton kernel. Default: below Ampere. Measured on an RTX 2060 (M=2785, N=12288, K=2048):
+    the Triton kernel runs at 0.15 TFLOPS in fp16 and bf16 alike -- the software e4m3 unpack
+    per tile dominates and the dot never gets near the tensor cores -- while cuBLAS fp16 does
+    19 TFLOPS on the same GPU. ``FREETOKEN_FP8_SCRATCH_GEMM=0/1`` overrides anywhere."""
+    env = os.environ.get("FREETOKEN_FP8_SCRATCH_GEMM")
+    if env is not None:
+        return env == "1"
+    from freetoken.utils import is_pre_ampere
+
+    return is_pre_ampere()
+
+
+_SCRATCH_BUFFERS: dict = {}
+
+
+def _dequant_scratch(numel: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """One persistent flat buffer per (dtype, device), grown to the largest projection seen.
+    Allocating a fresh 50 MB scratch per projection per forward made the caching allocator
+    grow and shrink segments under load, which on a full card (RTX 2060 6 GB under WSL2)
+    intermittently died with ``CUDA driver error: device not ready``."""
+    key = (dtype, str(device))
+    buf = _SCRATCH_BUFFERS.get(key)
+    if buf is None or buf.numel() < numel:
+        if device.type == "cuda":  # grow only with an idle GPU (see the docstring)
+            torch.cuda.synchronize(device)
+        buf = _SCRATCH_BUFFERS[key] = torch.empty(numel, dtype=dtype, device=device)
+    return buf
+
+
+def preallocate_scratch(numel: int, dtype: torch.dtype, device: torch.device) -> int:
+    """Allocate the dequant scratch for the largest fp8 projection once, while the GPU is idle
+    (engine init). Returns the bytes taken."""
+    return _dequant_scratch(numel, dtype, device).numel() * torch.empty((), dtype=dtype).element_size()
+
+
+def _gemm_scratch(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+                  out_dtype: torch.dtype) -> torch.Tensor:
+    """M>1 W8A16 GEMM as dequant + cuBLAS: ``weight`` [N, K] fp8 (the fp8 tensor, not the
+    uint8 view) is expanded into a persistent ``[N, K]`` scratch in the activation dtype with
+    the per-row scale folded in (so the product stays in fp16 range), then ``a @ w.t()``."""
+    n, k = weight.shape
+    w = _dequant_scratch(n * k, a.dtype, a.device)[: n * k].view(n, k)
+    w.copy_(weight)  # fp8 -> activation dtype
+    w.mul_(weight_scale.to(a.dtype)[:, None])
+    return (a @ w.t()).to(out_dtype)
+
+
 def _gemm(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
           out_dtype: torch.dtype) -> torch.Tensor:
     """M>1 W8A16 GEMM. ``a`` [M, K] bf16; ``weight`` [N, K] fp8; ``weight_scale`` [N] fp32."""
@@ -343,6 +418,9 @@ def fp8_pertensor_linear(
         ).reshape(*lead, N)
     elif x.numel() // K == 1:
         out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)
+    elif _scratch_gemm_preferred() and x.numel() // K >= _SCRATCH_GEMM_MIN_M:
+        # pre-Ampere prefill: dequant to a scratch and let cuBLAS run the GEMM (see the helper)
+        out = _gemm_scratch(x.reshape(-1, K), weight, weight_scale, x.dtype).reshape(*lead, N)
     else:
         out = _gemm(
             x.reshape(-1, K), e4m3_kernel_view(weight), weight_scale, x.dtype,

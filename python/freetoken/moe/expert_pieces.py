@@ -8,6 +8,7 @@ their ``_scale`` / ``_global`` companions, or an already fused ``gate_up``). The
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator
 
 import torch
@@ -66,6 +67,59 @@ def iter_expert_pieces(
             model_path, config, spec_hook(model_path, config), parallel=parallel, workers=workers, chunk=chunk
         )
     raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
+
+
+@dataclass(frozen=True)
+class ExpertSource:
+    """One checkpoint tensor the expert banks are built from, located without reading it.
+
+    ``bank_layer`` is the global MoE-layer index (no pipeline window applied); the tensor holds
+    rows ``e0:e1`` of that layer's ``role`` piece -- one expert (``stacked`` False: stored
+    without the expert dimension) or the whole layer (``stacked`` True). ``convert`` is what the
+    reader does to it on the way into a piece when that is more than adding the expert
+    dimension (NVFP4 global scales: fp16, reciprocal for quant-side dialects).
+
+    This is what ``ft bank pack`` needs to know which bytes the bank file must reproduce, and
+    what the bank's fingerprint is taken over.
+    """
+
+    name: str
+    bank_layer: int
+    e0: int
+    e1: int
+    role: str
+    stacked: bool = False
+    convert: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+    def to_piece(self, tensor: torch.Tensor) -> torch.Tensor:
+        """The stored tensor as the loader's piece rows ``[e1 - e0, ...]``."""
+        if self.convert is not None:
+            return self.convert(tensor)
+        return tensor if self.stacked else tensor.unsqueeze(0)
+
+
+def expert_sources(model_path: str, config, kind: QuantKind, *, weight_map: dict[str, str] | None = None) -> dict[str, ExpertSource]:
+    """Every checkpoint tensor behind the routed-expert banks of ``config`` (the FULL model config).
+
+    From names alone -- the safetensors index, or ``weight_map`` when the caller has one (a
+    packed checkpoint's original headers). A family may ship ``expert_sources`` for the storage
+    forms only it uses; NVFP4 experts come from its ``nvfp4_expert_spec``. Raises
+    ``NotImplementedError`` for a format nobody describes, which ``ft bank pack`` reports as
+    unsupported rather than guessing.
+    """
+    spec = get_model_spec(config.architectures[0])
+    hook = _model_hook(spec, "expert_sources")
+    if hook is not None:
+        got = hook(model_path, config, kind, weight_map=weight_map)
+        if got is not None:
+            return got
+    if kind is QuantKind.NVFP4:
+        spec_hook = _model_hook(spec, "nvfp4_expert_spec")
+        if spec_hook is not None:
+            from freetoken.models.nvfp4_banks import nvfp4_expert_sources
+
+            return nvfp4_expert_sources(model_path, config, spec_hook(model_path, config), weight_map=weight_map)
+    raise NotImplementedError(f"{spec.module} does not describe where its {kind} expert tensors are")
 
 
 def packed_expert_source_info(key: str) -> tuple[int, str] | None:
@@ -147,8 +201,10 @@ def per_expert_pieces(
 
 
 __all__ = [
+    "ExpertSource",
     "Piece",
     "bank_layer_of",
+    "expert_sources",
     "iter_expert_pieces",
     "num_moe_layers",
     "packed_expert_source_info",

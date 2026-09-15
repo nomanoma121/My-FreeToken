@@ -195,6 +195,7 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
+        self._read_blocks: set[tuple[int, int]] = set()  # (address, layer id) of every layer tensor
         ptrs, (self.H, self.I) = self._resolve_banks(
             {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
         )
@@ -333,9 +334,50 @@ class CpuMoeExecutor:
         """
         assert len(layers) == self.num_layers, (len(layers), self.num_layers)
         table = torch.tensor([t.data_ptr() for t in layers], dtype=torch.int64)
+        # remembered so enable_bank_prefetch can check that a mapped block is what this
+        # executor actually reads, at that layer id
+        self._read_blocks.update((t.data_ptr(), i) for i, t in enumerate(layers))
         self._banks.append(table)
         self._banks.extend(layers)
         return table
+
+    def enable_bank_prefetch(self, cold_blocks) -> int:
+        """``--moe-bank-prefetch``: advise each task's cold rows before the workers read them.
+
+        ``cold_blocks`` is ``MappedBanks.cold_blocks``: (bank name, layer position, address of
+        row 0, bytes per row, first file-backed row) for every block of a mapped bank that has
+        a file-backed part. A block is kept only when this executor reads that very memory at
+        that layer id -- a bank the cache copied, reshaped or never handed over (the
+        ``--spec-mtp`` head's layer is not in the mapped file at all) is left to the fault
+        path. Returns the number of blocks kept; 0 means the flag has nothing to do here.
+
+        Blocks read by the down pass (``down*``) are advised after the workers are woken,
+        everything else before: see the comment on PrefetchSpan in cpu_moe_ext.cpp.
+        """
+        from freetoken.kernel import _cpu_moe
+        from freetoken.moe.legacy_format import canonical_role
+
+        if not getattr(_cpu_moe, "bank_prefetch_supported", lambda: False)():
+            return 0
+        layer, base, row_bytes, cold_from, phase = [], [], [], [], []
+        for name, pos, addr, rb, first_cold in cold_blocks:
+            if (int(addr), int(pos)) not in self._read_blocks:
+                continue
+            layer.append(int(pos))
+            base.append(int(addr))
+            row_bytes.append(int(rb))
+            cold_from.append(int(first_cold))
+            phase.append(2 if canonical_role(name).startswith("down") else 1)
+        return int(self._ext.set_bank_prefetch(layer, base, row_bytes, cold_from, phase))
+
+    def bank_prefetch_stats(self) -> dict[str, int]:
+        """Counters of ``--moe-bank-prefetch`` since start (all zero when it is off, or when the
+        extension was built before the flag existed and so never enabled it)."""
+        if not hasattr(self._ext, "bank_prefetch_stats"):
+            return {"tasks": 0, "rows": 0, "ranges_advised": 0, "bytes_advised": 0, "ns": 0, "errno": 0}
+        tasks, rows, ranges, nbytes, ns, err = self._ext.bank_prefetch_stats()
+        return {"tasks": tasks, "rows": rows, "ranges_advised": ranges,
+                "bytes_advised": nbytes, "ns": ns, "errno": err}
 
     def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.

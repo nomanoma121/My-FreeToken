@@ -41,6 +41,9 @@ _GEMMA_NORM_SUFFIXES = (
     ".post_attention_layernorm.weight",
     ".self_attn.q_norm.weight",
     ".self_attn.k_norm.weight",
+    # the MTP draft head's norms (same (1+w) RMSNorm as the decoder)
+    ".pre_fc_norm_embedding.weight",
+    ".pre_fc_norm_hidden.weight",
 )
 # leaves the model builds as Linear layers: only their tensors are read under the QuantConfig, the rest passes through as stored
 _LINEAR_LEAVES = frozenset({
@@ -51,12 +54,22 @@ _LINEAR_LEAVES = frozenset({
 _DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn, "e2m1": torch.uint8}
 _QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8)
+# The MTP draft head's routed experts. ``mtp*`` is off every quantizer's list, so these are
+# bf16 where the decoder's are NVFP4; ``_stack_mtp_experts`` turns them into the two tensors
+# the engine quantizes into a bank layer.
+_MTP_EXPERT_RE = re.compile(
+    r"^mtp\.layers\.0\.mlp\.experts\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
+_MTP_STACKED_GATE_UP = "mtp.layers.0.mlp.experts.gate_up_proj"
+_MTP_STACKED_DOWN = "mtp.layers.0.mlp.experts.down_proj"
 
 
-def _rename(raw_name: str) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
+def _rename(raw_name: str, keep_mtp: bool = False) -> str | None:
+    """Checkpoint key -> FreeToken state-dict key, or None to skip. ``mtp.*`` (the draft head)
+    is dropped unless ``keep_mtp`` (--spec-mtp); its keys are already in the model's own naming.
+    """
     if raw_name.startswith("mtp."):
-        return None
+        return raw_name if keep_mtp else None
     # static KV-cache scales of the quantizers; the KV cache runs in the engine's dtype
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
@@ -64,7 +77,7 @@ def _rename(raw_name: str) -> str | None:
 
 
 def _is_gemma_norm(name: str) -> bool:
-    return name == "model.norm.weight" or name.endswith(_GEMMA_NORM_SUFFIXES)
+    return name in ("model.norm.weight", "mtp.norm.weight") or name.endswith(_GEMMA_NORM_SUFFIXES)
 
 
 def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
@@ -233,17 +246,44 @@ class _DenseReader:
         return out
 
 
+def _stack_mtp_experts(parts: dict[int, dict[str, torch.Tensor]]) -> list[tuple[str, torch.Tensor]]:
+    """Per-expert ``{e: {gate_proj, up_proj, down_proj}}`` -> ``[(gate_up [E, 2I, H]),
+    (down [E, H, I])]`` (on the parts' device), consuming ``parts`` as it goes so the peak is
+    one stacked copy plus what is not yet stacked."""
+    if not parts:
+        return []
+    e = len(parts)
+    assert set(parts) == set(range(e)), sorted(parts)[:5]
+    g0, u0, d0 = (parts[0][k] for k in ("gate_proj", "up_proj", "down_proj"))
+    inter, hidden = g0.shape
+    assert u0.shape == (inter, hidden) and d0.shape == (hidden, inter), (g0.shape, u0.shape, d0.shape)
+    gate_up = torch.empty(e, 2 * inter, hidden, dtype=g0.dtype, device=g0.device)
+    down = torch.empty(e, hidden, inter, dtype=d0.dtype, device=d0.device)
+    for i in range(e):
+        part = parts.pop(i)
+        gate_up[i, :inter].copy_(part["gate_proj"])
+        gate_up[i, inter:].copy_(part["up_proj"])
+        down[i].copy_(part["down_proj"])
+    return [(_MTP_STACKED_GATE_UP, gate_up), (_MTP_STACKED_DOWN, down)]
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_mtp: bool = False,
     include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense weights fused to the model's buffers, and the routed experts only where a resident path takes them from here: bf16 stacked experts as stored, block-fp8 experts restacked per layer.
 
     Per-expert NVFP4 experts always come from the offload cache's expert reader.
+
+    ``include_mtp`` (--spec-mtp): the draft head's ``mtp.*`` tensors are yielded too. Every
+    export that carries a head leaves it off the quantizer's list, so the head reads as stored
+    and fuses like the decoder's; its per-expert routed experts are gathered on the host and
+    yielded last as two stacked tensors the engine quantizes into a bank layer.
     """
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe weight loading supports TP=1 only")
@@ -252,17 +292,38 @@ def iter_weights(
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision)
+        yield from _iter_shards(
+            model_path, device, reader, stacked=stacked, include_mtp=include_mtp,
+            include_vision=include_vision,
+        )
     if include_moe_experts and config.is_moe and config.expert_quant == "fp8_block":
         yield from _resident_fp8_experts(model_path, config)
 
 
-def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool):
+def _iter_shards(
+    model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool,
+    include_vision: bool, include_mtp: bool = False,
+):
+    mtp_experts: dict[int, dict[str, torch.Tensor]] = {}
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name)
-                if name is None or _EXPERT_RE.search(name):
+                name = _rename(raw_name, keep_mtp=include_mtp)
+                if name is None:
+                    continue
+                if _EXPERT_RE.search(name):
+                    m = _MTP_EXPERT_RE.match(name) if include_mtp else None
+                    if m is not None:
+                        # the head's experts: off the GPU at once (1.6 GB for 256 x 512), stacked below
+                        tensor = f.get_tensor(raw_name)
+                        if tensor.dtype in _QUANT_DTYPES:
+                            raise NotImplementedError(
+                                f"--spec-mtp: {raw_name} is {tensor.dtype}. The draft head is read "
+                                "as stored and quantized by the engine, so only an unquantized head loads"
+                            )
+                        mtp_experts.setdefault(int(m.group("expert")), {})[m.group("proj")] = (
+                            tensor.to("cpu")
+                        )
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
@@ -284,6 +345,10 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
         lines = reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
+    if include_mtp:
+        stacked_mtp = _stack_mtp_experts(mtp_experts)
+        assert stacked_mtp, "--spec-mtp: the checkpoint has no mtp.layers.0.mlp.experts.* tensors"
+        yield from stacked_mtp
 
 
 def iter_weights_parallel(

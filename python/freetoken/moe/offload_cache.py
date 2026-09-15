@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -26,6 +27,8 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
 from freetoken.utils import init_logger
+from freetoken.utils.prefill_profile import active as _prefill_profile
+from freetoken.utils.prefill_profile import major_faults as _major_faults
 
 logger = init_logger(__name__)
 
@@ -158,6 +161,13 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # --moe-bank-ram: rows [0, prefix_pinned_rows) of every bank are registered and so
+        # device-addressable; the rest are host pages the GPU has no address for. None means
+        # the usual all-or-nothing residency.
+        self.prefix_pinned_rows: int | None = None
+        # --moe-bank-ram: reads a prefill's non-resident rows with parallel direct reads instead
+        # of faulting them in through the mapping (moe/bank_reader.py); None elsewhere
+        self.bank_reader = None
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -245,6 +255,10 @@ class OffloadMoeCache:
         # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
         # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
         # captured graph would not re-run this host-side scatter on replay).
+        # --moe-bank-ram: per-MoE-layer logical->physical expert id maps, or None when
+        # every expert is resident (the identity, and the only state today's behaviour has).
+        # The MoE layers read theirs at attach time; see moe/bank_disk.py.
+        self.expert_perm: list[torch.Tensor] | None = None
         self.collect_decode_freq = False
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
@@ -276,6 +290,9 @@ class OffloadMoeCache:
         self._prefill_buffer_layer: list[int | None] = [None, None]
         self._prefill_buffer_released: list[bool] = [True, True]
         self._prefill_buffer_has_release_event: list[bool] = [False, False]
+        # --moe-bank-ram: the buffer's non-resident remainder has been issued to the
+        # bounce path or not yet. See prefetch_prefill_layer.
+        self._prefill_pending_bounce: list[int | None] = [None, None]
         # hit-D2D split state: pinned begin-of-chunk snapshot of slot_for_id (the
         # classification input; frozen for the chunk -- no decode runs inside one,
         # and buffer invalidation only clears slot < 2E entries, which classify as
@@ -481,6 +498,7 @@ class OffloadMoeCache:
         self.prefill_release_events = []
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        self._prefill_pending_bounce = [None, None]
         self._prefill_buffer_has_release_event = [False, False]
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
@@ -519,7 +537,9 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
-        self.decode_freq.zero_()
+        # decode_freq is kept: which experts the router picks does not depend on the slot
+        # count, and --moe-stats-out rewrites its file at every idle, so zeroing here would
+        # replace a session's histogram with whatever came after the rebuild
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
@@ -607,6 +627,7 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        self._prefill_pending_bounce = [None, None]
         self._prefill_buffer_has_release_event = [False, False]
         # The double buffers borrow the slot cache's first 2 * num_experts slots
         # (one full expert layer per buffer), one view per registered bank.
@@ -647,6 +668,7 @@ class OffloadMoeCache:
             return
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        self._prefill_pending_bounce = [None, None]
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
@@ -683,8 +705,20 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
-            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+            prof = _prefill_profile() if self.device.type == "cuda" else None
+            if prof is not None:
+                stream = torch.cuda.current_stream(self.device)
+                start, nbytes = prof.hot_copy_begin(stream), 0
+            for src, dst in self._prefill_pairs(layer_id, buffer_id):
+                hot = self._prefill_hot(src)
+                if hot < src.size(0):
+                    dst[:hot].copy_(src[:hot], non_blocking=True)
+                else:
+                    dst.copy_(src, non_blocking=True)
+                if prof is not None:
+                    nbytes += src[:hot].numel() * src.element_size()
+            if prof is not None:
+                prof.hot_copy_end(start, stream, nbytes)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -695,10 +729,55 @@ class OffloadMoeCache:
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
                 copy()
-                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+                if not self._has_bounce(layer_id):
+                    self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
         self._prefill_buffer_layer[buffer_id] = layer_id
         self._prefill_buffer_released[buffer_id] = False
+        if self.prefill_copy_stream is not None and self._has_bounce(layer_id):
+            # The registered rows are on their way. The rest goes through _staged_h2d, which
+            # blocks the host -- and this call sits BEFORE the current layer's GEMMs are
+            # issued, so blocking here stalls a GPU with nothing queued. Leave it pending;
+            # finish_prefill_prefetch runs it once the GEMMs are in flight.
+            self._prefill_pending_bounce[buffer_id] = layer_id
+
+    def _prefill_pairs(self, layer_id: int, buffer_id: int):
+        return [
+            (per_layer[layer_id], buffer[buffer_id])
+            for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers)
+        ]
+
+    def _prefill_hot(self, src: torch.Tensor) -> int:
+        """Rows of ``src`` the GPU can DMA out of: all of them unless --moe-bank-ram left a
+        non-resident remainder past the registered prefix."""
+        hot = self.prefix_pinned_rows
+        return src.size(0) if hot is None else min(hot, src.size(0))
+
+    def _has_bounce(self, layer_id: int) -> bool:
+        if self.prefix_pinned_rows is None:
+            return False
+        return any(
+            self._prefill_hot(per_layer[layer_id]) < per_layer[layer_id].size(0)
+            for per_layer, _ in self.banks
+        )
+
+    def finish_prefill_prefetch(self) -> None:
+        """Run any deferred bounce copy. Call once this layer's GEMMs are issued: the copy
+        blocks the host, and the point of deferring it is that the GPU has work to do
+        meanwhile. A buffer whose bounce is still pending has no ready event yet, so
+        wait_prefill_layer forces it rather than waiting on an event that never comes."""
+        if self.prefill_copy_stream is None:
+            return
+        for buffer_id, layer_id in enumerate(self._prefill_pending_bounce):
+            if layer_id is None:
+                continue
+            with torch.cuda.stream(self.prefill_copy_stream):
+                for src, dst in self._prefill_pairs(layer_id, buffer_id):
+                    hot = self._prefill_hot(src)
+                    if hot < src.size(0):
+                        self._staged_h2d(dst[hot:], src[hot:])
+                self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+            self._prefill_pending_bounce[buffer_id] = None
 
     def _hit_d2d_usable(self) -> bool:
         """Whether the hit-D2D split can serve this prefill; logs the first fallback.
@@ -709,7 +788,11 @@ class OffloadMoeCache:
         """
         from freetoken.kernel.fast_index_copy import _skip_fast_index_copy_enabled
 
-        if self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
+        if self.prefix_pinned_rows is not None:
+            # --moe-bank-ram registers only the resident prefix; the hit-D2D split builds its
+            # own pointer list and would batch-memcpy out of the unregistered rows.
+            reason = "the mapped bank is only registered up to its resident prefix"
+        elif self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
             reason = "prefill overlap buffers are not initialized for this device"
         elif _skip_fast_index_copy_enabled():
             reason = "FREETOKEN_SKIP_FAST_INDEX_COPY is set (the hit gather would be a no-op)"
@@ -824,6 +907,11 @@ class OffloadMoeCache:
         assert self.prefill_bank_buffers
         self.prefetch_prefill_layer(layer_id)
         buffer_id = layer_id % 2
+        if self._prefill_pending_bounce[buffer_id] is not None:
+            # Nothing has been issued for this layer to hide behind -- the first layer of a
+            # chunk always lands here. Pay for it now; every later layer's bounce was
+            # already run behind the previous layer's GEMMs.
+            self.finish_prefill_prefetch()
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
@@ -852,7 +940,9 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts_hybrid(
+        self, layer_id: int, expert_ids: torch.Tensor, freq_ids: torch.Tensor | None = None
+    ) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -865,7 +955,9 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
-            ids = expert_ids.reshape(-1).long()
+            # freq_ids: the caller may have rewritten non-resident ids before this call (see
+            # OffloadMoELayer._decode_hybrid); the histogram wants what was actually routed.
+            ids = (expert_ids if freq_ids is None else freq_ids).reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
@@ -1008,21 +1100,85 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    # ----- non-pinned layers: staged whole-layer copy -------------------------------------
+    def _staging(self):
+        """Two pinned staging buffers (``FREETOKEN_STAGED_COPY_MB`` each, default 32) and their
+        DMA-done events, allocated on first use."""
+        st = getattr(self, "_stage", None)
+        if st is None:
+            from freetoken.kernel.pinned import alloc_pinned_tensor
+
+            mb = int(os.environ.get("FREETOKEN_STAGED_COPY_MB", "32") or 32)
+            size = max(1, mb) << 20
+            bufs = [alloc_pinned_tensor(size, dtype=torch.uint8) for _ in range(2)]
+            events = [torch.cuda.Event() for _ in range(2)]
+            st = self._stage = (bufs, events, size)
+        return st
+
+    def _staged_h2d(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        """Host -> device copy of a whole bank layer that lives in non-pinned (LOCKED or
+        PAGEABLE) memory. A plain pageable ``copy_`` serialises the driver's internal memcpy
+        and the DMA and ran at ~1.7 GB/s on an RTX 2060 under WSL2 (about 5 s of every prefill
+        chunk for 19 CPU-side layers of Ornith). Here the layer goes through two pinned staging
+        buffers: the CPU copies piece i+1 into one buffer (multi-threaded ``copy_``) while the
+        DMA of piece i drains the other on the current stream. ``FREETOKEN_STAGED_COPY=0``
+        restores the plain copy."""
+        if (
+            dst.device.type != "cuda"
+            or src.is_pinned()
+            or os.environ.get("FREETOKEN_STAGED_COPY") == "0"
+        ):
+            dst.copy_(src)
+            return
+        prof = _prefill_profile()
+        if self.bank_reader is not None and self.bank_reader.h2d(dst, src, prof):
+            return
+        d = dst.reshape(-1).view(torch.uint8)
+        s = src.reshape(-1).view(torch.uint8)
+        assert d.numel() == s.numel(), (dst.shape, src.shape, dst.dtype, src.dtype)
+        bufs, events, size = self._staging()
+        stream = torch.cuda.current_stream(dst.device)
+        n = d.numel()
+        off = 0
+        i = 0
+        while off < n:
+            m = min(size, n - off)
+            stage = bufs[i][:m]
+            if prof is None:
+                events[i].synchronize()  # the DMA that last read this buffer is done
+                stage.copy_(s[off : off + m])  # host memcpy into pinned memory
+            else:
+                t0 = time.perf_counter()
+                events[i].synchronize()
+                t1, faults = time.perf_counter(), _major_faults()
+                stage.copy_(s[off : off + m])
+                prof.staged_piece(t1 - t0, time.perf_counter() - t1, m, _major_faults() - faults)
+            d[off : off + m].copy_(stage, non_blocking=True)  # async DMA on the stream
+            events[i].record(stream)
+            off += m
+            i ^= 1
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if layer_id in self._unpinned_layers:
+        # A prefix-registered bank is pinned for decode (the misses are clamped to the
+        # registered rows) but not for the whole-layer prefill sweep, which touches every
+        # row including the unregistered ones. That sweep takes the pageable branch below;
+        # a plain cudaMemcpy reads any host memory, registered or not.
+        if layer_id in self._unpinned_layers or (
+            self.prefix_pinned_rows is not None and self._pending_whole_layer
+        ):
             if not self._pending_whole_layer:
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
                     f"pageable materialize (position == expert id); ensure_experts's "
                     f"LRU slot remap cannot be honored without a device alias"
                 )
-            # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
+            # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for per_layer, cache in self.banks:
-                cache[: self.num_experts].copy_(per_layer[layer_id])
+                self._staged_h2d(cache[: self.num_experts], per_layer[layer_id])
             return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
@@ -1074,4 +1230,8 @@ def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:
     layers = list(iter_offload_moe_layers(model))
     for layer in layers:
         layer.offload_cache = cache
+        # cached on the layer rather than looked up per forward: this runs once per MoE
+        # layer per step and the list index would be pure Python overhead in the decode path
+        if cache.expert_perm is not None:
+            layer.expert_perm = cache.expert_perm[layer.layer_id]
     return layers

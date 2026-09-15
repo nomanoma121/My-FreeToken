@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import try_get_world_info
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -26,15 +26,30 @@ class GraphCaptureBuffer:
     positions: torch.Tensor
     # [3, bs] t/h/w rope positions; allocated only for mrope models (else None).
     mrope_positions: torch.Tensor | None
-    logits: torch.Tensor
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
+    # Static forward output: [max_bs, vocab] fp32 logits, or the residual stream a non-last
+    # pipeline rank hands on. Shaped from the first eager forward (ensure_out).
+    out: torch.Tensor | None = None
+    # Pipeline engine, non-first ranks: the static residual-stream input the captured graphs
+    # read; the engine copies each step's received rows into it before replay.
+    pp_in: torch.Tensor | None = None
 
     @classmethod
     def init(
-        cls, bs: int, vocab_size: int, device: torch.device, mrope: bool = False
+        cls,
+        bs: int,
+        vocab_size: int,
+        device: torch.device,
+        pp_hidden: tuple[int, torch.dtype] | None = None,
+        mrope: bool = False,
     ) -> GraphCaptureBuffer:
+        del vocab_size  # the output buffer is shaped from the model's own output (ensure_out)
+        pp_in = None
+        if pp_hidden is not None:
+            width, dtype = pp_hidden
+            pp_in = torch.zeros(bs, width, dtype=dtype, device=device)
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
@@ -42,10 +57,17 @@ class GraphCaptureBuffer:
             mrope_positions=(
                 torch.zeros(3, bs, dtype=torch.int32, device=device) if mrope else None
             ),
-            logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            pp_in=pp_in,
         )
+
+    def ensure_out(self, sample: torch.Tensor) -> torch.Tensor:
+        if self.out is None:
+            self.out = torch.empty(
+                (self.input_ids.numel(), *sample.shape[1:]), dtype=sample.dtype, device=sample.device
+            )
+        return self.out
 
     def set_batch(self, batch: Batch) -> None:
         from freetoken.attention.linear import FLAMetadata
@@ -116,8 +138,11 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
+        pp_hidden: tuple[int, torch.dtype] | None = None,
         mrope: bool = False,
     ) -> None:
+        # (width, dtype) of the residual stream a non-first pipeline rank receives; None else
+        self.pp_hidden = pp_hidden
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
@@ -159,17 +184,19 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
         self.buffer = GraphCaptureBuffer.init(
-            self.max_graph_bs, vocab_size, self.device, mrope=self.mrope
+            self.max_graph_bs, vocab_size, self.device, pp_hidden=self.pp_hidden, mrope=self.mrope
         )
         self._reset_moe_offload_cache()
 
+        world = try_get_world_info()
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
             desc="Preparing for capturing CUDA graphs...",
             unit="batch",
-            disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
+            disable=world is not None and not world.is_primary(),  # disable for non-primary ranks
         )
         pool = None
+        ctx = get_global_ctx()
         for bs in pbar:
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
@@ -186,13 +213,21 @@ class GraphRunner:
                           if self.dummy_req.linear_slot_idx is not None
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
-            with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
-                # Keep the offload cache warmed for capture. Resetting here forces
-                # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
-                self._reset_moe_offload_cache()
+            # the captured graph must read the static residual-stream buffer, not a fresh tensor
+            if self.buffer.pp_in is not None:
+                ctx.pp_hidden_in = self.buffer.pp_in[:bs]
+            try:
+                with ctx.forward_batch(batch):
+                    warm = model.forward()  # one eager warm run, as before; it also shapes the static output
+                    out = self.buffer.ensure_out(warm)
+                    out[:bs] = warm
+                    # Keep the offload cache warmed for capture. Resetting here forces
+                    # CUDA graph capture to replay cold-cache expert copies.
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        out[:bs] = model.forward()
+                    self._reset_moe_offload_cache()
+            finally:
+                ctx.pp_hidden_in = None
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
@@ -210,7 +245,8 @@ class GraphRunner:
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
-        return self.buffer.logits[: batch.size]
+        assert self.buffer.out is not None
+        return self.buffer.out[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size

@@ -128,7 +128,9 @@ def test_generic_validate_rebuild_budget_check():
     config = _generic_config()
     per_page, fixed, _, _ = MHAKVCache.kv_cost(config)
     pool = object.__new__(MHAKVCache)  # generic validate_rebuild reads no instance state
-    budget = per_page * 50 + fixed  # memory_ratio=1.0: exactly 50 pages fit
+    # memory_ratio=1.0: exactly 50 usable pages fit, with the dummy page rebuild_from_config
+    # allocates on top of them
+    budget = per_page * (50 + 1) + fixed
 
     def check(pages, baseline):
         pool.validate_rebuild(
@@ -142,7 +144,7 @@ def test_generic_validate_rebuild_budget_check():
     with pytest.raises(CacheRebuildRejected, match="old cache kept"):
         check(51, budget)
     # num_pages=None budgets the CURRENT page count
-    check(None, per_page * 10 + fixed)
+    check(None, per_page * (10 + 1) + fixed)
 
 
 def test_dsv4_validate_rebuild_floor():
@@ -289,7 +291,7 @@ def test_validate_rebuild_targets_flow_by_kv_cost_signature():
         per_page, fixed, _, _ = cls.kv_cost(config, **budget_tokens_kwargs)
         pool.validate_rebuild(
             config, num_pages=10, target_moe=0, per_expert_bytes=0,
-            baseline_free=10 * per_page + fixed, weights_bytes=0,
+            baseline_free=(10 + 1) * per_page + fixed, weights_bytes=0,  # + the dummy page
             current_num_pages=10, **targets,
         )
 
@@ -307,6 +309,6 @@ def test_validate_rebuild_targets_flow_by_kv_cost_signature():
     pool = object.__new__(MHAKVCache)
     pool.validate_rebuild(
         plain, num_pages=10, target_moe=0, per_expert_bytes=0,
-        baseline_free=10 * per_page, weights_bytes=0, current_num_pages=10,
+        baseline_free=(10 + 1) * per_page, weights_bytes=0, current_num_pages=10,
         num_swa_pages=None, future_family_key=None,
     )

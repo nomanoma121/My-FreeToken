@@ -33,11 +33,16 @@
 #include <torch/extension.h>
 
 #if defined(__linux__)
+#include <cerrno>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #define CPU_MOE_HAS_AFFINITY 1
+#define CPU_MOE_HAS_BANK_PREFETCH 1
 #else
 #define CPU_MOE_HAS_AFFINITY 0
+#define CPU_MOE_HAS_BANK_PREFETCH 0
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -1889,7 +1894,134 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Install the cold spans (--moe-bank-prefetch). Parallel arrays, one entry per (bank, layer)
+  // block: layer_id, row-0 address, bytes per row, first cold row, phase (1 or 2). Call while the
+  // pool is idle (before the first decode); an empty list turns prefetch off. Returns the number
+  // of spans kept -- blocks whose every row is resident are dropped here.
+  int set_bank_prefetch(const std::vector<int64_t>& layer, const std::vector<uint64_t>& base,
+                        const std::vector<uint64_t>& row_bytes,
+                        const std::vector<int64_t>& cold_from, const std::vector<int64_t>& phase) {
+    const size_t n = layer.size();
+    if (base.size() != n || row_bytes.size() != n || cold_from.size() != n || phase.size() != n)
+      throw std::runtime_error("set_bank_prefetch: argument lengths differ");
+    pf_enabled.store(false);
+    pf_spans.assign(num_layers, {});
+    pf_min_cold.assign(num_layers, num_experts);
+    int kept = 0;
+#if CPU_MOE_HAS_BANK_PREFETCH
+    const long ps = sysconf(_SC_PAGESIZE);
+    pf_page = ps > 0 ? static_cast<uint64_t>(ps) : 4096;
+    uint64_t widest = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const int L = static_cast<int>(layer[i]);
+      if (L < 0 || L >= num_layers)
+        throw std::runtime_error("set_bank_prefetch: layer id out of range");
+      if (phase[i] != 1 && phase[i] != 2)
+        throw std::runtime_error("set_bank_prefetch: phase must be 1 or 2");
+      const int cf = static_cast<int>(std::max<int64_t>(0, cold_from[i]));
+      if (cf >= num_experts || row_bytes[i] == 0 || base[i] == 0) continue;
+      pf_spans[L].push_back({base[i], row_bytes[i], cf, static_cast<int>(phase[i])});
+      pf_min_cold[L] = std::min(pf_min_cold[L], cf);
+      widest = std::max(widest, row_bytes[i]);
+      ++kept;
+    }
+    pf_stamp.assign(num_experts, 0);
+    pf_gen = 0;
+    pf_rows.reserve(num_experts);
+    pf_vec.resize((widest + 2 * pf_page) / pf_page);
+    pf_enabled.store(kept > 0);
+#else
+    (void)base, (void)row_bytes, (void)cold_from, (void)phase;
+#endif
+    return kept;
+  }
+
+  // (tasks with a cold row, distinct cold rows, ranges advised, bytes advised, ns spent, errno)
+  std::vector<uint64_t> bank_prefetch_stats() const {
+    return {pf_tasks.load(), pf_rows_seen.load(), pf_ranges_advised.load(), pf_bytes_advised.load(),
+            pf_ns.load(), static_cast<uint64_t>(pf_errno.load())};
+  }
+
+  // List this task's distinct rows at or past the layer's first cold row. Ids < 0 (routes served
+  // elsewhere, e.g. on the GPU in hybrid) and out-of-range ids are skipped, as the passes do.
+  bool prefetch_collect(const MoeTask* t) {
+    pf_rows.clear();
+    if (!pf_enabled.load(std::memory_order_relaxed)) return false;
+    const int L = t->layer_id;
+    if (L < 0 || L >= static_cast<int>(pf_spans.size()) || pf_spans[L].empty()) return false;
+    const int lo = pf_min_cold[L];
+    if (++pf_gen == 0) {  // wrapped: clear the stamps so no stale generation matches
+      std::fill(pf_stamp.begin(), pf_stamp.end(), 0);
+      pf_gen = 1;
+    }
+    const size_t n = static_cast<size_t>(t->num_tokens) * top_k;
+    for (size_t i = 0; i < n; ++i) {
+      const int e = t->ids[i];
+      if (e < lo || e >= num_experts || pf_stamp[e] == pf_gen) continue;
+      pf_stamp[e] = pf_gen;
+      pf_rows.push_back(e);
+    }
+    if (pf_rows.empty()) return false;
+    std::sort(pf_rows.begin(), pf_rows.end());  // file order within each block
+    pf_tasks.fetch_add(1, std::memory_order_relaxed);
+    pf_rows_seen.fetch_add(pf_rows.size(), std::memory_order_relaxed);
+    return true;
+  }
+
+  // Advise the listed rows of one phase's blocks. Page-aligned outward: a row need not start on
+  // a page (gpt-oss scale rows are 518400 B), and the page it shares with a neighbour is read
+  // whole by the fault path anyway.
+  void prefetch_phase(const MoeTask* t, int phase) {
+#if CPU_MOE_HAS_BANK_PREFETCH
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t mask = ~(pf_page - 1);
+    for (PrefetchSpan& s : pf_spans[t->layer_id]) {
+      if (s.phase != phase) continue;
+      for (int e : pf_rows) {
+        if (e < s.cold_from) continue;
+        const uint64_t a = s.base + static_cast<uint64_t>(e) * s.row_bytes;
+        const uint64_t lo = a & mask;
+        const uint64_t hi = (a + s.row_bytes + pf_page - 1) & mask;
+        const size_t len = static_cast<size_t>(hi - lo);
+        const size_t pages = len / pf_page;
+        bool missing = pages > pf_vec.size() ||
+                       mincore(reinterpret_cast<void*>(lo), len, pf_vec.data()) != 0;
+        for (size_t p = 0; !missing && p < pages; ++p) missing = (pf_vec[p] & 1) == 0;
+        if (!missing) continue;
+        if (madvise(reinterpret_cast<void*>(lo), len, MADV_WILLNEED) != 0) {
+          // A range the kernel refuses (ENOMEM: not mapped) will keep refusing -- stop asking for
+          // this block rather than paying a failing syscall per row per step. (Anonymous memory
+          // is not an error: WILLNEED there is swap-in readahead, and resident rows skip it.)
+          pf_errno.store(errno, std::memory_order_relaxed);
+          s.cold_from = num_experts;
+          break;
+        }
+        pf_ranges_advised.fetch_add(1, std::memory_order_relaxed);
+        pf_bytes_advised.fetch_add(len, std::memory_order_relaxed);
+      }
+    }
+    pf_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - t0)
+                                              .count()),
+                    std::memory_order_relaxed);
+#else
+    (void)t, (void)phase;
+#endif
+  }
+
+  // Test hook: run only the prefetch for a task (no compute), both phases.
+  void prefetch_only(uintptr_t task) {
+    const MoeTask* t = reinterpret_cast<MoeTask*>(task);
+    if (prefetch_collect(t)) {
+      prefetch_phase(t, 1);
+      prefetch_phase(t, 2);
+    }
+  }
+
   void submit(MoeTask* t) {
+    // --moe-bank-prefetch: the gate_up side before the workers start (they read it first)...
+    const bool pf = pf_enabled.load(std::memory_order_relaxed) && prefetch_collect(t);
+    if (pf) prefetch_phase(t, 1);
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -1959,6 +2091,8 @@ struct CpuMoeExecutor {
       submitted.store(cur_gen, std::memory_order_release);
     }
     task_cv.notify_all();
+    // ...and the down side after: pass 2 waits for all of pass 1, so this lands first.
+    if (pf) prefetch_phase(t, 2);
   }
 
   void sync() {
@@ -2107,6 +2241,51 @@ struct CpuMoeExecutor {
     MoeTask* t = reinterpret_cast<MoeTask*>(ud);
     t->exec->sync();
   }
+
+  // ---- --moe-bank-prefetch: page in this task's cold rows before the workers fault on them ----
+  // (Kept as the LAST members of the executor: inserted among the flag-handshake members above, they
+  // shifted that layout and decode stalled for 2-5 s a few times per 1500 tokens on the RTX 2060 with
+  // the flag off -- 0 of 7 runs without these members, 4 of 4 with. guides/40 §13.)
+  // Under --moe-bank-ram the rows past a block's resident prefix are file-backed pages. Left to
+  // the workers, each is a synchronous 4 KiB fault answered by a readahead window centred on it,
+  // so a window reads into the neighbouring (cold, unwanted) experts and the pool waits on one
+  // window per worker at a time. Here the submitting thread -- which sees the routing before any
+  // worker does -- asks for exactly the rows this task will read, deduplicated: a mincore(2)
+  // check (a row already in page cache costs no syscall beyond it), then MADV_WILLNEED, which
+  // inserts every page of the row into the page cache and submits the reads without waiting for
+  // them. A worker that then faults finds the page there, waits on its I/O instead of starting a
+  // read of its own, and reads nothing it will not use.
+  //
+  // Chosen by replaying the executor's access shape against a real bank file (guides/40): per
+  // cold row, the fault path took 3.2-3.9 ms and read 1.7x the bytes it used at read_ahead_kb
+  // 256, 10-39 ms and 4-11x at 8192; WILLNEED took 0.9-1.2 ms and read 1.00x at both.
+  // MADV_POPULATE_READ goes through the same fault path and inherited its waste; a buffered pread
+  // pool matched WILLNEED only with 16 threads; starting the workers first and advising in
+  // parallel wasted reads once readahead was wide, because a worker could fault before the advice
+  // landed. So: serial, before the wake -- for the gate_up side. The down side is advised right
+  // after the wake, since pass 2 cannot start until pass 1 (which waits on gate_up I/O) is done.
+  struct PrefetchSpan {
+    uint64_t base;       // address of row 0 of this (bank, layer) block
+    uint64_t row_bytes;  // bytes per expert row
+    int cold_from;       // rows [cold_from, num_experts) are file-backed and may be absent
+    int phase;           // 1 = read by pass 1 (gate_up side), 2 = by pass 2 (down side)
+  };
+  std::vector<std::vector<PrefetchSpan>> pf_spans;  // layer_id -> blocks with a cold part
+  std::vector<int> pf_min_cold;                      // layer_id -> min cold_from (skip test)
+  std::atomic<bool> pf_enabled{false};
+  std::vector<uint32_t> pf_stamp;  // expert -> generation that last listed it (dedup)
+  uint32_t pf_gen = 0;
+  std::vector<int> pf_rows;              // this task's distinct cold rows, ascending
+  std::vector<unsigned char> pf_vec;     // mincore scratch
+  uint64_t pf_page = 4096;
+  // Counters (read by Python for logs and tests; written only by the submitting thread).
+  std::atomic<uint64_t> pf_tasks{0};         // tasks that had at least one cold row
+  std::atomic<uint64_t> pf_rows_seen{0};     // distinct cold rows over those tasks
+  std::atomic<uint64_t> pf_ranges_advised{0};
+  std::atomic<uint64_t> pf_bytes_advised{0};
+  std::atomic<uint64_t> pf_ns{0};            // time spent in the prefetch calls
+  std::atomic<int> pf_errno{0};              // last madvise failure (0 = none)
+
 };
 
 }  // namespace
@@ -2144,6 +2323,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
+      .def("set_bank_prefetch", &CpuMoeExecutor::set_bank_prefetch, py::arg("layer"),
+           py::arg("base"), py::arg("row_bytes"), py::arg("cold_from"), py::arg("phase"))
+      .def("bank_prefetch_stats", &CpuMoeExecutor::bank_prefetch_stats)
+      .def("prefetch_only", &CpuMoeExecutor::prefetch_only, py::arg("task"),
+           py::call_guard<py::gil_scoped_release>())
       .def("isa_name", &CpuMoeExecutor::isa_name);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
@@ -2157,4 +2341,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLU_CLAMP); });
+  // --moe-bank-prefetch: whether this build can advise mapped rows (Linux only).
+  m.def("bank_prefetch_supported", []() { return CPU_MOE_HAS_BANK_PREFETCH == 1; });
 }

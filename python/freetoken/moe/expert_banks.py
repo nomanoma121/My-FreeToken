@@ -192,6 +192,22 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
     )
 
 
+def _local_pieces(model_config, pieces):
+    """Under --pp-size a rank's banks hold its own MoE layers only, indexed from zero, so the
+    piece stream is filtered and renumbered here rather than in every family's reader."""
+    from freetoken.distributed import try_get_pp_info
+
+    pp = try_get_pp_info()
+    if pp is None:
+        return pieces
+    lo, hi = pp.bank_window(int(getattr(model_config, "first_k_dense_replace", 0) or 0))
+    return (
+        (bank_layer - lo, e0, e1, piece)
+        for bank_layer, e0, e1, piece in pieces
+        if lo <= bank_layer < hi
+    )
+
+
 def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
@@ -201,7 +217,9 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     pieces = iter_expert_pieces(
         model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
     )
-    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
+    return build_expert_banks(
+        method, num_layers, _local_pieces(model_config, pieces), device=device, layer_sink=layer_sink
+    )
 
 
 def _host_ram_fits_parallel(model_path: str) -> bool:
@@ -314,9 +332,17 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        from freetoken.distributed import try_get_pp_info
+
+        pp = try_get_pp_info()
+        layer_window = None
+        if pp is not None:
+            # this rank's MoE layers within the FTW's full bank set
+            fkd = int(getattr(model_config, "first_k_dense_replace", 0))
+            layer_window = (*pp.bank_window(fkd), pp.num_layers - fkd)
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-            layer_residency=layer_residency,
+            layer_residency=layer_residency, layer_window=layer_window,
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")

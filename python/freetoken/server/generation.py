@@ -37,6 +37,7 @@ except Exception:  # pragma: no cover — jinja2 always ships with transformers
 from .function_call_parser import FunctionCallParser, TOOLS_TAG_LIST, ToolCallItem
 from .reasoning_parser import (
     DSV4_SPECIAL_TOKENS,
+    QWEN_SPECIAL_TOKENS,
     ReasoningParser,
     build_reasoning_parser,
     strip_special_tokens,
@@ -418,10 +419,28 @@ def _split_reasoning(text: str, spec: GenSpec, state: Any) -> tuple[str, str]:
     return parser.parse_non_stream(text)
 
 
+_QWEN_TOOL_CALL_PARSERS = frozenset({"qwen", "qwen25", "qwen3_coder"})
+
+
 def _leaked_special_tokens(state: Any) -> list[str]:
-    """Special-token strings to strip from output. Empty (no-op) unless the dsv4
-    reasoning parser is configured, so non-dsv4 output is untouched."""
-    return DSV4_SPECIAL_TOKENS if getattr(state.config, "reasoning_parser", None) == "deepseekv32" else []
+    """Special-token strings to strip from output, after the reasoning and tool
+    parsers have consumed their markers. Empty (no-op) unless a dsv4 or Qwen-family
+    parser is configured, so other families' output (gpt-oss Harmony tokens
+    included) is untouched. Qwen is recognized by either parser, since a
+    deployment may turn one of them off.
+
+    Applied per detokenizer delta: a special token is one token, so it arrives
+    whole, and the parsers only hold back a suffix that is a prefix of their own
+    tags, which never splits a ``<|...|>`` token."""
+    config = state.config
+    if getattr(config, "reasoning_parser", None) == "deepseekv32":
+        return DSV4_SPECIAL_TOKENS
+    if (
+        getattr(config, "reasoning_parser", None) == "qwen3"
+        or getattr(config, "tool_call_parser", None) in _QWEN_TOOL_CALL_PARSERS
+    ):
+        return QWEN_SPECIAL_TOKENS
+    return []
 
 
 def _make_tool_parser(spec: GenSpec, state: Any) -> FunctionCallParser:
@@ -703,7 +722,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             elif parse_tools:
                 pending += content_delta
             else:
-                yield ContentDelta(strip_special_tokens(content_delta, specials))
+                stripped = strip_special_tokens(content_delta, specials)
+                if stripped:  # a bare special token must not emit an empty delta
+                    yield ContentDelta(stripped)
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -724,7 +745,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             elif parse_tools:
                 pending += flush_content
             else:
-                yield ContentDelta(strip_special_tokens(flush_content, specials))
+                stripped = strip_special_tokens(flush_content, specials)
+                if stripped:
+                    yield ContentDelta(stripped)
 
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
@@ -766,7 +789,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             if finish_reason != "length":
                 finish_reason = "tool_calls"
         elif parse_tools and pending:
-            yield ContentDelta(strip_special_tokens(pending, specials))
+            stripped = strip_special_tokens(pending, specials)
+            if stripped:
+                yield ContentDelta(stripped)
 
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,

@@ -23,6 +23,7 @@ from .moe import (
     Nvfp4MoEMethod,
     UnquantizedMoEMethod,
 )
+from .at_load import AT_LOAD_FP8, LoadTimeFp8Config
 from .quant_backend import QuantBackend, get_quant_backend, set_quant_backend
 from .names import NameMap
 from .configs import (
@@ -49,4 +50,5 @@ __all__ = [
     "QuantBackend", "set_quant_backend", "get_quant_backend", "NameMap",
     "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config",
     "quant_method_for", "quantization_config_of", "set_quant_config", "get_quant_config", "finalize_quant",
+    "LoadTimeFp8Config", "AT_LOAD_FP8",
 ]

@@ -19,14 +19,27 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
+from freetoken.distributed import try_get_pp_info
+from freetoken.layers import (
+    BaseOP,
+    Fp8VocabParallelEmbedding,
+    HostEmbedding,
+    LinearReplicated,
+    OPList,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.mtp_quant import draft_head_config
+from freetoken.models.pipeline import RemoteLayer as _RemoteLayer
+from freetoken.models.prefill_pieces import plan_prefill_pieces
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
-from .hc import GatedResidual
+from .hc import GatedResidual, GroupedPlusOneRMSNorm
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+from freetoken.mm import restore_placeholder
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 
@@ -58,19 +71,41 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
+    def __init__(
+        self, config: ModelConfig, layer_id: int, moe_layer_offset: int = 0, *, prefix: str = ""
+    ) -> None:
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
         if self._is_linear:
             self.linear_attn = build_linear_mixer(config, layer_id, f"{prefix}.linear_attn")
         else:
             self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
-        self.mlp = Qwen4ExpMoE(config, layer_id, prefix=f"{prefix}.mlp")
+        # the offload cache indexes MoE layers rank-locally under the pipeline engine
+        self.mlp = Qwen4ExpMoE(config, layer_id - moe_layer_offset, prefix=f"{prefix}.mlp")
         self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
         self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
         self.ple = (
             PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
         )
+
+    def forward_pieces(self, hidden: torch.Tensor, batch: Batch, pieces, ctx) -> torch.Tensor:
+        """forward() with the sequence mixer over consecutive pieces of the chunk and everything
+        else -- PLE, both hyper-connection mix/combine, the MoE -- over all of it
+        (models/prefill_pieces.py). PLE reads the chunk's own n-gram context and the
+        hyper-connections are per token, so only the mixer sees a piece at a time."""
+        if self.ple is not None:
+            hidden = hidden + self.ple.forward(hidden, batch)
+        block_input, inject = self.attn_hyper_connection.mix(hidden)
+        outs = []
+        for start, end, piece in pieces:
+            x = block_input[start:end]
+            with ctx.piece_batch(piece):
+                outs.append(
+                    self.linear_attn.forward(x) if self._is_linear else self.self_attn.forward(x, piece)
+                )
+        hidden = self.attn_hyper_connection.combine(hidden, torch.cat(outs), inject)
+        block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
@@ -86,31 +121,154 @@ class Qwen4ExpDecoderLayer(BaseOP):
         return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
 
+class Qwen4ExpMTP(BaseOP):
+    """The checkpoint's MTP draft head (``mtp.*``): one more decoder layer over the target's
+    residual streams. Per token, with ``R [T, hc*hidden]`` the target's final-layer residual
+    (BEFORE its stream mixer) and ``t_next`` the token that follows::
+
+        R_i' = fc_hidden(norm_h(R)_i) + fc_embedding(norm_e(embed(t_next)))   # every stream i
+        R''  = layer(R')            # full-attention QSA layer + MoE, own KV / index slab
+        h    = mixer.mix(R'')       # [T, hidden]  ->  shared lm_head  ->  logits of t_next+1
+
+    (the llama.cpp NextN graph: grouped per-stream rmsnorm on the wide residual, the two fc's
+    fused into one block projection, the head's own hyper-connection mixer as output norm).
+    Multi-step drafting feeds ``R''`` back as the next step's residual."""
+
+    def __init__(self, config: ModelConfig, layer_id: int, moe_layer_offset: int, own_embedding: bool) -> None:
+        args = config.qwen4_args
+        self.hc_count = args.hc_count
+        self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
+        hidden = config.hidden_size
+        self.pre_fc_norm_hidden = GroupedPlusOneRMSNorm(self.hc_count * hidden, config.rms_norm_eps, self.hc_count)
+        self.pre_fc_norm_embedding = GroupedPlusOneRMSNorm(hidden, config.rms_norm_eps, 1)
+        # bf16, or per-row fp8 under --dense-quant fp8 (quantized at load like every projection)
+        self.fc_hidden = LinearReplicated(
+            hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_hidden"
+        )
+        self.fc_embedding = LinearReplicated(
+            hidden, hidden, has_bias=False, quant_config=config.quant, prefix="mtp.fc_embedding"
+        )
+        head_config = draft_head_config(config, dense_from_model=True)
+        self.layers = OPList([
+            Qwen4ExpDecoderLayer(
+                head_config, layer_id, moe_layer_offset=moe_layer_offset, prefix="mtp.layers.0"
+            )
+        ])
+        self.hyper_connection_mixer = GatedResidual(
+            config, use_combine=False, prefix="mtp.hyper_connection_mixer"
+        )
+        # the head shares the target's embedding; a pipeline rank without the embedding table
+        # carries its own copy (mtp.embed_tokens, duplicated by the loader) in pinned host
+        # memory, gathered by the GPU in place (so the head's graphs can embed too) and the
+        # VRAM goes to KV pages instead. The copy stays bf16 under --dense-quant fp8.
+        self.embed_tokens = HostEmbedding(config.vocab_size, hidden) if own_embedding else None
+        self._embed_ref = None  # the target's embedding when shared (not a state-dict child)
+        self._image_token_id = config.image_token_id
+
+    def forward(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        """``residual [T, hc*hidden]`` + ``next_ids [T]`` -> the head's own residual ``[T, hc*hidden]``
+        (its KV / expert routing use ``batch``'s positions and metadata)."""
+        emb = self.embed_tokens if self.embed_tokens is not None else self._embed_ref
+        assert emb is not None, "MTP head has no embedding table"
+        t = residual.shape[0]
+        rn = self.pre_fc_norm_hidden.forward(residual)
+        fh = self.fc_hidden.forward(rn.reshape(t * self.hc_count, self.hidden_size))
+        fh = fh.reshape(t, self.hc_count * self.hidden_size)
+        if self._image_token_id is not None:
+            # an image row's successor id is a content pad id past the vocab: the head embeds
+            # the placeholder token there, as the PLE hash does
+            next_ids = restore_placeholder(next_ids, self._image_token_id)
+        e = self.pre_fc_norm_embedding.forward(emb.forward(next_ids).to(residual.dtype))
+        fe = self.fc_embedding.forward(e)
+        r = fh + fe.repeat(1, self.hc_count)
+        pieces = getattr(batch, "prefill_pieces", None)
+        if pieces is not None and pieces[-1][1] == t:
+            return self.layers.op_list[0].forward_pieces(r, batch, pieces, get_global_ctx())
+        return self.layers.op_list[0].forward(r, batch)
+
+    def mix(self, residual: torch.Tensor) -> torch.Tensor:
+        """Collapse the head's residual streams into the lm_head input ``[T, hidden]``."""
+        return self.hyper_connection_mixer.mix(residual)[0]
+
+    def to_head(self, h: torch.Tensor) -> torch.Tensor:
+        """The engine's common draft-head seam: the head output -> the lm_head input."""
+        return self.mix(h)
+
+
 class Qwen4ExpModel(BaseOP):
+    """The decoder stack, or under the pipeline engine (``--parallel pp``) this rank's slice
+    of it: layers ``[start, end)`` with the embedding on the first rank and the stream mixer
+    on the last; the other layers are ``_RemoteLayer`` placeholders."""
+
     def __init__(self, config: ModelConfig, *, prefix: str = "model") -> None:
         self.hc_count = config.qwen4_args.hc_count
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
+        pp = try_get_pp_info()
+        start, end = (0, config.num_layers) if pp is None else (pp.start, pp.end)
+        self._pp_first = start == 0
+        self._pp_last = end == config.num_layers
+        embed_cls = (
+            Fp8VocabParallelEmbedding
+            if getattr(config, "embed_quant", "none") == "fp8_pertensor"
+            else VocabParallelEmbedding
+        )
+        self.embed_tokens = (
+            embed_cls(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size)
+            if self._pp_first
+            else None
         )
         self.layers = OPList(
             [
-                Qwen4ExpDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                Qwen4ExpDecoderLayer(
+                    config, layer_id, moe_layer_offset=start,
+                    prefix=f"{prefix}.layers.{layer_id}",
+                )
+                if start <= layer_id < end
+                else _RemoteLayer()
                 for layer_id in range(config.num_layers)
             ]
         )
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+        self.hyper_connection_mixer = (
+            GatedResidual(
+                config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer"
+            )
+            if self._pp_last
+            else None
+        )
+        # Indices, not layer objects: the offload-cache walk (iter_offload_moe_layers) visits
+        # every tuple on the model, so a second reference would attach each MoE layer twice.
+        self._local_ids = tuple(range(start, end))
         # plain tuple (not an OP child), so it never shows up in the state dict
-        self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        self._ple = tuple(
+            self.layers.op_list[i].ple for i in self._local_ids if self.layers.op_list[i].ple is not None
+        )
+
+    @property
+    def pp_first(self) -> bool:
+        return self._pp_first
+
+    @property
+    def pp_last(self) -> bool:
+        return self._pp_last
 
     @property
     def ple_layers(self) -> List[PLELayer]:
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
-        hidden = hidden.repeat(1, self.hc_count)
+    def forward(
+        self, input_ids: torch.Tensor, batch: Batch, hidden_in: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``hidden_in`` is the residual stream ``[T, hc_count*hidden]`` received from the
+        previous pipeline rank (required on non-first ranks); a non-last rank returns the
+        stream it hands on instead of the mixed ``[T, hidden]`` head input."""
+        if self._pp_first:
+            # only the embedding rank sees input embeddings, so only it places image soft tokens
+            hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
+            hidden = hidden.repeat(1, self.hc_count)
+        else:
+            assert hidden_in is not None, "non-first pipeline rank needs the received residual stream"
+            hidden = hidden_in
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -118,12 +276,31 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
-            hidden = layer.forward(hidden, batch)
+        layers = self.layers.op_list
+        ctx = get_global_ctx()
+        dbg = ctx.debug_layer_outs
+        # --prefill-mixer-pieces (models/prefill_pieces.py). Pipeline ranks included: a piece
+        # never leaves the rank, and what crosses to the next rank is the whole chunk's stream.
+        pieces = None
+        if ctx.prefill_mixer_pieces >= 2:
+            pieces = plan_prefill_pieces(
+                batch, ctx.prefill_mixer_pieces, ctx.attn_backend, hidden.device, ctx.linear_state_pool
+            )
+        for i in self._local_ids:
+            if pieces is not None:
+                hidden = layers[i].forward_pieces(hidden, batch, pieces, ctx)
+            else:
+                hidden = layers[i].forward(hidden, batch)
+            if dbg is not None:
+                dbg.append((i, hidden.detach().clone()))
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if not self._pp_last:
+            return hidden
+        # the MTP draft head reads the final residual streams (before the mixer)
+        self._last_residual = hidden
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
@@ -131,14 +308,36 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            quant_config=config.quant,
-            prefix="lm_head",
-        )
+        # the residual stream crossing a pipeline boundary is [T, hc_count * hidden] in the
+        # model dtype (the engine builds the model under torch_dtype(config.dtype))
+        self.pp_hidden_width = config.qwen4_args.hc_count * config.hidden_size
+        self._pp_hidden_dtype = torch.get_default_dtype()
+        # --spec-mtp: the draft head rides the last pipeline rank as layer mtp_layer_id
+        self.mtp = None
+        mtp_id = getattr(config, "mtp_layer_id", None)
+        if mtp_id is not None and self.model.pp_last:
+            pp = try_get_pp_info()
+            start = 0 if pp is None else pp.start
+            self.mtp = Qwen4ExpMTP(
+                config, mtp_id, moe_layer_offset=start,
+                own_embedding=self.model.embed_tokens is None,
+            )
+            if self.model.embed_tokens is not None:
+                self.mtp._embed_ref = self.model.embed_tokens
+        if not self.model.pp_last:
+            self.lm_head = None
+        else:
+            assert not (config.tie_word_embeddings and self.model.embed_tokens is None), (
+                "tied embeddings need the embedding and the head on the same pipeline rank"
+            )
+            self.lm_head = ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+                quant_config=config.quant,
+                prefix="lm_head",
+            )
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
@@ -208,9 +407,76 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
         return table.bank.nbytes
 
+    @property
+    def host_resident_prefixes(self) -> tuple[str, ...]:
+        """State-dict key prefixes the engine materializes in pinned host memory instead of
+        on the device (the draft head's own embedding copy)."""
+        mtp = self.mtp
+        if mtp is not None and getattr(mtp.embed_tokens, "host_resident", False):
+            return ("mtp.embed_tokens.",)
+        return ()
+
+    def remap_loaded_weight(
+        self, name: str, tensor: torch.Tensor, model_state: dict
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Loader seam (engine._load_weight_state_dict): the reader fuses the GDN projections
+        into one ``in_proj`` (qkv | z | b | a); the fp8 GDN keeps qkv|z quantized and b|a bf16
+        as two buffers, so split the rows the way the model declares them."""
+        if name.endswith(".linear_attn.in_proj.weight") and name not in model_state:
+            base = name[: -len("in_proj.weight")]
+            qkvz, ba = base + "in_proj_qkvz.weight", base + "in_proj_ba.weight"
+            if qkvz in model_state and ba in model_state:
+                n = model_state[qkvz].shape[0]
+                assert n + model_state[ba].shape[0] == tensor.shape[0], (name, tensor.shape)
+                return [(qkvz, tensor[:n]), (ba, tensor[n:])]
+        if name == "model.embed_tokens.weight" and "mtp.embed_tokens.weight" in model_state:
+            # a pipeline rank that holds the draft head but not the embedding gets its own copy
+            return [(name, tensor), ("mtp.embed_tokens.weight", tensor)]
+        return [(name, tensor)]
+
+    @property
+    def last_hidden(self) -> torch.Tensor:
+        """The draft head's input from the last (eager) forward: the final-layer residual
+        streams ``[T, hc*hidden]`` (head-owning rank)."""
+        return self.model._last_residual
+
+    def spec_rollback(self, batch: Batch, accepted: int, ctx) -> None:
+        """Roll this rank's per-request state back to the first ``accepted`` rows of the verify
+        window: GDN recurrent + conv states (from the layers' stashes) and the PLE n-gram
+        context (from the host-side ids)."""
+        for stash in ctx.spec_stash:
+            stash.restore(accepted)
+        ctx.spec_stash = []
+        if self.model._ple:
+            from freetoken.engine.spec import ngram_context_after
+
+            from .ple import _state_slot, rewrite_ngram_context
+
+            req = batch.reqs[0]
+            args = self._config.qwen4_args
+            ids = ngram_context_after(
+                req.input_ids.tolist(), req.spec_drafts, accepted,
+                args.ngram_size - 1, args.ngram_boundary_token_id,
+            )
+            rewrite_ngram_context(_state_slot(req), ids)
+
     def forward(self) -> torch.Tensor:
-        batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        hidden_in = None
+        if not self.model.pp_first:
+            hidden_in = ctx.pp_hidden_in
+            if hidden_in is None:
+                # warmup / probe forwards run without a peer: feed a zero stream of the right shape
+                hidden_in = torch.zeros(
+                    (batch.input_ids.numel(), self.pp_hidden_width),
+                    dtype=self._pp_hidden_dtype,
+                    device=batch.input_ids.device,
+                )
+        out = self.model.forward(batch.input_ids, batch, hidden_in)
+        if not self.model.pp_last:
+            return out  # the residual stream for the next pipeline rank
+        return self.lm_head.forward(out)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

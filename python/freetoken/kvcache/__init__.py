@@ -23,6 +23,9 @@ class CacheManagerCreator(Protocol):
 
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 
+# Sliding-window model families (HybridSWAKVCache) that --kv-cache-dtype is enabled for.
+_KV_QUANT_SWA_MODEL_TYPES = frozenset({"gpt_oss"})
+
 
 def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     """attn_type -> KV pool family, the dispatch shared by ``create_kv_pool`` and the
@@ -109,6 +112,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             if config.cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
+    from .kv_quant import resolve as _resolve_kv_quant
+
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
@@ -117,6 +122,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_quant=_resolve_kv_quant(getattr(config, "kv_cache_dtype", None)),
     )
 
 
@@ -128,18 +134,61 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_quant=None,
 ) -> BaseKVCachePool:
+    if kv_quant is not None:
+        # Refuse at startup rather than serve a pool whose secondary tiers (sparse index
+        # slabs, MLA latents) are still 16-bit while the paged slab is not: every one of those
+        # is read by a kernel that has not been taught the layout, and the failure mode is
+        # wrong numbers, not an exception.
+        from .hybrid_swa_pool import HybridSWAKVCache as _HybridSWA
+        from .mha_pool import MHAKVCache as _MHA
+        from .qsa_pool import QSAKVCache as _QSA
+
+        family = resolve_pool_class(model_config)
+        # QSA quantizes its paged K/V only; the compressed index slab, the pending ring and
+        # the scratch rows stay 16-bit (they choose which blocks get read, and an error there
+        # changes the selection rather than blurring a value).
+        if family is _HybridSWA:
+            # Both groups are quantized, and the Triton kernels read codes with the window
+            # and the sinks applied. What is enabled is the model family that path has been
+            # checked for: Gemma 4 and MuseGlimmer build the same pool but carry their own
+            # attention geometry (per-group head_dim, K == V groups), not looked at yet.
+            model_type = getattr(model_config, "model_type", None)
+            if model_type not in _KV_QUANT_SWA_MODEL_TYPES:
+                raise ValueError(
+                    f"--kv-cache-dtype {kv_quant.name} on a sliding-window model is only "
+                    f"enabled for {', '.join(sorted(_KV_QUANT_SWA_MODEL_TYPES))}; this model "
+                    f"is {model_type!r}. Serve it without the flag."
+                )
+            for spec in model_config.kv_cache_group_specs():
+                # raises with the head_dim in the message when the block does not divide it
+                kv_quant.code_bytes_per_row(spec.head_dim)
+        elif family not in (_MHA, _QSA):
+            raise ValueError(
+                f"--kv-cache-dtype {kv_quant.name} is only implemented for the plain paged "
+                f"pool, Flash-Next's QSA pool and gpt-oss; this model resolves to "
+                f"{family.__name__}. Serve it without the flag."
+            )
+
+    # the pools validate global layer ids against the model depth; the MTP draft head (spec
+    # decoding) is one more full-attention layer numbered num_layers
+    num_layers = model_config.num_layers
+    mtp_layer = getattr(model_config, "mtp_layer_id", None)
+    if mtp_layer is not None and mtp_layer >= num_layers:
+        num_layers = mtp_layer + 1
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
         return HybridSWAKVCache(
             groups=model_config.kv_cache_group_specs(),
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             num_full_pages=num_pages,
             page_size=page_size,
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            kv_quant=kv_quant,
         )
 
     from .mha_pool import MHAKVCache
@@ -171,7 +220,7 @@ def create_kvcache_pool(
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -193,7 +242,7 @@ def create_kvcache_pool(
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=num_layers,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -204,6 +253,7 @@ def create_kvcache_pool(
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
+            kv_quant=kv_quant,
             mrope=model_config.model_is_mrope,
         )
 
@@ -247,15 +297,21 @@ def create_kvcache_pool(
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
+    head_dim = spec.head_dim if spec is not None else model_config.head_dim
+    if kv_quant is not None:
+        # code_bytes_per_row raises with the head_dim in the message when the block does not
+        # divide it, which is the only geometry this layout cannot express.
+        kv_quant.code_bytes_per_row(head_dim)
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
-        head_dim=spec.head_dim if spec is not None else model_config.head_dim,
+        num_layers=num_layers,
+        head_dim=head_dim,
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_quant=kv_quant,
     )
 
 

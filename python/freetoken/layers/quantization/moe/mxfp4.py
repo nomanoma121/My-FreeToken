@@ -40,6 +40,16 @@ class TritonMxfp4MoEKernel(MoEKernel):
         out["down_scale"].copy_(pieces["down_scale"].view(E8M0))
         return {}
 
+    def unpack(self, rows, cfg: MoEConfig):
+        # byte views of the stored codes and scales
+        i = cfg.intermediate
+        return {
+            "gate_up": rows["gate_up"], "gate_up_scale": rows["gate_up_scale"],
+            "gate": rows["gate_up"][:, :i], "up": rows["gate_up"][:, i:],
+            "gate_scale": rows["gate_up_scale"][:, :i], "up_scale": rows["gate_up_scale"][:, i:],
+            "down": rows["down"], "down_scale": rows["down_scale"],
+        }
+
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"])
@@ -88,6 +98,20 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
         out["down_scale"].copy_(pieces["down_scale"].permute(0, 2, 1))
         out["down_bias"].copy_(pieces["down_bias"])
         return {}
+
+    def unpack(self, rows, cfg: MoEConfig):
+        # the pack transposes the HF blocks / scales and keeps the biases as stored; only the
+        # whole intermediate range is the checkpoint's tensor (TP slices it on the way in)
+        if cfg.tp_size != 1:
+            return {}
+        return {
+            "gate_up": rows["gate_up"].permute(0, 2, 1),
+            "gate_up_scale": rows["gate_up_scale"].permute(0, 2, 1),
+            "gate_up_bias": rows["gate_up_bias"],
+            "down": rows["down"].permute(0, 2, 1),
+            "down_scale": rows["down_scale"].permute(0, 2, 1),
+            "down_bias": rows["down_bias"],
+        }
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         from freetoken.moe.fused_mxfp4 import MXFP4_DECODE_MAX_TOKENS, run_mxfp4_prefill_experts_t, run_mxfp4_splitk_decode_experts

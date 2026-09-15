@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Batch, Req
+from freetoken.env import ENV
 from freetoken.utils import align_down, div_ceil, init_logger
 
 from .mm import mm_chunk_end, mm_rows_after
@@ -55,6 +57,9 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # Why the last try_add_one returned None: a short tuple, kind first (see describe_refusal).
+    # Set only on the refusal path, from numbers the check already had in hand.
+    refusal: tuple | None = None
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -69,6 +74,7 @@ class PrefillAdder:
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
+            self.refusal = ("req_slots",)
             return None
 
         # TODO: consider host cache match case
@@ -81,10 +87,14 @@ class PrefillAdder:
             req.input_len + req.output_len, cached_len
         )
 
-        if estimated_size + self.reserved_size > self.cache_manager.available_size:
+        available = self.cache_manager.available_size
+        if estimated_size + self.reserved_size > available:
+            self.refusal = ("kv", estimated_size, self.reserved_size, available)
             return None
         self.cache_manager.lock(handle)
-        if estimated_size + self.reserved_size > self.cache_manager.available_size:
+        available = self.cache_manager.available_size
+        if estimated_size + self.reserved_size > available:
+            self.refusal = ("kv", estimated_size, self.reserved_size, available)
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -94,6 +104,7 @@ class PrefillAdder:
             if pool.num_free_slots < 3:
                 self.cache_manager.ensure_mamba_slots(3)
             if pool.num_free_slots < 3:
+                self.refusal = ("gdn", pool.num_free_slots)
                 return self.cache_manager.unlock(handle)
 
         # Third currency (SWA): refuse admission unless the swa pool can seat this request's first
@@ -107,7 +118,9 @@ class PrefillAdder:
             need_swa = div_ceil(
                 min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
             ) * ps
-            if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
+            swa_available = self.cache_manager.swa_available_size - self.reserved_swa
+            if swa_available < need_swa:
+                self.refusal = ("swa", need_swa, swa_available)
                 return self.cache_manager.unlock(handle)
 
         table_idx = self.table_manager.allocate()
@@ -138,6 +151,8 @@ class PrefillAdder:
         table_idx: int,
         cached_len: int,
         linear_slot_idx: int | None = None,
+        chunk_upto: int | None = None,
+        chunk_dups: list | None = None,
         ping_pong: tuple | None = None,
         next_track_idx: int = 0,
         restore_src: int | None = None,
@@ -172,6 +187,7 @@ class PrefillAdder:
             if 0 < chunk_size < remain_len:
                 aligned = align_down(cached_len + chunk_size, ps) - cached_len
                 if aligned <= 0:
+                    self.refusal = ("swa_align", swa_budget)
                     return None
                 chunk_size = aligned
         align = self.cache_manager.prefill_chunk_align
@@ -221,6 +237,8 @@ class PrefillAdder:
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
+        req.chunk_upto = chunk_upto
+        req.chunk_dups = [] if chunk_dups is None else chunk_dups
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
@@ -229,6 +247,7 @@ class PrefillAdder:
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
         if self.token_budget <= 0:
+            self.refusal = ("budget", self.token_budget)
             return None
 
         if chunked_req := pending_req.chunked_req:
@@ -238,6 +257,8 @@ class PrefillAdder:
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
                 linear_slot_idx=chunked_req.linear_slot_idx,
+                chunk_upto=chunked_req.chunk_upto,
+                chunk_dups=chunked_req.chunk_dups,
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
@@ -268,6 +289,127 @@ class PrefillAdder:
         return None
 
 
+class AdmissionStall:
+    """Clock for the request at the head of the prefill queue while it keeps being refused.
+
+    A refusal is routine: KV is short for one step while a decode finishes, and with
+    --max-running-requests 1 a client's side request (Open WebUI's title/tags) queues behind a
+    whole generation. Waiting behind requests that are advancing is FIFO, not a stall, so while
+    anything is running the clock only counts time in which the running requests made no
+    progress; the upstream #453 wedge is exactly that (active=1, 0 tok/s). Nothing is said until
+    that has lasted ``warn_after`` seconds, then once per ``repeat_every`` while it lasts.
+    ``since`` stays the head's first refusal, so a warning still reports the whole wait. Per
+    scheduling turn the cost is an int compare plus, on a refusal, a clock read and a sum over
+    the running requests (at most --max-running-requests)."""
+
+    def __init__(self, warn_after: float, repeat_every: float = 60.0):
+        self.warn_after = warn_after
+        self.repeat_every = max(repeat_every, warn_after)
+        self.clear()
+
+    def clear(self) -> None:
+        self.uid: int | None = None
+        self.since = 0.0
+        self.warnings = 0
+        self._next_warn = 0.0
+        self.progress: int | None = None
+        self.progress_at = 0.0  # when ``progress`` last changed (or the clock started)
+
+    def refused(self, uid: int, now: float, progress: int | None = None) -> bool:
+        """The head ``uid`` was refused at ``now``; True when that deserves a warning.
+        ``progress`` is a marker that moves whenever the running requests advance (None: nothing
+        is running); a move pushes the next warning a full ``warn_after`` out."""
+        if uid != self.uid:
+            self.uid, self.since, self.warnings = uid, now, 0
+            self.progress, self.progress_at = progress, now
+            self._next_warn = now + self.warn_after
+            return False
+        if progress is not None and progress != self.progress:
+            self.progress, self.progress_at = progress, now
+            self._next_warn = now + self.warn_after
+            return False
+        if self.warn_after <= 0 or now < self._next_warn:
+            return False
+        self._next_warn = now + self.repeat_every
+        self.warnings += 1
+        return True
+
+
+def describe_refusal(
+    refusal: tuple | None,
+    head: PendingReq,
+    waited: float,
+    queued_behind: int,
+    cache_manager: CacheManager,
+    table_manager: TableManager,
+    decode_manager: DecodeManager,
+    no_progress_for: float | None = None,
+) -> str:
+    """The stall warning: what the head asked for against what the pool had. The refusal numbers
+    are the ones the check compared; the free/evictable split is read now, which is cheap and
+    only happens when a warning is due. ``no_progress_for``: how long the running requests have
+    not advanced (the stall clock's own reading)."""
+    running = len(decode_manager.running_reqs)
+    kind = refusal[0] if refusal else None
+    cm = cache_manager
+    outlook = None
+    if kind == "req_slots":
+        reason = (
+            f"no free request slot (all {table_manager._max_running_reqs} of "
+            "--max-running-requests are taken)"
+        )
+    elif kind == "kv":
+        _, need, reserved, available = refusal
+        free = len(cm.free_slots) * cm.page_size
+        total = cm.num_pages * cm.page_size
+        reason = (
+            f"it needs {need} KV tokens (prompt + max_tokens, page-rounded, less its cached "
+            f"prefix) and {reserved} are reserved for the running requests, but {available} "
+            f"were available ({free} free + {max(cm.available_size - free, 0)} evictable prefix "
+            f"cache now, of {total} in the pool)"
+        )
+        if need > total:
+            reason += "; that is more than the whole pool"
+            outlook = " It can never be admitted: lower its max_tokens or raise the KV budget."
+    elif kind == "gdn":
+        pool = cm.linear_state_pool
+        reason = (
+            f"it needs 3 GDN state slots and {refusal[1]} were free after evicting cached "
+            f"snapshots (pool of {pool.num_slots - 1})"
+        )
+    elif kind == "swa":
+        reason = (
+            f"it needs {refusal[1]} sliding-window tokens for its first chunk and {refusal[2]} "
+            "were available"
+        )
+    elif kind == "swa_align":
+        reason = (
+            f"the sliding-window budget ({refusal[1]} tokens) does not reach the next page "
+            "boundary of its chunk"
+        )
+    elif kind == "budget":
+        reason = f"the prefill token budget for this turn was {refusal[1]}"
+    elif kind == "disk":
+        reason = (
+            f"its first {refusal[1]} tokens are being read back from --prefix-disk-cache and "
+            "the read has not finished"
+        )
+        outlook = " A slow or busy disk delays it; it is admitted as soon as the read ends."
+    else:
+        reason = "no reason was recorded"
+    if outlook is None and kind != "budget":
+        outlook = (
+            f" It is queued behind {running} running request(s) that have made no progress for "
+            f"{no_progress_for or 0:.0f}s, so they are not going to free it either." if running
+            else " Nothing is running that could free it, so this will not clear by itself."
+        )
+    return (
+        f"request {head.uid} (prompt {head.input_len} tokens, max_tokens {head.output_len}) has "
+        f"been refused admission for {waited:.0f}s, holding {queued_behind} queued request(s) "
+        f"behind it: {reason}.{outlook or ''}"
+    )
+
+
 @dataclass
 class PrefillManager:
     cache_manager: CacheManager
@@ -276,6 +418,11 @@ class PrefillManager:
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
+    stall: AdmissionStall = field(
+        default_factory=lambda: AdmissionStall(ENV.ADMISSION_WARN_SECONDS.value)
+    )
+    # --prefix-disk-cache (scheduler/prefix_disk.PrefixDiskCache), set by the scheduler
+    prefix_disk: object | None = None
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
@@ -312,11 +459,28 @@ class PrefillManager:
         log_cached_tokens = 0
         for pending_req in self.pending_list:
             is_continuation = pending_req.chunked_req is not None
+            if (
+                self.prefix_disk is not None
+                and not is_continuation
+                and adder.token_budget > 0
+                and not self.prefix_disk.admit_gate(
+                    pending_req, can_restore=not reqs, reserve_tokens=adder.reserved_size
+                )
+            ):
+                # its prompt is on disk deeper than the tree has it and is being read back;
+                # hold it (and the queue behind it, as any refusal does) until it is restored
+                adder.refusal = ("disk", pending_req.disk_entry.length)
+                break
             if req := adder.try_add_one(pending_req):
+                predecessor = pending_req.chunked_req
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
+                if predecessor is not None:
+                    # The chunk this one continues is still in flight (overlap): let its commit
+                    # find us, so a handle swap reaches the object that will unlock it.
+                    predecessor.successor = req
                 reqs.append(req)
                 if not is_continuation:
                     # Record the COMPLETE prompt length and the prefix-cache hit on the
@@ -337,7 +501,25 @@ class PrefillManager:
             else:
                 break  # We cannot add more requests
         if len(reqs) == 0:
+            # Nothing admitted: the head was refused and holds the whole queue behind it. The
+            # scheduler retries every loop without blocking, so this is the only place a
+            # queue that never moves again can be seen.
+            head = self.pending_list[0]
+            now = time.monotonic()
+            running = self.decode_manager.running_reqs
+            # device_len (a host int) grows on every forward a running request gets, drafts
+            # included; the sum stands still only if none of them is being stepped
+            progress = sum(req.device_len for req in running) if running else None
+            stall = self.stall
+            if stall.refused(head.uid, now, progress):
+                logger.warning(describe_refusal(
+                    adder.refusal, head, now - stall.since, len(self.pending_list) - 1,
+                    self.cache_manager, self.table_manager, self.decode_manager,
+                    no_progress_for=now - stall.progress_at,
+                ))
             return None
+        if self.stall.uid is not None:
+            self._note_admitted(reqs)
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
@@ -345,9 +527,28 @@ class PrefillManager:
         batch.prompt_admissions = prompt_admissions
         return batch
 
+    def _note_admitted(self, reqs: List[Req]) -> None:
+        stall = self.stall
+        if not any(req.uid == stall.uid for req in reqs):
+            return  # admitted around it (continuation chunks); it is still waiting
+        if stall.warnings:
+            logger.info(
+                f"request {stall.uid} admitted after {time.monotonic() - stall.since:.0f}s "
+                "at the head of the prefill queue"
+            )
+        stall.clear()
+
     def abort_req(self, uid: int) -> Req | None:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
+                if uid == self.stall.uid:
+                    if self.stall.warnings:
+                        logger.info(
+                            f"request {uid} aborted after "
+                            f"{time.monotonic() - self.stall.since:.0f}s at the head of the "
+                            "prefill queue, never admitted"
+                        )
+                    self.stall.clear()
                 self.pending_list.pop(i)
                 return req.chunked_req
         return None

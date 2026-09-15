@@ -6,7 +6,7 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is kept only when the model built the tower.
+Dropped: ``mtp.*`` (the speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) unless ``include_mtp`` asks for it; ``model.visual.*`` is kept only when the model built the tower.
 """
 
 from __future__ import annotations
@@ -52,6 +52,14 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
+
+def _is_primary() -> bool:
+    """Rank 0 of whatever parallel layout runs (TP or the pipeline engine): drives progress bars."""
+    from freetoken.distributed import try_get_world_info
+
+    world = try_get_world_info()
+    return world is None or world.is_primary()
+
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
 _PLE_SHARD_RE = re.compile(
@@ -86,8 +94,8 @@ _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith("mtp."):
-        return None
+    # mtp.* (the MTP draft head) is kept under its own prefix: the engine drops it unless
+    # --spec-mtp built the head, and turns its stacked bf16 experts into a bank layer
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -108,7 +116,7 @@ def _split_kind(name: str) -> tuple[str, str]:
 class _DenseFuser:
     """Concatenates checkpoint projection parts into the model's merged buffers, per kind (weight / block scale).
 
-    The part table is the family's packed_modules_mapping. The QuantConfig picks the GDN in_proj layout and validates each part against the scheme the model built its buffer from.
+    The part table is the family's packed_modules_mapping. The QuantConfig picks the GDN in_proj layout from the scheme the model built its buffer from, and validates each part against the scheme the checkpoint stores it under.
     """
 
     def __init__(self, quant, packed: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
@@ -121,7 +129,16 @@ class _DenseFuser:
         self.buf: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
 
     def scheme(self, module: str):
+        """The scheme the model builds ``module`` from -- which is what picks the GDN in_proj layout."""
         return None if self.quant is None else self.quant.scheme_for(module)
+
+    def stored(self, module: str):
+        """The scheme the checkpoint stores ``module`` under, which is not always the one above:
+        --dense-quant reports an unquantized projection as fp8 because that is what the layer
+        becomes, while the shard still holds bf16 and the engine converts it after the read."""
+        if self.quant is None:
+            return None
+        return self.quant.scheme_for_name(self.quant.name_map.to_checkpoint(module)[0])
 
     def _target(self, parent: str, leaf: str) -> tuple[str, int] | None:
         candidates = self.by_part.get(leaf)
@@ -140,8 +157,10 @@ class _DenseFuser:
         return f"{parent}.{fused}", idx
 
     def check(self, module: str, name: str, tensor: torch.Tensor) -> None:
-        """``tensor`` (checkpoint key ``name``) must match the scheme the model built ``module`` from."""
-        scheme = self.scheme(module)
+        """``tensor`` (checkpoint key ``name``) must match the scheme the checkpoint stores that
+        part under. Asking what the model built ``module`` from instead refuses every bf16
+        projection under --dense-quant, whose whole job is to report them as fp8."""
+        scheme = self.stored(_split_kind(name)[0])
         if name.endswith(".weight_scale_inv"):
             if scheme is None or not scheme.has("weight_scale_inv"):
                 raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
@@ -194,9 +213,12 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_mtp: bool = False,
     include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
+    ``include_mtp`` also yields the checkpoint's MTP draft head (``mtp.*``, the engine asks for
+    it when --spec-mtp built the head on this process); off, like upstream, it is skipped.
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the model's state dict minus the routed experts.
     A dense projection is bf16 or 128x128 block-fp8 (``.weight`` e4m3 + ``.weight_scale_inv``) as the checkpoint's QuantConfig says: the official releases skip everything but the routed experts, the community NVFP4-FP8 requants quantize the attention / GDN projections.
@@ -214,12 +236,12 @@ def iter_weights(
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
-        disable=not get_tp_info().is_primary(),
+        disable=not _is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)
-                if name is None:
+                if name is None or (not include_mtp and name.startswith("mtp.")):
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue

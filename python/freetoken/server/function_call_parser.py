@@ -677,6 +677,9 @@ class InvokeParamStreamMixin:
     _ps_trim: str = "\n"
     _ps_trim_single: bool = False
     _ps_missing_type: str = "string"
+    # True: an outer block whose body opens with "{" is a Hermes-style JSON call
+    # (qwen3_coder), parsed by ``_parse_json_call_body`` once the block closes.
+    _ps_json_body: bool = False
 
     def _ps_reset(self) -> None:
         self._ps_mode = "idle"
@@ -685,6 +688,8 @@ class InvokeParamStreamMixin:
         self._ps_emitted_any = False
         self._ps_lead_trimmed = False
         self._ps_param_config: Dict = {}
+        self._ps_block_fresh = False
+        self._ps_block_raw = ""
 
     def _ps_convert_value(self, key: str, raw: str) -> Any:
         if key in self._ps_param_config or self._ps_missing_type != "loose":
@@ -757,6 +762,58 @@ class InvokeParamStreamMixin:
                     continue
                 self._buffer = buf[len(self._ps_outer_open):]
                 self._ps_mode = "block"
+                self._ps_block_fresh = self._ps_json_body
+                self._ps_block_raw = self._ps_outer_open
+                continue
+
+            if mode == "block" and self._ps_block_fresh:
+                # The body's first non-whitespace char picks the grammar: "{" is a
+                # JSON call, anything else continues as invoke markup. Leading
+                # whitespace is kept so an unparseable block passes through verbatim.
+                body = buf.lstrip()
+                if not body:
+                    self._ps_block_raw += buf
+                    self._buffer = ""
+                    break
+                self._ps_block_fresh = False
+                if body[0] == "{":
+                    self._buffer = self._ps_block_raw + buf
+                    self._ps_mode = "json"
+                    continue
+
+            if mode == "json":
+                # The buffer holds the raw block from its opening tag; parse it
+                # only once it closes, as the one-shot path does.
+                end = buf.find(self._ps_outer_close)
+                if end == -1:
+                    break
+                raw = buf[: end + len(self._ps_outer_close)]
+                self._buffer = buf[len(raw):]
+                self._ps_mode = "idle"
+                items = self._parse_json_call_body(buf[len(self._ps_outer_open):end], tools)
+                if items is None:
+                    # Not a JSON call: surface the block as text, matching one-shot
+                    # parsing (which returns the whole text when nothing parses).
+                    normal_parts.append(raw)
+                    continue
+                for item in items:
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    calls.append(
+                        ToolCallItem(tool_index=self.current_tool_id, name=item.name, parameters="")
+                    )
+                    _emit(item.parameters)
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": item.name,
+                        "arguments": json.loads(item.parameters),
+                    }
+                    self.current_tool_id += 1
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
                 continue
 
             if mode == "block":
@@ -901,6 +958,10 @@ class InvokeParamStreamMixin:
         residual, self._buffer = self._buffer, ""
         mode = getattr(self, "_ps_mode", "idle")
         self._ps_reset()
+        if mode == "json":
+            # Unterminated JSON block that recover_truncated_call could not parse:
+            # pass it through as text, like the one-shot path.
+            return residual
         if mode != "idle" or (self._ps_outer_open and self._ps_outer_open in residual):
             return ""
         if self.prev_tool_call_arr and residual.strip() == "":
@@ -1888,6 +1949,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     _ps_trim = "\n"
     _ps_trim_single = True
     _ps_missing_type = "string"
+    _ps_json_body = True
 
     """
     Detector for Qwen3-Coder XML-style function call format.
@@ -1910,6 +1972,12 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     - Parameters are XML key-value pairs, not JSON objects
     - Function name is embedded in the <function=> tag attribute
     - Values need schema-aware type conversion (string by default)
+
+    Qwen3.5-family models occasionally fall back to the Hermes JSON body
+    (``<tool_call>{"name": ..., "arguments": {...}}</tool_call>``, Qwen25Detector's
+    format); a block whose body opens with ``{`` is parsed that way in both the
+    streaming and one-shot paths. A JSON body that does not parse as a call is
+    passed through as text by both.
 
     Reference: https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3-Coder-480B-A35B.html
     """
@@ -2023,20 +2091,47 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
         return json.dumps(param_dict, ensure_ascii=False)
 
+    def _parse_json_call_body(self, body: str, tools: List[Tool]) -> Optional[List[ToolCallItem]]:
+        """Parse a Hermes-style JSON ``<tool_call>`` body (an object, or a list of
+        objects, each with a string ``name``). None when the body is not such JSON,
+        so the caller passes the block through as text; [] when every call names an
+        undefined function (dropped, as an unknown ``<function=>`` invoke is)."""
+        try:
+            obj = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        objs = obj if isinstance(obj, list) else [obj]
+        if not objs or not all(isinstance(o, dict) and isinstance(o.get("name"), str) for o in objs):
+            return None
+        return self.parse_base_json(objs, tools)
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
 
-        if "<function=" not in text:
+        if "<function=" not in text and self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         # Extract function blocks from tool_call blocks (or raw text as fallback)
         tool_call_blocks = self.tool_call_block_regex.findall(text)
+        closed = bool(tool_call_blocks)
         if not tool_call_blocks:
             tool_call_blocks = [text]
 
         calls = []
         for block in tool_call_blocks:
+            if "<function=" not in block:
+                # JSON body: a closed block's inner text, or whatever follows the
+                # opening tag of an unterminated one (truncated generation).
+                if not closed:
+                    if self.bot_token not in block:
+                        continue
+                    block = block.split(self.bot_token, 1)[1]
+                if block.lstrip().startswith("{"):
+                    for item in self._parse_json_call_body(block, tools) or []:
+                        item.tool_index = len(calls)
+                        calls.append(item)
+                continue
             func_matches = self.function_regex.findall(block)
             for match in func_matches:
                 func_str = match[0] if match[0] else match[1]

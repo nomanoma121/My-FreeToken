@@ -8,6 +8,7 @@ from typing import Callable
 
 import safetensors
 import torch
+from freetoken.distributed import try_get_pp_info
 from freetoken.utils import download_hf_weight
 from tqdm import tqdm
 
@@ -51,6 +52,15 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     if bank_layer is None:
         return None
     num_layers = _num_moe_layers(config)
+    # Pipeline engine: skip the layers another rank serves so this one never reads them, but
+    # keep the id global -- expert_banks._local_pieces re-bases it. Doing both here windowed
+    # an already-windowed id and left every rank but the first with empty banks.
+    pp = try_get_pp_info()
+    if pp is not None:
+        lo, hi = pp.bank_window(int(getattr(config, "first_k_dense_replace", 0)))
+        if not (lo <= bank_layer < hi):
+            return None
+        num_layers = int(pp.num_layers) - int(getattr(config, "first_k_dense_replace", 0))
     if bank_layer < 0 or bank_layer >= num_layers:
         raise ValueError(
             f"{spec.desc}: bank layer {bank_layer} for checkpoint layer {layer} "
@@ -135,4 +145,46 @@ def iter_nvfp4_expert_pieces(
     return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
 
 
-__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
+def nvfp4_expert_sources(model_path: str, config, spec: Nvfp4ExpertSourceSpec, *, weight_map: dict[str, str] | None = None):
+    """``{name: ExpertSource}`` for every per-expert NVFP4 tensor, by global bank layer.
+
+    The same matching ``iter_nvfp4_expert_pieces`` does, without the pipeline window and without
+    reading a byte: ``config`` is the full model's.
+    """
+    from freetoken.models.loader import safetensors_weight_map
+    from freetoken.moe.expert_pieces import ExpertSource
+
+    if weight_map is None:
+        weight_map = safetensors_weight_map(download_hf_weight(model_path))
+    num_layers = _num_moe_layers(config)
+    out: dict[str, ExpertSource] = {}
+    for name in weight_map:
+        match = spec.key_pattern.match(name)
+        if match is None:
+            continue
+        layer = int(match.group("layer"))
+        bank_layer = spec.layer_to_bank(layer, config)
+        if bank_layer is None:
+            continue
+        if not 0 <= bank_layer < num_layers:
+            raise ValueError(f"{spec.desc}: bank layer {bank_layer} for checkpoint layer {layer} is outside [0, {num_layers})")
+        proj = match.group("proj")
+        if proj not in spec.proj_to_role:
+            raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
+        kind = _canon_kind(spec, match.group("kind"))
+        if kind not in ("weight", "weight_scale", "weight_scale_2"):
+            raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
+        role = spec.proj_to_role[proj] + _kind_suffix(kind)
+        convert = None
+        if role.endswith("_global"):
+            def convert(t, _spec=spec):
+                return _ingest_global(_spec, t).reshape(1, -1)
+        expert = int(match.group("expert"))
+        out[name] = ExpertSource(name, bank_layer, expert, expert + 1, role, stacked=False, convert=convert)
+    expected = num_layers * config.num_experts * 9
+    if len(out) != expected:
+        raise ValueError(f"{spec.desc}: found {len(out)} expert tensors, expected {expected}")
+    return out
+
+
+__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces", "nvfp4_expert_sources"]

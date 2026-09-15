@@ -167,6 +167,17 @@ class MoEKernel(ABC):
     def pack(self, pieces: dict[str, torch.Tensor], cfg: MoEConfig, out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Write one batch of expert pieces into ``out`` rows; returns the GPU-resident per-expert values, if any."""
 
+    def unpack(self, rows: dict[str, torch.Tensor], cfg: MoEConfig) -> dict[str, torch.Tensor]:
+        """The piece roles ``pack`` stored losslessly, recovered from bank ``rows`` (``[e, ...]`` per role).
+
+        Only roles whose checkpoint bytes come back exactly: ``ft bank pack`` drops a checkpoint
+        tensor only when its bytes can be regenerated from the bank file, and checks that they
+        are before saying so. A role converted on the way in (an fp32 global scale stored as fp16
+        rows) is left out and stays in the checkpoint. The default recovers nothing.
+        Views are fine; the caller makes them contiguous and compares bytes, not dtypes.
+        """
+        return {}
+
     @abstractmethod
     def apply(self, layer: Any, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, is_prefill: bool) -> torch.Tensor: ...
 

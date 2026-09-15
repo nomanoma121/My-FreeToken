@@ -5,6 +5,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
+from freetoken.moe.bank_disk import apply_permutation
 from freetoken.moe.fused import fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -146,6 +147,16 @@ class MoELayer(BaseOP):
 
 
 class OffloadMoELayer(MoELayer):
+    # logical -> physical expert id for this layer, when --moe-bank-ram renumbered the bank
+    # so the resident experts occupy rows [0, hot). None = every expert resident, which is
+    # the identity map and skips the remap entirely. Set per layer by
+    # attach_offload_moe_cache; see moe/bank_disk.py.
+    #
+    # Declared on the class, not in __init__: the routed entry points are exercised against
+    # instances built with __new__ (tests/moe/test_cpu_prefill_short.py drives the dispatch
+    # threshold without a real layer), and those never run __init__.
+    expert_perm: "torch.Tensor | None" = None
+
     def __init__(
         self,
         layer_id: int,
@@ -195,7 +206,9 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        # an MTP verify window is an extend for the kernels but must NOT stream whole layers:
+        # its few tokens go through the decode (LRU cache / hybrid) path
+        if ctx.batch.is_prefill and not getattr(ctx.batch, "spec_verify", False):
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -218,7 +231,7 @@ class OffloadMoELayer(MoELayer):
         shared branches that need the original input before calling this method.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not getattr(ctx.batch, "spec_verify", False):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
@@ -276,6 +289,11 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        # Renumbering is applied here, before anything reads an expert id: the slot cache,
+        # copy_missing and the CPU executor all address the physical row. The bank keeps its
+        # [num_experts, ...] shape either way -- rows past the resident prefix are file-backed
+        # pages that fault in -- so nothing downstream can tell. No-op when nothing was moved.
+        apply_permutation(topk_ids, self.expert_perm)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -314,7 +332,19 @@ class OffloadMoELayer(MoELayer):
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+        # --moe-bank-ram: the GPU can only address the registered prefix, so a miss on a row
+        # past it must not be fetched. The fetch choice lives in the kernel, so steer it from
+        # here instead: hand those positions expert 0 (rank 0 of the renumbering -- the
+        # hottest expert, so all but certainly a hit costing no fetch), then overwrite the
+        # slot it returns with -1 so the CPU partial takes them. raw still holds the true
+        # ids, which is what the CPU executor and the routing histogram read.
+        cold = None
+        if cache.prefix_pinned_rows is not None:
+            cold = raw >= cache.prefix_pinned_rows
+            topk_ids.masked_fill_(cold, 0)
+        cache.ensure_experts_hybrid(self.layer_id, topk_ids, freq_ids=raw)  # -> slot or -1
+        if cold is not None:
+            topk_ids.masked_fill_(cold, -1)
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
@@ -352,10 +382,19 @@ class OffloadMoELayer(MoELayer):
     ) -> torch.Tensor:
         """Prefill movement: stream whole layers -- double-buffered behind the
         previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
-        ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        ``materialize_layer``. In both, position == expert id (physical, after the
+        --moe-bank-ram renumbering), so the routing ids pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        apply_permutation(topk_ids, self.expert_perm)
+        # short extends take the CPU executor whether or not the overlap double buffer is on:
+        # the decision is per forward (every layer sees the same row count), so a forward that
+        # goes this way never touches the overlap machinery
+        if (
+            getattr(cache, "cpu_executor", None) is not None
+            and 0 < hidden_states.shape[0] <= cpu_prefill_max_tokens()
+        ):
+            return self._prefill_on_cpu(cache, hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -368,6 +407,8 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
+            # the GEMMs are issued, so the host is free to run the next layer's bounce copy
+            cache.finish_prefill_prefetch()
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)
@@ -382,6 +423,40 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+
+    def _prefill_on_cpu(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """A short extend (a chat turn behind a cached prefix, a few hundred tokens at most)
+        skips streaming this layer's whole expert bank to the GPU: the CPU executor computes
+        the routed experts instead, in pieces of ``CPU_PREFILL_PIECE`` rows (one buffer shape,
+        the tail padded with skipped routes). Streaming a 256-expert NVFP4 layer costs ~0.13 s
+        per layer at the ~3.4 GB/s an RTX 2060 sees under WSL2 -- ~5 s per chunk over 40 layers
+        whatever the chunk holds -- while the CPU reads each distinct expert once for all the
+        rows routed to it. ``FREETOKEN_CPU_PREFILL_MAX_TOKENS`` (default 256; 0 disables) is the
+        longest extend that takes this path; longer chunks stream as before."""
+        executor = cache.cpu_executor
+        assert executor is not None
+        total = hidden_states.shape[0]
+        piece = max(1, min(CPU_PREFILL_PIECE, int(executor.max_tokens)))
+        outs = []
+        for start in range(0, total, piece):
+            end = min(start + piece, total)
+            n = end - start
+            x = hidden_states[start:end]
+            w = topk_weights[start:end]
+            ids = topk_ids[start:end]
+            if n < piece:
+                pad = piece - n
+                x = torch.cat([x, x.new_zeros(pad, x.shape[1])])
+                w = torch.cat([w, w.new_zeros(pad, w.shape[1])])
+                ids = torch.cat([ids, ids.new_full((pad, ids.shape[1]), -1)])  # -1: skipped
+            outs.append(executor.decode(self.layer_id, x, w, ids)[:n])
+        return outs[0] if len(outs) == 1 else torch.cat(outs)
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
@@ -433,6 +508,17 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
         raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+
+
+# Short-extend prefill on the CPU executor (see OffloadMoELayer._prefill_on_cpu): the piece
+# size is the one batch shape the executor sees for it (the engine sizes max_tokens to it).
+CPU_PREFILL_PIECE = 64
+
+
+def cpu_prefill_max_tokens() -> int:
+    """Longest prefill extend the CPU executor computes instead of streaming the layer banks
+    (``FREETOKEN_CPU_PREFILL_MAX_TOKENS``, default 256; 0 disables)."""
+    return int(os.environ.get("FREETOKEN_CPU_PREFILL_MAX_TOKENS", "256") or 0)
 
 
 def make_moe_layer(
