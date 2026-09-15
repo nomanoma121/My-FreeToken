@@ -54,9 +54,14 @@ class Qwen3_5MoE(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, layer_id: int | None = None, *, prefix: str = ""):
+        top_k = config.num_experts_per_tok
+        schedule = config.num_experts_per_tok_schedule
+        if schedule is not None and layer_id is not None and layer_id < len(schedule):
+            top_k = schedule[layer_id]
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
+            top_k=top_k,
             renormalize=config.norm_topk_prob,
             quant_config=config.quant,
             prefix=f"{prefix}.experts",

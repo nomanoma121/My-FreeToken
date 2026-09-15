@@ -241,6 +241,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         rotary_config=full_rotary,
         num_experts=num_experts,
         num_experts_per_tok=int(getattr(text, "num_experts_per_tok", 0) or 0),
+        num_experts_per_tok_schedule=(
+            tuple(int(k) for k in text.num_experts_per_tok_schedule)
+            if getattr(text, "num_experts_per_tok_schedule", None) is not None
+            else None
+        ),
         moe_intermediate_size=int(getattr(text, "moe_intermediate_size", 0) or 0),
         shared_expert_intermediate_size=int(
             getattr(text, "shared_expert_intermediate_size", 0) or 0

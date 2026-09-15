@@ -318,6 +318,12 @@ class ModelConfig:
     has_router_bias: bool = False
     moe_weight_format: str | None = None
     swiglu_limit: float | None = None
+    # Per-layer override of num_experts_per_tok, indexed by decoder layer_id (len ==
+    # num_layers). None (default) keeps every MoE layer at the scalar num_experts_per_tok.
+    # A model's parse_config populates this from an optional checkpoint config field; the
+    # MoE block constructor (e.g. Qwen3_5MoE.__init__) looks itself up by layer_id and
+    # falls back to num_experts_per_tok when the schedule doesn't cover that layer.
+    num_experts_per_tok_schedule: Tuple[int, ...] | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
