@@ -419,7 +419,16 @@ ft serve --model ~/models/qwen38-flash-next-nvfp4 --pp-size 2 --gpu 1,0 \
 
 **平均 ~24.3 tok/s。** 均等分割(~22 tok/s)から **さらに+10%**。
 ベースライン(~15.5 tok/s)からは **+57%**。PCIe非対称性を考慮した分割が実際に効いている
-ことを確認。さらに非対称にできるか (32や34など) 次に試す。
+ことを確認。
+
+**さらに非対称にした`--pp-layers 34`は起動時にクラッシュ**:
+`RuntimeError: ... Timed out waiting 60000ms for send operation to complete`
+(rank0/GPU1が34層・7 expert shardsのロードに約2分以上かかり、先に14層のロードを終えた
+rank1/GPU0がKVページ数合意のバリアで待ちきれずgloo送受信タイムアウト)。
+`FREETOKEN_RANK_JOIN_TIMEOUT_SECONDS`はバリア自体の待ち時間を延ばせるが、
+gloo transport層のsend/recv自体の60秒タイムアウトは別物で、ここは環境変数で
+簡単に延ばせる保証がない (深追いはリスクに見合わないため今回は見送り)。
+**`--pp-layers 30`を現状のベストとして採用し、次のレバーに進む。**
 
 ## 未検証 / 次にやること
 
