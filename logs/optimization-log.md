@@ -729,6 +729,57 @@ github.com/FlashML-org/flashlib) が公開しているOSSで、Kaiと同様にve
 安全に完了させられる規模ではないと判断した。** 挑戦する場合は
 `flashlib`のvendor化から始める別プロジェクトとして扱うべき。
 
+## 決定的な分析: 「完璧なキャッシュ」でも40 tok/sには届かない (2026-09-15)
+
+上記のリスク判断が本当に正しいか、「キャッシュ改善に投資する価値が本当にあるか」を
+実測値から定量的に検証した。
+
+実測値 (`--pp-layers 30`, fp8 dense + q4_0 KV, memory-ratio 0.95, ~24.7 tok/s平均) を
+使い、1 decode stepの内訳を計算:
+
+```
+測定 step time:        40.49 ms  (= 1000/24.7 tok/s)
+確認済み1expert分のサイズ: 2.642 MB  (実際のcache plan log "experts 2670 slots 6.89 GiB" から逆算)
+
+rank0 (GPU1, 30層, miss率23.2%, PCIe 25.8GB/s):  PCIe fetch 6.96 ms/step (69.6 experts/step)
+rank1 (GPU0, 18層, miss率6.2%,  PCIe 6.2GB/s):   PCIe fetch 4.64 ms/step (11.2 experts/step)
+合計PCIe fetch:                11.61 ms/step (step timeの28.7%)
+
+→ compute + overhead の下限:    28.88 ms/step (step timeの71.3%)
+→ miss率0%(理論上完璧なキャッシュ)でも: 1000/28.88 = 34.6 tok/s が上限
+```
+
+**目標の40 tok/sには `step time <= 25.00 ms` が必要。現在のcompute+overhead
+だけで28.88ms/stepを使っており、これはキャッシュmissを完全にゼロにしても
+超えられない (34.6 < 40)。**
+
+つまり、`flashlib`のLRUカーネルをどれだけ改良しても(たとえTinyLFU化でmiss率を
+0%近くまで下げられたとしても)、目標の40 tok/sには届かない計算になる。
+このリスクの高いカーネル改造に投資するのは**割に合わない**という結論に至った
+(best caseでも+40%改善で34.6 tok/s止まり)。
+
+### 本当のボトルネックは「compute + overhead」28.9ms/step
+
+この28.9msの内訳は: 48層分のattention/GDN/hyper-connection/indexer計算、
+cache-hit分のMoE GEMM (missでなくてもGEMM自体は必要)、rank間のgloo通信、
+CUDA graph replayのオーバーヘッド等。これらは主に**モデルのアーキテクチャ規模と
+RTX3060の生の計算力そのもの**に規定されており、engine側の設定変更や
+キャッシュ戦略の改善では動かせない領域。
+
+**この意味するところ: 現在のハードウェア (2x RTX3060 12GB) とモデル
+(Qwen3.8-Flash-Next, 48層, 512experts/層) の組み合わせでは、エンジン側の
+最適化 (FreeTokenの設定・改造含む) だけでは40 tok/sという目標に構造的に
+届かない可能性が高い。** 届かせるには次のいずれかが必要:
+1. より高性能なGPUへの変更 (計算力そのものを底上げ)
+2. モデル側の近似 (dynamic top-k削減など、出力品質とのトレードオフを伴う
+   モデル改変 — これはエンジン最適化とは異なる種類の意思決定)
+3. FreeToken自体のcompute kernel (attention/GDN/hyper-connection等の
+   演算そのもの)の高速化 — これも`flashlib`同様、大規模なカーネル
+   エンジニアリングになる
+
+現在の**~24.5-24.9 tok/s**は、実測に基づく分析上、このハードウェア構成での
+現実的な到達点に近いと判断する。
+
 ### git履歴
 
 本セッションの全作業は `~/My-FreeToken` にgitでコミット済み (コミット一覧は
