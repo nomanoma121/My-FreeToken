@@ -886,6 +886,46 @@ rank間のgloo pipeline通信が`Connection closed by peer`で切断、
 バックエンドがクラッシュした。`--memory-ratio 0.95`はこのハードウェアでの
 安全上限であり、これ以上は不安定化するのみと判断。**0.95を維持。**
 
+### top-k=3上でpp-layers再チューニングを試みた → 変化なし (プラトー再確認)
+
+top-k=10向けにチューニングされたpp-layers=30の層分割点が、top-k=3の
+軽量化されたcompute特性でも最適かを確認するため、pp-layers=26で再測定。
+
+| pp-layers | decode tok/s (prose/code) |
+|---|---|
+| 30 (既定) | 35.36 / 37.12 |
+| 26 | 35.05 / 37.40 |
+
+誤差範囲内で実質的に同一。top-k=10で確認した「pp-layers 26/30/34間で
+プラトー」という結論は、top-k=3でも変わらず成立する。GPU間の層分割点は
+top-kに関わらずボトルネックではない。pp-layers=30を維持。
+
+## 最終まとめ (2026-09-15時点)
+
+engineレベルのチューニング (dense-quant fp8, kv-cache q4_0, memory-ratio,
+pp-layers分割) は出尽くした。追加で試した`--dense-quant`は`none`/`fp8`の
+2択のみで既にfp8使用中、`--kv-cache-dtype`もq4_0が最も圧縮率が高い選択肢で
+既に使用中、`--memory-ratio`は0.95が安定上限 (0.97はクラッシュ)、
+`--pp-layers`は26/30/34全てでプラトー。`--moe-bank-prefetch`等の
+readahead系フラグは`--moe-bank-ram`+cpu/hybrid decode専用で、今回の
+`--moe-strategy offload`構成には適用不可。
+
+残る2つの現実的な選択肢:
+
+| 構成 | decode tok/s (prose/code) | 40 tok/s目標比 | 品質 | FreeToken本体改造 |
+|---|---|---|---|---|
+| **品質優先**: top-k=10 (無改造) | 24.45 / 24.88 | 61-62% | フル品質 | dual-GPU pipeline-parallel対応のみ (`--pp-size`, `--distributed-timeout`) |
+| **速度優先**: top-k=3 | 35.05-35.36 / 37.12-37.40 | 88-93% | 算数・論理パズル正解、崩壊なし | 同上 (top-kはconfig.jsonのみ変更、ソース無改造) |
+
+60 tok/sの理想目標には届かないが、速度優先構成は40 tok/sの目標に対して
+88-93%まで到達しており、実測に基づく理論値 (完全ヒットキャッシュでも
+~34.6 tok/s、top-k=10時点) を上回っている。これはtop-k削減がcompute側の
+天井そのものを引き下げたためで、単なるキャッシュ調整では不可能だった
+効果。この先さらに積み増すには、(1) より高性能なGPUへの交換、
+(2) attention/GDN/hyper-connectionカーネル自体の書き換え、のいずれかが
+必要で、どちらも本セッションのスコープを超える大規模エンジニアリングと
+判断し、ここでengine+model近似の両輪によるチューニングを一区切りとする。
+
 ### git履歴
 
 本セッションの全作業は `~/My-FreeToken` にgitでコミット済み (コミット一覧は
