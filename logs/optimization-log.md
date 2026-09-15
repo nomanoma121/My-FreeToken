@@ -1011,6 +1011,28 @@ per-layerスケジュールにより、一律top-k=3から約+1.7-2 tok/s、40 t
 (`config.json`の`text_config.num_experts_per_tok_schedule`に48要素のリストを
 保持)。
 
+### 追加検証: sched-cはlinear_attention層のみを削っていた (attention種別は無関係と確認)
+
+`layer_types`を確認したところ、sched-c (12層削減、崩壊) が選んだ位置
+(2,6,10,...,46) は**全てlinear_attention (GDN) 層**で、full_attention
+(QSA) 層は1つも含まれていなかった。つまり「GDN層の方が削減に強いはず」
+という仮説はこの時点で既に反証されている ── 崩壊の原因は層の種別ではなく
+純粋に削減する層の**数**だった。sched-dの8層(idx 3,9,15,21,27,33,39,45)は
+full_attention 4層 + linear_attention 4層の混在で、こちらは健全だった。
+
+### 再現性確認 (2回目のベンチマーク実行)
+
+sched-dを再起動し2回目の独立したベンチマークを実行:
+
+| 実行 | decode tok/s (prose/code) |
+|---|---|
+| 1回目 | 37.04 / 37.46 |
+| 2回目 | 36.01 / 37.29 |
+
+1 tok/s程度の実行間ノイズはあるが、一律top-k=3 (35.05-35.36/37.12-37.40)
+を安定して上回ることを再確認。sched-dの実効性能帯は概ね**36-37.5 tok/s**
+(40 tok/s目標の90-94%)。
+
 (下の表は一律top-k=3までの時点のまとめ。この後前掲の「FreeToken本体を
 改造: per-layer top-kスケジュール」セクションでsched-dによりさらに
 更新されたので、最終結論はそちらを参照)
