@@ -460,6 +460,28 @@ VRAM headroomがほぼ無くなる代償を考えると費用対効果は逓減�
 再検証する — 以前(最初期のFreeToken単体テスト)ではAmpereでのhybridバグ懸念が
 Web調査で見つかっていたが、今の構成(PP+fp8+q4_0+深いcache)で状況が変わるか確認する。
 
+## `--moe-strategy hybrid` 再検証 → やはり悪化 (2026-09-15)
+
+`--pp-layers 30 --moe-strategy hybrid --dense-quant fp8 --kv-cache-dtype q4_0
+--memory-ratio 0.90` で起動・実測。
+
+| decode step | gen throughput (tok/s) |
+|---|---|
+| step2 | 16.76 |
+| step3 | 16.95 |
+| step4 | 17.37 |
+| step5 | 17.09 |
+| step6 | 17.52 |
+
+**平均 ~17.1 tok/s。offload(~25.2)より明確に悪い (-32%)。**
+Web調査で見つけた `FlashML-org/FreeToken#151` (Ampereでhybridが実サービング時に
+著しく遅い) の懸念が、PP+fp8+q4_0の改善された構成でも変わらず再現した。
+**結論: 本機では `--moe-strategy offload` を今後も既定として使う。hybridはこの
+ハードウェアでは明確に劣る選択肢。**
+
+`--moe-strategy offload --pp-layers 30 --dense-quant fp8 --kv-cache-dtype q4_0
+--memory-ratio 0.95` (直前の~25.2 tok/s構成) に復帰。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
