@@ -430,6 +430,36 @@ gloo transport層のsend/recv自体の60秒タイムアウトは別物で、こ�
 簡単に延ばせる保証がない (深追いはリスクに見合わないため今回は見送り)。
 **`--pp-layers 30`を現状のベストとして採用し、次のレバーに進む。**
 
+## `--spec-mtp` 失敗、`--memory-ratio` 追加チューニング (2026-09-15)
+
+`--spec-mtp 5` を試したが起動時に
+`AssertionError: --spec-mtp: MTP experts missing from the checkpoint: got []`
+で失敗。ロードされたのは `mtp.embed_tokens.` (host-resident) のみで、MTP用の
+expert weight (gate_up_proj/down_proj) が `nvidia/Qwen3.8-Flash-Next-NVFP4` には
+含まれていない模様 (RadixArk版など別チェックポイントには入っている可能性があるが、
+別途100GB超のダウンロードが必要になるため今回は見送り)。
+
+`--memory-ratio` を0.85→0.95に上げ、fp8+q4_0で浮いた分をさらにexpertキャッシュへ:
+`moe_cache_size=2670` (0.85時の2224から+20%)。ただしFree GPU memory after
+capturing CUDA graphs: 0.36 GiB とかなりタイトになり、prefill-chunk-budgetが
+自動的に1024まで縮小 (8192目安から大幅減、長いプロンプトのprefillは遅くなる代償)。
+
+### 実測
+
+| decode step | gen throughput (tok/s) |
+|---|---|
+| step2 | 23.99 |
+| step3 | 25.68 |
+| step4 | 25.60 |
+| step5 | 23.89 |
+| step6 | 26.90 |
+
+**平均 ~25.2 tok/s。** memory-ratio 0.85 (~24.3) から+3.7%程度の小幅改善。
+VRAM headroomがほぼ無くなる代償を考えると費用対効果は逓減してきている。
+次は `--moe-strategy hybrid` (CPU/GPU同時miss処理) を、現在の改善されたVRAM状況で
+再検証する — 以前(最初期のFreeToken単体テスト)ではAmpereでのhybridバグ懸念が
+Web調査で見つかっていたが、今の構成(PP+fp8+q4_0+深いcache)で状況が変わるか確認する。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
