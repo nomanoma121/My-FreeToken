@@ -362,6 +362,38 @@ for recv operation` でクラッシュ (Kai READMEが警告している既知の
 `--kv-cache-dtype q4_0` (どちらもフリーになったVRAMをexpertキャッシュに回す設計)、
 `--spec-mtp` を順に試す。
 
+## `--dense-quant fp8` + `--kv-cache-dtype q4_0` (2026-09-15)
+
+dense重み(attention/GDN/shared_expert/lm_head/embedding)をper-row fp8に量子化 (97個の
+dense projectionを量子化, ログ確認済み) + KVキャッシュをq4_0量子化。空いたVRAMは自動的に
+MoEオフロードキャッシュへ回る設計 (Kaiの設計思想通り)。
+
+```
+ft serve --model ~/models/qwen38-flash-next-nvfp4 --pp-size 2 --gpu 1,0 \
+  --moe-strategy offload --text-model-only --dense-quant fp8 --kv-cache-dtype q4_0 \
+  --memory-ratio 0.85 --max-running-requests 1
+```
+
+結果: `--moe-cache-auto resolved moe_cache_size=2491` (前回1691から **+47%**)。
+512experts/層に対し2491slotsは約4.9倍の深さがあり、PCIeフェッチのミス率が大きく下がる。
+
+### 実測 (サーバースケジューラログ, 同一prose系プロンプト)
+
+| decode step | gen throughput (tok/s) |
+|---|---|
+| step2 | 22.46 |
+| step3 | 22.63 |
+| step4 | 22.11 |
+| step5 | 19.79 |
+| step6 | 23.40 |
+
+**平均 ~22 tok/s。** ベースライン(~15.5 tok/s)から **+42%**。
+**FreeToken-Kai自身が2x RTX3060で報告する参考値18-20 tok/sを既に上回った。**
+(ユーザー指示通り、Kaiの数値は目標ではなく通過点として扱う。目標は40、理想60。)
+
+次: `--pp-layers`でGPU0(遅いPCIe)/GPU1(速いPCIe)の非対称性を反映した分割を試す、
+`--spec-mtp`でMTP投機デコードを試す。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
