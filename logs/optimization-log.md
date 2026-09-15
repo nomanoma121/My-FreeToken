@@ -1448,6 +1448,88 @@ target_splits=8は64と有意差がない一方、1まで下げると明確に�
 単発の思いつきパラメータ変更では届かないという、より確度の高い結論を
 補強するものとなった。
 
+## `nsys` (Nsight Systems) によるGPUカーネルレベルの実プロファイリング
+
+`ncu` (Nsight Compute) はGPU性能カウンタへのアクセス権限
+(`ERR_NVGPUCTRPERM`) がなく使えなかった (システム全体のNVIDIAドライバ
+設定変更が必要でユーザー許可なしに実施しないと判断)。一方`nsys`
+(Nsight Systems, タイムライン/APIトレース中心で性能カウンタ権限を
+要求しない) は権限なしで動作することを確認できたため、これを使って
+sched-h構成のdecode実行を実際にプロファイリングした。
+
+### 落とし穴: デフォルトはCUDA graph replay内部を展開しない
+
+最初の試行 (`--trace=cuda,osrt`のみ) では、`_qsa_sparse_paged_gqa_splitk_kernel`
+がGPU時間の58%を占めるという結果が出たが、インスタンス数がわずか48件
+(かつ平均70ms、最大250ms) で、これは主にprefill (CUDA graph化されない
+生カーネル起動) を捉えたものであり、decodeの実体 (CUDA graphでキャプチャ・
+リプレイされる大量の小さいカーネル呼び出し) はnsysのデフォルト挙動では
+1つの`cudaGraphLaunch`として扱われ、内部の個別カーネル実行が展開されない
+ことが判明した。`--cuda-graph-trace=node`を追加して再プロファイリングし、
+graph内部の個別ノード実行を正しく捕捉した。
+
+### 実測結果: decodeの真のGPU時間内訳 (sched-h, 2リクエスト分のトレース)
+
+| カーネル | GPU時間比率 | インスタンス数 | 中央値 | 備考 |
+|---|---|---|---|---|
+| **`_gemv_splitk_kernel`** | **33.4% (最大)** | 133,386 | 53.7us | dense(fp8)投影のdecode時GEMV。Q/K/V/O、GDN in_proj、shared expertなど`--dense-quant fp8`で量子化された121投影 |
+| `_qsa_sparse_paged_gqa_splitk_kernel` | 15.3% | 8,329 | 34.8us (中央値) | QSA attention。中央値は軽いが、少数のprefill呼び出し(最大245ms)が平均を大きく歪めている |
+| `fast_index_copy_multi` | 11.7% | 33,173 | - | offloadキャッシュのミスフェッチ (host→device行コピー)。実測ミス率10.7-17.7%の直接的な裏付け |
+| `internal::gemvx::kernel<bf16>` | 9.0% | 133,384 | - | cuBLAS系GEMV、dense投影の一部 |
+| `_decode_nvfp4_marlin_kernel` | 6.4% | 66,344 | - | NVFP4関連decodeカーネル |
+| `_prefill_nvfp4_moe_kernel` | 4.5% | 288 | 3.76ms (平均) | MoE prefillカーネル (decode速度には無関係、TTFTのみに影響) |
+
+### 分かったこと: 最大のコストはMoEルーティングではなく「dense (fp8) 投影のGEMV」
+
+これまでのセッションの主軸だったtop-k削減・per-layerスケジュールは
+**ルーティングエキスパートの計算量**を削っていたが、実測プロファイルに
+よると、decode時にGPU時間を最も消費しているのは**dense層 (attention
+QKV/O, GDN in_proj, shared expert) のfp8 GEMV**であり、これはtop-k削減の
+影響を一切受けない固定コストだった。これは「top-k=10→3でも8→9層の
+増分でほぼ頭打ちになった」という以前の観察 (28.9msの compute+overhead
+floor) を、実測プロファイルデータで直接裏付けるものとなった。
+
+つまり、これまでの最適化 (top-k削減) は実測で確認された**2番目に大きい
+実質可変コスト**(MoEルーティング) を正しく攻めていたが、**最大の固定
+コスト**(dense fp8 GEMV) には手が届いていなかった、ということが今回
+初めて定量的に判明した。
+
+### dense GEMVカーネル自体も同様の手法で調整を試みたが、有意な改善なし
+
+`_gemv_splitk_kernel`の定義 (`python/freetoken/kernel/triton/fp8_pertensor_linear.py`)
+を確認したところ、`num_warps=1`(1ワープ=32スレッドのみ) という非常に
+保守的な設定と、`split_k = max(1, min(1536 // n_tiles, n_kb))`という
+"1536"というマジックナンバーに基づくsplit-k次数の決定ロジックを発見。
+QSAの"Tuned on GB300"と同様、明示的なGPU依存の調整はなく、汎用的な
+定数に見えた。同じ手法(正しさに影響しない範囲でのパラメータ実験)で検証:
+
+| 変更 | decode tok/s (prose/code) | 備考 |
+|---|---|---|
+| (基準) num_warps=1, split_k budget=1536 | 36-38.4 | - |
+| num_warps=4 (split_k budget=1536のまま) | 36.05 / 38.51 | 基準範囲内、有意差なし |
+| split_k budget=384 (4分の1) | 36.18 / 37.72 | 基準範囲内、有意差なし |
+| split_k budget=96 (16分の1) | 34.75 / 35.95 | **やや低下** (基準範囲の下限をやや下回る、QSAのsplit=1と同種の「行き過ぎると悪化」傾向) |
+
+### 結論: dense GEMVカーネルも、QSA同様「既に妥当な範囲」
+
+num_warpsを1→4に増やしても改善せず、split-k予算を1536→384に落としても
+無変化、96まで落とすとわずかに悪化。QSA attentionで見たのと同じ
+パターン (ある程度までは鈍感、行き過ぎると悪化) が、decodeの最大コスト
+であるdense GEMVカーネルでも再現した。これにより、「明示的にGB300向けの
+マジックナンバーが3060では最適でないはず」という仮説は、**このカーネルに
+関しても**実測で反証された。全ての変更は元の値に戻して破棄
+(`git diff`で無変更を確認済み)。
+
+**総括**: nsysによる実測プロファイリングは、(1) decodeの真のボトルネックが
+MoEルーティングではなくdense fp8 GEMVであることを定量的に確定させ、
+(2) そのdense GEMVカーネル・QSA attentionカーネルの双方について、
+「GB300向けにチューニングされた値が3060では悪い」という尤もらしい仮説を
+実際のコード変更と計測によって反証した。両カーネルともBLOCK_N/BLOCK_K
+サイズなどのタイル形状自体を変える(単純な並列度パラメータの調整を
+超える)踏み込んだ再チューニングは未実施であり、そこにはNsight Compute
+級のプロファイラ (今回は権限不足で使用不可) による反復測定が必要と
+判断する。
+
 (下の表は一律top-k=3までの時点のまとめ。この後前掲の「FreeToken本体を
 改造: per-layer top-kスケジュール」セクションでsched-dによりさらに
 更新されたので、最終結論はそちらを参照)
