@@ -301,6 +301,67 @@ layer/GPUを明示指定しないと伸びない。**現時点のベスト: `-nc
 次はMTP投機デコード (`~/models/qwen-flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`
 を使用) を試す — こちらの方が本命の大きなレバーになる見込み。
 
+## FreeToken本体をdual-GPU対応に改造 (2026-09-15)
+
+ユーザーから明確な指示: 「llama.cppに逃げるのではなく、FreeTokenのソースコードを改造して
+デュアルGPUに対応させ、その上で自分の環境向けに最適化してほしい」。
+
+### 採用した方法
+
+ゼロから分散パイプライン並列(gloo point-to-point, CUDA graphをrank跨ぎで扱う仕組み,
+per-rankキャッシュ予算解決など)を実装するのは非常にリスクが高い(バグりやすい分散処理を
+一から書くことになる)と判断し、**yuuki-net/FreeToken-Kai** (Apache-2.0, 非公式フォーク,
+upstream afd99cbに追従、我々のクローンの初期コミットと完全同一の基点)を参照実装として
+`git remote add kai` -> `git merge kai/kai` で取り込んだ (2026-09-15, コミット `96cb1cb`)。
+ユーザー許可を得た上で実施 (サーバー側の権限チェックで一度ブロックされ、明示的に承認を得た)。
+
+**重要 (ユーザーからの指摘)**: Kaiの実測値 (2x RTX3060で18-20 tok/s) は目標ではなく、
+あくまで「動くdual-GPU基盤」を借りただけ。Kaiを上回ることが目的で、Kaiの数値を鵜呑みに
+しない。以後はそのための独自チューニングを積み重ねる。
+
+Kaiが追加する機能 (`--pp-size`): レイヤー単位のパイプライン並列。1GPU=1プロセス、
+NCCL/P2P不要 (gloo point-to-point)。rank0が埋め込み層、最終rankがlm_headを持つ。
+これにより「dense重みが1枚のVRAMに収まらない」「NVFP4のtritonカーネルがTP>1非対応」
+という2つの根本的な壁を同時に回避できる (PPはレイヤーをまるごと1GPUに割り当てるだけで、
+層の中身を分割しないのでMoEカーネル側の変更が一切不要)。
+
+新規C++拡張 (`_cpu_moe`, `_ple_store`など) を `python setup.py build_ext --inplace` で
+追加ビルド。
+
+### 起動成功
+
+```
+ft serve --model ~/models/qwen38-flash-next-nvfp4 --pp-size 2 --gpu 1,0 \
+  --moe-strategy offload --text-model-only --memory-ratio 0.85 --max-running-requests 1
+```
+
+`pipeline rank 0/2: layers [0, 24) on cuda:1` / `pipeline rank 1/2: layers [24, 48) on cuda:0`
+で正常に起動、両GPUとも約10.5GB使用 (dense重み+MoEオフロードキャッシュ1691slot/rank)。
+**FreeTokenがこのモデルをついに起動できた。**
+
+初回起動直後にリクエストを送ったところ `RuntimeError: gloo ... Timed out waiting 60000ms
+for recv operation` でクラッシュ (Kai READMEが警告している既知のrank-relay起動直後レース
+と同種の可能性)。サーバー再起動 + ready後に軽くsleepを挟んで再送したところ安定して応答。
+
+### 実測 (サーバー自身のスケジューラログより, prose系プロンプト, reasoning=xhigh既定)
+
+`--pp-size 2 --gpu 1,0` (24/24均等分割, dense-quant/kv-cache-dtypeともに未指定, デフォルト):
+
+| decode step | gen throughput (tok/s) |
+|---|---|
+| step1 | 1.35 (ウォームアップ) |
+| step2 | 15.32 |
+| step3 | 16.53 |
+| step4 | 15.49 |
+| step5 | 14.48 |
+| step6 | 15.83 |
+
+**平均 ~15.5 tok/s。** llama.cpp単GPU版 (16.57 tok/s) とほぼ同等かやや下回る —
+「動くようになった」だけでまだKaiの参考値(18-20)にも届いていない。ここからが本番。
+`--pp-layers`によるPCIe非対称性を活かした分割、`--dense-quant fp8`、
+`--kv-cache-dtype q4_0` (どちらもフリーになったVRAMをexpertキャッシュに回す設計)、
+`--spec-mtp` を順に試す。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
