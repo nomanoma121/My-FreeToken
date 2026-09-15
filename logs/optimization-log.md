@@ -106,6 +106,37 @@ Qwen3.8-Flash-Next を自分のマシンで 4bit 量子化して動かし、デ�
   GGUF (`unsloth UD-Q4_K_XL`, 105GB, 4shard) は既にダウンロード済みで
   `~/.cache/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF` にある。
 
+## Web調査で得た知見 (2026-09-15, ユーザー許可のもと検索実施)
+
+- **重要**: `FlashML-org/FreeToken#151` — 2x RTX3090 (sm_86, Ampereは我々と同世代) +
+  DeepSeek-V4-Flash で `ft bench bw` が `hybrid` を自動選択するが、手動で
+  `--moe-strategy offload` に固定した方が **8.3倍速い** (5.58 vs 0.67 tok/s)。
+  bench bw の帯域測定 (56.2GB/s) が実サービング時の実効帯域 (~2GB/s) と乖離しており、
+  per-activation同期オーバーヘッドをコストモデルが見ていないのが原因、との報告。未修正。
+  → **本機でも `--moe-strategy auto`/`hybrid` を信用せず、明示的に `offload` を指定する。**
+- `yuuki-net/FreeToken-Kai` という非公式フォークが、ほぼ同一ハード
+  (2x RTX3060 12GB, Qwen3.8-Flash-Next) で **18-20 tok/s** (128kコンテキストでも
+  ほぼフラット) を報告。ただし upstream FreeTokenには無い独自機能を使っている:
+  - `--pp-size 2`: pipeline-parallel GPU分割 (gloo実装, NCCL/peer-access不要)
+  - ファイルマップ方式のexpert bankでRAM使用量を半減 (`--moe-bank-ram 48G` で制限時は14-15 tok/sに低下)
+  - `--kv-cache-dtype q4_0/q8_0`: KVキャッシュ量子化でVRAM 1.9-3.6倍節約
+  - これらはupstreamの `My-FreeToken` には存在しない。ポートするかは要判断
+    (今回は "forkしない" 指示があるため、まずupstreamのフラグチューニングで
+    どこまで迫れるか試し、天井が見えたら再検討する)。
+- `nvidia-smi topo -m` 実測: GPU0-GPU1間は **PHB** (PCIe Host Bridge経由、NVLinkなし)。
+  P2Pは理論上可能だが帯域はPCIeどまり。FreeToken-KaiがTP(NCCL)を避けてPP(gloo)を
+  選んだ理由と整合する。upstreamの `--tensor-parallel-size 2` はNCCL/peer-access前提の
+  可能性が高く、このトポロジでは恩恵が薄いか不安定なリスクあり。
+  → **まずは `--gpu 0` のシングルGPUで動作・速度を確認してからTPを検討する。**
+- 参考上限値: NVIDIA公式NVFP4 + DGX Spark (unified memory, PCIeオフロード無し) で
+  Qwen3.8-Flash-Next 単体43.8 tok/s peak / 32.5 tok/s中央値 (1台), 2台TPで63.7 tok/s peak。
+  つまりPCIeオフロードのボトルネックが無い理想的環境でも60tok/s台が精一杯の部類。
+  我々の環境 (dual RTX3060 12GB, PCIe offload必須) では
+  **40 tok/sはかなり挑戦的、60 tok/sは非常に厳しい目標**という見立て。
+  (出典: NVIDIA Developer Forums, FlashML-org/FreeToken#151, yuuki-net/FreeToken-Kai README)
+- Marlin vs flashinfer/sglang-kernel の sm_86 性能比較や、FreeToken論文自体の
+  低VRAM環境ベンチマーク数値は検索でヒットせず (未確認のまま)。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
