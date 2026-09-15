@@ -183,6 +183,73 @@ Web調査の知見を踏まえ、実サービングでは両GPUとも `--moe-str
      カーネルレベルで不可能。2GPU構成でもMoE計算は常に単一GPUで行うしかない。**
      `--tp-size`はここでは使えない。
 
+## 単GPUでのVRAM予算チューニング詳細 (2026-09-15) と最終結論
+
+`--memory-ratio`/`--kv-reserve-tokens`/`--disable-moe-prefill-overlap`/`--max-running-requests`
+を極限まで詰めた記録 (すべてGPU1, `--text-model-only`, `--moe-strategy offload`):
+
+| 試行 | flags差分 | 結果 (budget vs 必要量) |
+|---|---|---|
+| 1 | デフォルト | -2040754172 B (moe=1024 slots overlap込み) |
+| 2 | `--memory-ratio 0.97 --kv-reserve-tokens 1024 --max-running-requests 1` | -1889759228 B (変化ほぼ無し) |
+| 3 | 上記 + `--disable-moe-prefill-overlap` (floor 1024→512) | budget 825138063 B, 必要 2864971776 B (まだ不足) |
+| 4 | `--memory-ratio 0.99 --kv-reserve-tokens 256` | budget 1072158975 B, 必要 1425997824 B (差 ▲337MB) |
+| 5 | `--memory-ratio 1.0 --kv-reserve-tokens 64` (どちらも上限/下限) | budget 1195669432 B, 必要 1421131776 B (差 ▲215MB, これ以上flagで縮まらない) |
+| 6 | 上記 + `--max-seq-len-override 8192` | **数値完全に同一** (weights_bytes/fixed_cache_sizeはmax_seq_lenに非依存と判明) |
+
+実測 (VRAMトレース): GPU1上のdense (非expert) 重みだけで **約9.8-9.9GB** 消費
+(text-model-onlyでも殆ど変わらず)。512experts分のMoEオフロードキャッシュ最小要件
+(architecture固定, `num_experts=512`が絶対最小floor) だけで約1.3GB追加必要 →
+**12GBカード1枚には物理的に収まらない**(flagチューニングでは埋まらない
+約200-350MBの恒常的な不足)。
+
+`--moe-strategy cpu` (MoE計算を完全にCPU側で行い、GPU側は"固定2レイヤー分の
+バッファ"のみで済むはず) も試したが、`torch.OutOfMemoryError: ... Tried to
+allocate 800.00 MiB ... 182.88 MiB is free` で失敗。dense重みだけで
+11.08-11.32GiB (12GB弱) を使い切っており、`--num-tokens`/`--memory-ratio`を
+変えても症状は完全に同一 (この800MiB要求はKV/MoEキャッシュ計算より前の
+固定バッファ確保で、フラグの影響を受けない)。
+
+**結論: このモデル (Qwen3.8-Flash-Next, tie_word_embeddings=false, vocab=248320,
+hidden=2560, 48層) の非MoE(dense)パラメータだけで bf16 換算 約10-11GB超あり、
+単体RTX3060 12GBには収まらない。TPでの2GPU分割はカーネル制約
+(`triton: TP > 1 is not supported for this expert format`, sm_86では
+marlin/b12xも使えない) で不可能。よってFreeToken + このNVFP4チェックポイントの
+組み合わせでは、本機 (2x RTX3060 12GB, NVLink無し) で"サーバーを起動する"
+ところまでも到達できない。これはチューニング不足ではなくハード/チェックポイント
+のミスマッチ。**
+
+## 方針転換: llama.cpp (GGUF) へのピボット (2026-09-15)
+
+ユーザーから「FreeTokenがggufじゃないと聞いたが好きに進めていい、
+とにかくFlash Next Q4を速く動かせればOK」との指示を受けていたため、
+FreeToken(NVFP4, bf16 dense)がこのVRAM制約下で物理的に起動不能と判明した
+時点で、GGUF量子化 (dense層も含め全体を4bit系に圧縮でき、bf16のまま残る
+NVFP4チェックポイントより非expertパラメータのVRAM footprintが大幅に小さくなる
+はず) + llama.cpp へ舵を切る。
+
+調査の結果:
+- **`~/llama.cpp` (本家 ggml-org, clean checkout, 既にビルド済み)** に
+  Qwen3.8-Flash-Next のネイティブサポートが既に入っている
+  (`src/llama-model.h`: `LLM_TYPE_A3B, // Qwen3.8 Flash Next`)。
+  `llama-server`, `llama-bench` ともにビルド済みバイナリあり。
+- `~/llama-flashnext-other` (Inovello fork, `llama-cli`のみビルド済み) は
+  本家に無い追加の expert cache / pinned-host loader / top-k radix
+  フォールバックなどを含むが、検証環境は **2x RTX3090 (24GB x2) + DDR4-2133
+  quad channel + Xeon E5-2696v4 x2** と、うちの2x RTX3060 12GBとはVRAM量が
+  倍以上違う。`examples/flashnext-topk/README.md` に実測値あり:
+  - MTP投機デコード込み, 119k depth prompt, 42リクエスト中央値:
+    control(旧top-k fallback) **30.2-30.4 tok/s**, candidate(radix版) **33.1-33.7 tok/s**
+    (約9-12%改善)。品質は240ペア中235同等、4件candidate優位、1件劣化。
+  - 起動コマンド例 (`-ot 'ffn_(gate|up|down)_exps\.weight=CUDA_Host,...'` で
+    expertテンソルだけを明示的にhost RAMへ固定し、他はGPU常駐させる
+    llama.cpp方式) は、FreeTokenの「offload=全experts host RAM / dense常にGPU固定」
+    という硬直した二択よりも柔軟で、我々の「dense常駐だけでVRAM使い切る」問題を
+    テンソル単位で回避できる可能性が高い。
+- 方針: まず本家 `~/llama.cpp` (ネイティブサポート済み、安全) で `-ot` を使い
+  expertsをhost RAM/CPU、dense+attentionをGPU (2枚に分割) に配置する構成を試す。
+  必要に応じてforkの追加最適化 (top-kフォールバック等) も後で移植/比較する。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
