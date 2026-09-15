@@ -874,6 +874,18 @@ top-k=3と2の間に明確な品質の崖がある。top-k=3は40 tok/sには届
 として、この2案 (品質優先=top-k=10/エンジン最適化のみ、速度優先=top-k=3)
 を最終候補として提示する。top-k=2はどちらの案としても推奨しない。
 
+### top-k=3上でmemory-ratio再チューニングを試みたが失敗 (負の結果)
+
+top-k=10向けにチューニングされた`--memory-ratio 0.95`が、top-k=3のような
+軽量化されたcompute/PCIeバランスでも最適とは限らないと考え、
+`--memory-ratio 0.97`(cache 2670→2759 slots, +3.3%)を試した。
+
+結果: 起動はしたが (CUDA graph capture後の空きVRAMが0.15 GiBまで低下)、
+ベンチマーク中の実際のdecodeフォワードパスでOOMに近い状態になり、
+rank間のgloo pipeline通信が`Connection closed by peer`で切断、
+バックエンドがクラッシュした。`--memory-ratio 0.95`はこのハードウェアでの
+安全上限であり、これ以上は不安定化するのみと判断。**0.95を維持。**
+
 ### git履歴
 
 本セッションの全作業は `~/My-FreeToken` にgitでコミット済み (コミット一覧は
