@@ -910,7 +910,24 @@ pp-layers分割) は出尽くした。追加で試した`--dense-quant`は`none`
 readahead系フラグは`--moe-bank-ram`+cpu/hybrid decode専用で、今回の
 `--moe-strategy offload`構成には適用不可。
 
-残る2つの現実的な選択肢:
+### `--host-embedding`を試したが効果なし (負の結果)
+
+CLIヘルプに「250k×2048語彙で約1GBのVRAMを解放しKVページに回せる」とある
+`--host-embedding`(埋め込みテーブルをpinned host memoryに置く)を
+top-k=3構成に追加して試した。
+
+結果: `cache plan`のweights (3.38 GiB)もexperts slots (2670)も、
+フラグなしの場合と完全に同一。decode速度も35.12/37.38 tok/s
+(フラグなし35.36/37.12との差は誤差範囲)。ヘルプテキストが
+"Qwen3.5-MoE family"向けと明記している通り、Qwen3.8-Flash-Next
+(qwen4_exp architecture)では対象外で暗黙的にno-opになっていると判断。
+**採用せず。**
+
+`--nvfp4-backend flashinfer`(=b12x)も確認したが、これは既にTP検証時に
+判明済みの`KernelSelectionError: b12x: requires sm_120+, got sm_86`が
+再度該当するため試すまでもなく対象外。
+
+以上でCLIの主要フラグは一通り評価を終えた。残る2つの現実的な選択肢:
 
 | 構成 | decode tok/s (prose/code) | 40 tok/s目標比 | 品質 | FreeToken本体改造 |
 |---|---|---|---|---|
