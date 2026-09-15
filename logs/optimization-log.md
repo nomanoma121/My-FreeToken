@@ -1146,7 +1146,7 @@ Claudeがセッション上限 (usage limit, resets 17:10 UTC) で停止した�
 Claudeの残した次の一手「sched-hに1層足したsched-lで13層が本当に多すぎるのか検証」を実施。
 sched-lは既に定義済み (sched-hの12層削減にindex16を追加した13層: 3 full + 10 linear, 平均2.729) だったため、そのままサーブして計測。
 
-構成:  (sched-hと同一フラグ)。
+構成: ft serve --model sched-l --pp-size 2 --gpu 1,0 --pp-layers 30 --moe-strategy offload --text-model-only --dense-quant fp8 --kv-cache-dtype q4_0 --memory-ratio 0.95 --port 1919 (sched-hと同一フラグ)。
 
 実測 (bench_stream2.py, max_tokens=384):
 - prose: 36.03 tok/s (completion 383, window 10.6s)
