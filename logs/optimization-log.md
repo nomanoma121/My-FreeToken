@@ -160,6 +160,29 @@ Ampereでの hybrid 不具合 (#151) の懸念とも整合する。GPU0はhybrid
 Web調査の知見を踏まえ、実サービングでは両GPUとも `--moe-strategy offload` を
 明示指定してA/B比較する方針とする。
 
+## 起動トラブルシュート記録 (2026-09-15)
+
+1. **GPU1単体, `--moe-strategy offload`, マルチモーダル込み**: 失敗。
+   `AssertionError: cache budget too small: ... budget -2040754172 B`
+   (VRAM予算がマイナス。dense重み+固定キャッシュだけで12GBカードを使い切っている)
+2. **GPU1単体 + `--text-model-only`**: ほぼ改善なし。
+   `budget -1889759228 B` (▲150MB程度しか変わらず。visionエンコーダは主因ではない)
+3. **`--tp-size 2 --gpu 1,0` (両GPUでdense重みを分割)**: 2段階で失敗。
+   - a) pynccl の JIT ビルドで `cannot find -lnccl` (pip版 `nvidia-nccl-cu13` が
+     `libnccl.so.2` のみを配置し `libnccl.so` シンボリックリンクが無いため linker が解決できない)。
+     `ln -sf libnccl.so.2 libnccl.so` を作成し、`LIBRARY_PATH`/`LD_LIBRARY_PATH` に
+     そのディレクトリを追加して解決 (`~/.cache/tvm-ffi` の古いビルドキャッシュも削除)。
+   - b) NCCLリンク後に別のエラー:
+     `KernelSelectionError: no usable kernel in table; triton: TP > 1 is not supported
+     for this expert format; marlin: vLLM is not installed; b12x: b12x requires sm_120+, got sm_86`
+     → **重要な制約**: このNVFP4 checkpointのexpertカーネルは sm_86 (Ampere, RTX3060) では
+     事実上 `triton` バックエンドしか選べず、その `triton` 実装は **TP>1を完全に非対応**。
+     `marlin`はvLLM別インストールが必要 (transformers要件と衝突で保留中)、
+     `b12x`はsm_120+ (Blackwell) 専用で対象外。
+     → **結論: このハード+チェックポイントの組み合わせでは、MoE層のテンソル並列化は
+     カーネルレベルで不可能。2GPU構成でもMoE計算は常に単一GPUで行うしかない。**
+     `--tp-size`はここでは使えない。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
