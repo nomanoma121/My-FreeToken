@@ -701,6 +701,34 @@ per-layer allocation、あるいはより高精度な観測に基づく別アプ
   TinyLFUやstatic-hot+dynamic等の改良ポリシーへの改造は真に効果が見込めるが
   相応の実装工数とリスクを伴う本格的なソース改造になる。
 
+### 実際にLRUカーネルの実装を調査した結果 (2026-09-15)
+
+`ensure_experts`が委譲している`lru_ensure`の実体を特定: FreeToken自身のコードでは
+なく、外部pipパッケージ`flashlib` (`.venv/.../site-packages/flashlib/kernels/
+slot_cache/triton/lru_ensure.py`, 441行) 内のTritonカーネルだった。
+
+朗報: `flashlib`はFreeTokenと同じ組織 (FlashML-org, Apache-2.0,
+github.com/FlashML-org/flashlib) が公開しているOSSで、Kaiと同様にvendor/fork
+することは技術的・ライセンス的には可能。
+
+ただし中身を読むと、これは片手間で改造できる代物ではないと判断した:
+- CUDA graph捕捉可能であるための「host syncなし・固定shape」制約を全編で維持
+- victim選択に2つの戦略 (`_seq`: register常駐 argmin ループ, `_insert`: streaming
+  insert、大きいキャッシュ用) があり、両者が「bit-identical」な結果を返すことを
+  設計上要求されている
+- 過去に「hit直後のreloadが古い値を見てLRU victim判定を誤る」という具体的な
+  レースコンディションのバグ実績があり、`tl.debug_barrier()`の配置がその再発防止
+  のために厳密に効いている、という趣旨のコメントが複数箇所にある
+- frequency-aware化 (LFU/TinyLFU的な改良) をするには、新しいper-slot状態
+  (頻度カウンタ)を`lru_usage`と並行して追加し、両戦略の victim選択ロジック
+  (packed key生成、argmin/streaming insert)に一貫して組み込み、graph capture
+  安全性を保ったまま正しさを証明する必要がある
+
+**結論: これは「設定を変える」レベルの改修ではなく、正真正銘のGPUカーネル
+エンジニアリング(flashlibのフォーク+検証を含む)であり、今回のセッションで
+安全に完了させられる規模ではないと判断した。** 挑戦する場合は
+`flashlib`のvendor化から始める別プロジェクトとして扱うべき。
+
 ### git履歴
 
 本セッションの全作業は `~/My-FreeToken` にgitでコミット済み (コミット一覧は
