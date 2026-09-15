@@ -250,6 +250,26 @@ NVFP4チェックポイントより非expertパラメータのVRAM footprintが�
   expertsをhost RAM/CPU、dense+attentionをGPU (2枚に分割) に配置する構成を試す。
   必要に応じてforkの追加最適化 (top-kフォールバック等) も後で移植/比較する。
 
+## llama.cpp 初回実測 (2026-09-15)
+
+`~/llama.cpp` (本家, ビルド済み, commit 8ea290247) + `unsloth/Qwen3.8-Flash-Next-GGUF`
+の `UD-Q4_K_XL` (103.68 GiB, 176.94B params) で `llama-bench` を実行。
+
+コマンド: `llama-bench -m <UD-Q4_K_XL-00001-of-00004.gguf> -ngl 99 -ncmoe 999 -p 128 -n 64 -t 12 -fa on`
+(全MoE expertsをCPU、それ以外の層はGPUへ全offload試行, flash-attn on, 12スレッド)
+
+| test | t/s |
+|---|---|
+| pp128 (prompt processing) | 30.90 ± 3.62 |
+| **tg64 (decode, 本命の指標)** | **15.16 ± 0.06** |
+
+**FreeTokenでは起動すらできなかったのに対し、llama.cppは実際に動作し実測できた。**
+ただし現状15.16 tok/sで目標40 tok/sには届いていない。チューニング開始。
+（見積りの参考: `~/llama-flashnext-other`のREADMEでは2x RTX3090 24GBx2 + DDR4-2133
+quad channelでMTP投機デコード込み30.2-33.7 tok/sと報告されており、うちの環境は
+VRAM半分・恐らくRAM帯域も異なるため、素のdecode性能はその数値より低くなりやすい。
+MTP併用やチューニングでどこまで詰められるか検証する。)
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
