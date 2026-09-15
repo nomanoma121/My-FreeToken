@@ -1139,3 +1139,23 @@ GPUへの交換、(2) attention/GDN/hyper-connectionカーネル自体の書き�
 ## 実測値
 
 (まだベンチマーク未実施。実行後にここへ追記する。捏造しない。)
+
+### Takeover (Muse Spark, 2026-09-15 ~16:40 UTC): sched-l (sched-h+1層) 検証 — 13層の崖を再確認
+
+Claudeがセッション上限 (usage limit, resets 17:10 UTC) で停止したため引き継ぎ。
+Claudeの残した次の一手「sched-hに1層足したsched-lで13層が本当に多すぎるのか検証」を実施。
+sched-lは既に定義済み (sched-hの12層削減にindex16を追加した13層: 3 full + 10 linear, 平均2.729) だったため、そのままサーブして計測。
+
+構成:  (sched-hと同一フラグ)。
+
+実測 (bench_stream2.py, max_tokens=384):
+- prose: 36.03 tok/s (completion 383, window 10.6s)
+- code: 37.93 tok/s (completion 383, window 10.1s)
+- 速度だけ見ればsched-h (35.95-37.49 / 37.49-38.06) と誤差範囲で同等。
+
+品質チェック (temperature=0.0, max_tokens=300):
+- 算数 (17x24): "408" 正解 (finish=stop)
+- 羊問題: 空回答 (content="", finish=length) — 崩壊
+- コード (quicksort): 空回答 (content="", finish=length) — 崩壊
+
+結論: sched-k (13層) と同じ「推論はできるが書き出せない」崩壊パターンを再現。**13層は配置によらず実質的な崖**と確定。sched-h (12層) を最終推奨として維持する。サーバーはtakeover用に起動したsched-lを停止し、sched-hに戻す。
