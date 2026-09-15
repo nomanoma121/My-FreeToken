@@ -5,6 +5,51 @@ Qwen3.8-Flash-Next を自分のマシンで 4bit 量子化して動かし、デ�
 時系列で積み上げる。捏造した数字は書かない（実行していないベンチマーク
 結果は「未実施」と明記する）。
 
+## TL;DR (結論だけ知りたい場合)
+
+**目標の40 tok/sには届かず、36-38.4 tok/s (90-96%) が最終到達点。**
+60 tok/sには届いていない。詳しい経緯は下の本文を参照。
+
+### 今すぐ動かすコマンド (品質優先・改造なし相当、24.5-24.9 tok/s)
+
+```bash
+cd ~/My-FreeToken && source .venv/bin/activate
+ft serve --model ~/models/qwen38-flash-next-nvfp4 --pp-size 2 --gpu 1,0 \
+  --pp-layers 30 --moe-strategy offload --text-model-only \
+  --dense-quant fp8 --kv-cache-dtype q4_0 --memory-ratio 0.95 \
+  --max-running-requests 1 --port 1919
+```
+
+### 速度優先 (推奨、per-layer top-k削減、36-38.4 tok/s、品質チェック済み)
+
+```bash
+cd ~/My-FreeToken && source .venv/bin/activate
+ft serve --model ~/models/qwen38-flash-next-nvfp4-sched-h --pp-size 2 --gpu 1,0 \
+  --pp-layers 30 --moe-strategy offload --text-model-only \
+  --dense-quant fp8 --kv-cache-dtype q4_0 --memory-ratio 0.95 \
+  --max-running-requests 1 --port 1919
+```
+`~/models/qwen38-flash-next-nvfp4-sched-h/config.json` の
+`text_config.num_experts_per_tok_schedule` (48要素) が、この速度優先構成の
+実体。作り方は「per-layer top-kスケジュール」節を参照。
+
+### なぜ40 tok/sに届かないか (1行で)
+
+VRAM (RTX 3060 12GB x2) が上限で、offloadキャッシュのミス率
+(10.7-17.7%、実測済み) をこれ以上下げられない。これ以上はGPU換装か
+attention/GDN/MoEカーネル自体の書き換えが必要 (詳細は本文末尾)。
+
+### このセッションでFreeToken本体に加えた改造 (全てgitコミット済み)
+
+1. `--pp-size` パイプライン並列 (FreeToken-Kaiからマージ) — dual-GPU化の基盤
+2. `--distributed-timeout` フラグ追加 — 非対称pp-layers分割時のgloo timeout対策
+3. `num_experts_per_tok_schedule` per-layer top-kスケジュール機能 — モデル
+   近似による高速化 (config.jsonのみで有効化、モデル改造は不要)
+4. `--spec-mtp` のチェックポイント読み込みバグ修正 (unfused block-fp8対応) —
+   ただしこのハードウェアでは採用せず (正味で遅くなるため)
+
+---
+
 ## 環境スペック (2026-09-15 時点)
 
 - ホスト: `gpu-node-02`, Ubuntu 26.04 LTS, kernel 7.0.0-31-generic
