@@ -52,6 +52,15 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
+# nvidia/Qwen3.8-Flash-Next-NVFP4 ships the MTP draft head's experts the same way as the
+# routed experts (per-expert, un-fused) rather than the pre-stacked bf16 ``_MTP_EXPERT_RE``
+# the engine otherwise expects, and in 128x128 block-fp8 (weight + weight_scale_inv). These
+# must reach the engine's MTP capture untouched -- _EXPERT_RE below would otherwise drop them
+# as if they were the main model's routed experts (read separately via nvfp4_expert_sources).
+_MTP_EXPERT_UNFUSED_RE = re.compile(
+    r"^mtp\.layers\.0\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)$"
+)
+
 
 def _is_primary() -> bool:
     """Rank 0 of whatever parallel layout runs (TP or the pipeline engine): drives progress bars."""
@@ -240,6 +249,12 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
+                if include_mtp and _MTP_EXPERT_UNFUSED_RE.match(raw_name):
+                    # bypass _rename/_DenseFuser entirely: these aren't dense projections to
+                    # fuse (their leaf names collide with the shared-expert gate|up group) and
+                    # the engine's _capture_mtp_experts fuses them itself once complete.
+                    yield raw_name, f.get_tensor(raw_name)
+                    continue
                 name = _rename(raw_name)
                 if name is None or (not include_mtp and name.startswith("mtp.")):
                     continue

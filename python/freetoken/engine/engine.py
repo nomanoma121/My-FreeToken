@@ -475,6 +475,13 @@ class ForwardOutput(NamedTuple):
 
 # the stacked bf16 experts of the draft head, as the reader yields them
 _MTP_EXPERT_RE = re.compile(r"^mtp\.layers\.0\.mlp\.experts\.(gate_up_proj|down_proj)$")
+# some MTP releases (e.g. nvidia/Qwen3.8-Flash-Next-NVFP4) instead ship the draft head's
+# experts the same way the routed experts are shipped: per-expert, unfused, and in this
+# checkpoint's case 128x128 block-fp8 (weight + weight_scale_inv) rather than bf16.
+_MTP_EXPERT_UNFUSED_RE = re.compile(
+    r"^mtp\.layers\.0\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale_inv)$"
+)
 
 # FT_SPEC_TRACE=n: log the first n verify windows (ids, samples, drafts, top logits)
 _SPEC_TRACE_LEFT = [int(os.environ.get("FT_SPEC_TRACE", "0") or 0)]
@@ -582,6 +589,8 @@ class Engine:
         self._spec_profiler = None
         self._spec_graph = None  # SpecVerifyGraph once captured (end of __init__)
         self._mtp_raw: Dict[str, torch.Tensor] = {}
+        # per-expert unfused capture (see _MTP_EXPERT_UNFUSED_RE): expert id -> {(proj, kind): tensor}
+        self._mtp_raw_unfused: Dict[int, Dict[Tuple[str, str], torch.Tensor]] = {}
         self._mtp_bank_host: Dict[str, torch.Tensor] | None = None
         self._mtp_bank_bytes = 0
         self._mtp_bank_layers = 0
@@ -1032,15 +1041,65 @@ class Engine:
 
     # ------------------------------------------------------------------ MTP expert bank layer
     def _capture_mtp_experts(self, weights):
-        """Pull the head's stacked bf16 experts (``mtp.layers.0.mlp.experts.{gate_up,down}_proj``)
-        out of the weight stream: they become a bank layer, not model buffers."""
+        """Pull the head's experts out of the weight stream: they become a bank layer, not
+        model buffers. Two source shapes, both routed to ``_quantize_mtp_experts``:
+        already-stacked bf16 (``mtp.layers.0.mlp.experts.{gate_up,down}_proj``), or per-expert
+        unfused (``mtp.layers.0.mlp.experts.<id>.{gate,up,down}_proj.{weight,weight_scale_inv}``,
+        e.g. nvidia/Qwen3.8-Flash-Next-NVFP4's 128x128 block-fp8 draft head)."""
         for key, weight in weights:
             m = _MTP_EXPERT_RE.match(key)
-            if m is None:
-                yield key, weight
+            if m is not None:
+                self._mtp_raw[m.group(1)] = weight.to("cpu")
+                del weight
                 continue
-            self._mtp_raw[m.group(1)] = weight.to("cpu")
-            del weight
+            m2 = _MTP_EXPERT_UNFUSED_RE.match(key)
+            if m2 is not None:
+                slot = self._mtp_raw_unfused.setdefault(int(m2.group("expert")), {})
+                slot[(m2.group("proj"), m2.group("kind"))] = weight.to("cpu")
+                del weight
+                continue
+            yield key, weight
+
+    def _fuse_mtp_experts_unfused(self) -> Dict[str, torch.Tensor]:
+        """Dequantize + fuse per-expert block-fp8 MTP experts into the same stacked bf16
+        ``{gate_up_proj, down_proj}`` shape ``_quantize_mtp_experts`` expects from a checkpoint
+        that ships them pre-fused. Mirrors ``dequant_block_fp8``'s ``[N, K]`` + ``[N//128,
+        K//128]`` convention (see kernel/triton/fp8_block_linear.py), one expert at a time to
+        keep peak memory down (this is only ever one extra layer, not the offload cache)."""
+        from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+
+        experts = self._mtp_raw_unfused
+        num_experts = len(experts)
+        assert set(range(num_experts)) == set(experts), (
+            f"--spec-mtp: MTP expert ids are not a dense 0..{num_experts - 1} range: "
+            f"got {sorted(experts)[:5]}..."
+        )
+        gate_up_rows, down_rows = [], []
+        for e in range(num_experts):
+            parts = experts[e]
+            missing = {("gate_proj", "weight"), ("gate_proj", "weight_scale_inv"),
+                       ("up_proj", "weight"), ("up_proj", "weight_scale_inv"),
+                       ("down_proj", "weight"), ("down_proj", "weight_scale_inv")} - set(parts)
+            assert not missing, f"--spec-mtp: expert {e} is missing {sorted(missing)}"
+            gate = dequant_block_fp8(
+                parts[("gate_proj", "weight")].to(self.device),
+                parts[("gate_proj", "weight_scale_inv")].to(self.device),
+            )
+            up = dequant_block_fp8(
+                parts[("up_proj", "weight")].to(self.device),
+                parts[("up_proj", "weight_scale_inv")].to(self.device),
+            )
+            down = dequant_block_fp8(
+                parts[("down_proj", "weight")].to(self.device),
+                parts[("down_proj", "weight_scale_inv")].to(self.device),
+            )
+            gate_up_rows.append(torch.cat([gate, up], dim=0).cpu())
+            down_rows.append(down.cpu())
+            del gate, up, down
+        self._mtp_raw_unfused = {}
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        return {"gate_up_proj": torch.stack(gate_up_rows, dim=0), "down_proj": torch.stack(down_rows, dim=0)}
 
     def _quantize_mtp_experts(self) -> None:
         """Quantize the captured bf16 experts to the native NVFP4 bank layout, into pinned host
@@ -1050,6 +1109,8 @@ class Engine:
         from freetoken.moe.legacy_format import canonical_role
 
         raw = self._mtp_raw
+        if not raw and self._mtp_raw_unfused:
+            raw = self._fuse_mtp_experts_unfused()
         assert set(raw) == {"gate_up_proj", "down_proj"}, (
             f"--spec-mtp: MTP experts missing from the checkpoint: got {sorted(raw)}"
         )
