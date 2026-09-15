@@ -482,6 +482,41 @@ Web調査で見つけた `FlashML-org/FreeToken#151` (Ampereでhybridが実サ�
 `--moe-strategy offload --pp-layers 30 --dense-quant fp8 --kv-cache-dtype q4_0
 --memory-ratio 0.95` (直前の~25.2 tok/s構成) に復帰。
 
+## 現状ベスト構成の再確認 (2026-09-15, 383トークン生成, prose/code 2種)
+
+サーバーのスケジューラログだけでなく、クライアント側スクリプト(reasoning_content込みで
+正しく計測するよう修正)でも独立に計測。
+
+```
+ft serve --model ~/models/qwen38-flash-next-nvfp4 --pp-size 2 --gpu 1,0 --pp-layers 30 \
+  --moe-strategy offload --text-model-only --dense-quant fp8 --kv-cache-dtype q4_0 \
+  --memory-ratio 0.95 --max-running-requests 1
+```
+
+| workload | completion_tokens | TTFT | decode tok/s |
+|---|---|---|---|
+| prose (TCP congestion control説明) | 383 | 6.23s | **24.45** |
+| code (thread-safe LRU cache実装) | 383 | 5.98s | **24.88** |
+
+prose/codeでほぼ差がない (MTP未使用のため、Kaiが報告するworkload依存の大きな差は
+今回発生していない)。383トークンの長め生成でも安定して**~24.5-24.9 tok/s**。
+
+**進捗まとめ (2026-09-15 一日の作業):**
+
+| 段階 | 構成 | decode tok/s |
+|---|---|---|
+| FreeToken (upstream, NVFP4) | — | **起動不可** |
+| llama.cpp GGUF, 全expertCPU | ncmoe=999 | 15.7-15.8 |
+| llama.cpp GGUF, 一部expertGPU | ncmoe=44 | 16.57 |
+| FreeToken+Kai, PP均等分割 | pp-size 2 (24/24) | ~15.5 |
+| + dense-quant fp8 + kv q4_0 | 同上 | ~22 |
+| + pp-layers非対称分割 | pp-layers 30 | ~24.3 |
+| + memory-ratio 0.95 | 同上 | **~24.5-24.9 (確定)** |
+
+目標40 tok/s (理想60) に対し、現状は**目標の約61-62%**。FreeToken-Kai自身の
+参考値(18-20 tok/s)は上回っている。次の一手を継続検討中
+(pp-layers 32の探索、gloo起動タイムアウトの延長でpp-layers 34+を試す、等)。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
