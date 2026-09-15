@@ -33,11 +33,18 @@ ft serve --model ~/models/qwen38-flash-next-nvfp4-sched-h --pp-size 2 --gpu 1,0 
 `text_config.num_experts_per_tok_schedule` (48要素) が、この速度優先構成の
 実体。作り方は「per-layer top-kスケジュール」節を参照。
 
-### なぜ40 tok/sに届かないか (1行で)
+### なぜ40 tok/sに届かないか (nsysプロファイリングで実測確定)
 
-VRAM (RTX 3060 12GB x2) が上限で、offloadキャッシュのミス率
-(10.7-17.7%、実測済み) をこれ以上下げられない。これ以上はGPU換装か
-attention/GDN/MoEカーネル自体の書き換えが必要 (詳細は本文末尾)。
+decodeのGPU時間の内訳 (`nsys`実測): **dense層(attention/GDN/shared-expert)
+のfp8 GEMVが33.4%で最大**、次いでQSA attention 15.3%、offloadキャッシュの
+ミスフェッチ11.7% (ミス率10.7-17.7%は別途実測済み)。上位2つのカーネル
+(dense GEMV, QSA attention) は既にFreeToken本体のTritonカーネルで
+"GB300向け"と明記されたチューニング値を使っており、3060向けにsplit-k
+並列度やnum_warpsを変えて実測しても改善しないことを確認済み (本文の
+「nsysによるGPUカーネルレベルの実プロファイリング」節参照)。
+これ以上はGPU換装か、BLOCK_N/BLOCK_K等タイル形状レベルのカーネル
+再設計 (Nsight Compute等の権限が必要、このマシンでは権限不足で未実施)
+が必要と実測ベースで判断する。
 
 ### このセッションでFreeToken本体に加えた改造 (全てgitコミット済み)
 
