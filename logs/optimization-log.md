@@ -1193,6 +1193,53 @@ verify-windowのCUDA graphがVRAM不足でeager実行にフォールバックし
 RTX 3060 x2 + offload-cache構成では採用しない。** sched-h
 (12層top-k=2、spec-mtp無し、37-38 tok/s) が引き続き最終推奨。
 
+## キャッシュミス率の再測定とVRAM上限の最終確認 (2026-09-15)
+
+sched-h構成で`--moe-collect-stats --moe-stats-out`を使い、実際のキャッシュ
+ミス率を再測定した (top-k=10時代以来、初の再測定)。
+
+| rank | layers | cache_size | active_per_layer | miss_rate |
+|---|---|---|---|---|
+| 0 (GPU1) | 30 | 2670 slots | 2.77 | **17.7%** |
+| 1 (GPU0) | 18 | 3197 slots | 2.78 | **10.7%** |
+
+ミス率は無視できない水準 (10.7-17.7%) で残っており、「これ以上はカーネル
+書き換えかハードウェア交換しかない」という以前の結論を検証する必要が
+あると判断し、キャッシュ拡大の再チャレンジを実施した。
+
+### memory-ratio 0.96 (0.95と0.97の間) を試す
+
+0.97はクラッシュ済み、0.95が安定動作。0.96を試したところ起動成功、
+cache 2670→2714 slots (+1.6%)、CUDA graph capture後の空きVRAMは0.27 GiB
+(0.97の0.15 GiBよりは余裕あり)。品質チェック(算数408)は正解。
+
+実測: decode 36.01/38.41 tok/s — 0.95時点 (36-38.4 tok/s) の範囲内で、
+明確な改善なし (+1.6%のキャッシュ増では誤差範囲を超える効果が出ない)。
+
+### --linear-state-cache-ratio を下げてGDN state poolの余剰を探る
+
+`--linear-state-cache-ratio 1.0` (デフォルト2.0から半減) を試したが、
+`cache plan`は一字一句変化なし (GDN state pool 0.62 GiB、experts 2670 slots
+のまま)。ヘルプテキストにある「--max-running-req 1では4スナップショットが
+floor」という記述通り、既にfloorに張り付いており、この値を下げても
+VRAMは一切解放されないことを確認した。
+
+### 結論: VRAM予算は構造的に使い切っている
+
+`cache plan`の内訳 (weights 3.38 GiB + GDN state pool 0.62 GiB [floor-bound]
++ KV 0.03 GiB ≈ 4.03 GiB) は、dense-quant fp8 (これ以上の量子化オプション
+はCLIに存在しない) とGDN state poolのfloor制約により、これ以上圧縮できない。
+残りの予算 (memory-ratio 0.95で6.89-7.04 GiB) がまるごとexpertキャッシュに
+渡っており、0.96でも+1.6%、0.97はクラッシュという状況から、**このVRAM
+予算配分は事実上の天井**と判断する。
+
+10.7-17.7%のミス率を additional にゼロへ近づけるには、キャッシュを
+数十%単位で拡大する必要があるが、そのための追加VRAMをこのハードウェア
+(RTX 3060 12GB x2) から捻出する手段は使い果たした。これにより、
+「40 tok/s目標に対する残りのギャップは、GPU換装かカーネルレベルの
+書き換えが必要」という結論は、ミス率の実測とVRAM予算の構造分析
+双方から裏付けられたものとなった。
+
 (下の表は一律top-k=3までの時点のまとめ。この後前掲の「FreeToken本体を
 改造: per-layer top-kスケジュール」セクションでsched-dによりさらに
 更新されたので、最終結論はそちらを参照)
