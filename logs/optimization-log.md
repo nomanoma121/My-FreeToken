@@ -73,6 +73,39 @@ Qwen3.8-Flash-Next を自分のマシンで 4bit 量子化して動かし、デ�
    デフォルトのsystem python 3.14だとtorch等のwheelが噛み合わないリスクを回避)
 7. `uv pip install -e ".[accel]"` を background で実行開始 (flashinfer + sglang-kernel を含む accel extra)
 
+## サーブ時の主要フラグ調査 (docs/cli.md, args.py を確認)
+
+- `--tensor-parallel-size` / `--tp-size` と `--gpu 0,1` で **2枚のRTX3060を
+  TPで束ねられる** (`--gpu` はTP rank順のカンマ区切り)。VRAM合計24GiBを
+  MoE expert cache + KV cache に使えるようになり、単GPU(12GB)より
+  GPUキャッシュヒット率が上がる見込み。まずはシングルGPUで動作確認してから
+  `--tp-size 2` を試す。
+- `--moe-strategy {auto,fused,offload,cpu,hybrid}`。`auto`はMoEモデルなら
+  `offload`、`ft bench bw`のプロファイルがあれば`hybrid`に格上げ。
+  512expert/layerと巨大チェックポイントなので`offload`か`hybrid`が本命。
+- `--moe-cpu-layers`: offload戦略で特定layerのMoE計算をCPU側に逃がせる
+  (bf16/nvfp4/mxfp4対応、fp8experts不可 — 今回はnvfp4なので対象)。
+  Ryzen 9 5900X (12C/24T) のCPU計算力とPCIe帯域のバランスを見て調整余地あり。
+- `--moe-hybrid-max-fetch`: hybrid時にPCIe経由フェッチする最大expert数/layer/step。
+  `ft bench bw`のプロファイルで自動決定される。
+- `ft bench bw` は GPU毎・expertフォーマット毎にプロファイルを
+  `~/.cache/freetoken/benchbw/<gpu-uuid>.json` に保存する。モデルロード前に
+  一度実行しておく。
+- Marlin W4A16 NVFP4 kernel path は `vllm>=0.14,<0.15` 依存で
+  core の `transformers>=5.5` と衝突するため `accel` extra には未収録。
+  sm_86 (Ampere, RTX3060) でのNVFP4カーネル速度が伸びない場合の調査対象として残す。
+
+## フォールバック案 (メモ、未実施)
+
+- `~/llama-flashnext-other` (Inovello/llama.cpp フォーク) に Flash-Next 専用の
+  CUDA radix top-k フォールバックと "A/B guide" が既に入っている
+  (`dd64a3db0 cuda: publish tested Flash-Next radix top-k fallback and A/B guide`,
+  `9bd97fe54 Flash-Next replication branch for 2x RTX 3090 + DDR4 host experts`)。
+  対象ハードウェアは元々 2x RTX3090+DDR4 想定なので、うちの 2x RTX3060 12GB との
+  差分チューニングが必要になる。FreeToken経路でtok/s目標に届かない場合の代替候補。
+  GGUF (`unsloth UD-Q4_K_XL`, 105GB, 4shard) は既にダウンロード済みで
+  `~/.cache/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF` にある。
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
