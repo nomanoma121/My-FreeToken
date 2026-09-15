@@ -95,10 +95,20 @@ def test_every_rank_answers_alike_whether_images_are_served():
     assert not _serves_multimodal(SimpleNamespace(encoder_cache=None))
 
 
-def test_a_rank_without_the_encoder_cache_plans_no_gather():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the scheduler pins the staged rows")
+def test_a_rank_without_the_encoder_cache_gathers_nothing_but_keeps_the_image_spans():
+    """A later pipeline rank has no rows to gather (they arrive in the residual stream), but its
+    attention still needs each image span's end (a bidirectional block attends within its span)."""
     pytest.importorskip("freetoken.scheduler.scheduler")
+    from freetoken.message import MMItem
     from freetoken.scheduler.scheduler import Scheduler
 
-    batch = SimpleNamespace(padded_reqs=[SimpleNamespace(mm_items=[object()])], mm_gather_plan=None)
-    Scheduler._gather_multimodal(SimpleNamespace(engine=SimpleNamespace(encoder_cache=None)), batch)
-    assert batch.mm_gather_plan is None
+    item = MMItem(modality="image", hash=3, pad_value=1_000_003, offsets=[[2, 6]],
+                  precomputed_embeddings=torch.zeros(4, 8), model_specific_data={"grid_thw": [1, 4, 4]})
+    req = SimpleNamespace(uid=1, mm_items=[item], cached_len=0, device_len=8, extend_len=8)
+    later = SimpleNamespace(engine=SimpleNamespace(encoder_cache=None), device=torch.device("cpu"),
+                            _bidirectional_mm=False, _warned_cut_image=False)
+    batch = SimpleNamespace(padded_reqs=[req], mm_gather_plan=None, mm_encoder_jobs=None, mm_rows=None, mm_block_ends=None)
+    Scheduler._gather_multimodal(later, batch)
+    assert batch.mm_gather_plan is None and batch.mm_rows is None and batch.mm_encoder_jobs is None
+    assert batch.mm_block_ends.tolist() == [0, 0, 6, 6, 6, 6, 0, 0]
