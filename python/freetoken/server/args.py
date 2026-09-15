@@ -355,6 +355,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=ServerArgs.distributed_timeout,
+        help=(
+            "Timeout in seconds for the gloo/NCCL process group backing --pp-size and "
+            "--tensor-parallel-size (default 60). This bounds every send/recv, not just the "
+            "startup join barrier (which has its own longer wait via "
+            "FREETOKEN_RANK_JOIN_TIMEOUT_SECONDS): a heavily uneven --pp-layers split can make "
+            "the heavier rank's model load run past 60s while the lighter rank is already "
+            "waiting to agree on the KV page count, aborting the boot with a gloo send/recv "
+            "timeout even though nothing is actually wedged. Raise this to cover slow disk "
+            "loads on lopsided splits; it does not affect steady-state decode latency."
+        ),
+    )
+
+    parser.add_argument(
         "--gpu",
         type=_lazy_gpu_arg,
         default=ServerArgs.gpu,
