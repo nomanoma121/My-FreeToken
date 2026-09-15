@@ -517,6 +517,101 @@ prose/codeでほぼ差がない (MTP未使用のため、Kaiが報告するworkl
 参考値(18-20 tok/s)は上回っている。次の一手を継続検討中
 (pp-layers 32の探索、gloo起動タイムアウトの延長でpp-layers 34+を試す、等)。
 
+## ソース改造: `--distributed-timeout` フラグ追加 (2026-09-15)
+
+`--pp-layers 34` (rank0=34層/rank1=14層) は前回、rank0のロードが60秒を超えて
+rank1がgloo send/recvでタイムアウトし起動失敗していた。原因はハードコードされた
+`EngineConfig.distributed_timeout = 60.0` (`FREETOKEN_RANK_JOIN_TIMEOUT_SECONDS`とは
+別物、こちらはバリア専用でsend/recv自体のタイムアウトはカバーしない)。
+
+`python/freetoken/server/args.py` に `--distributed-timeout` フラグを追加し
+(コミット参照)、CLIから調整可能にした。ハードコードされた60秒制限を、フラグ非指定時は
+従来通りの挙動を保ちつつ、非対称splitで長いロード時間が必要な場合に上書きできるように
+した — これは「FreeTokenのソースコードを改造する」というユーザー要望に対する
+具体的な実装。
+
+`--distributed-timeout 300` を付けて `--pp-layers 34` を再実行 → 起動成功。
+
+### 実測 (pp-layers 34, 383トークン, prose/code)
+
+| workload | decode tok/s |
+|---|---|
+| prose | 24.10 |
+| code | 24.60 |
+
+**pp-layers 30 (24.45-24.88) とほぼ同じ、むしろ僅かに低い。** つまり30あたりが
+このハードウェアでの非対称分割の局所最適点であり、さらに片方に寄せても追加の
+利得は無いことを確認した。**`--pp-layers 30` を最終ベストとして確定する。**
+
+## 最終まとめ (2026-09-15)
+
+### 最終ベスト構成
+
+```
+ft serve --model ~/models/qwen38-flash-next-nvfp4 \
+  --pp-size 2 --gpu 1,0 --pp-layers 30 \
+  --moe-strategy offload --text-model-only \
+  --dense-quant fp8 --kv-cache-dtype q4_0 \
+  --memory-ratio 0.95 --max-running-requests 1
+```
+
+**確定decode速度: ~24.5-24.9 tok/s** (383トークン生成、prose/codeとも安定)
+
+### 目標との比較
+
+| 目標 | 値 | 達成度 |
+|---|---|---|
+| 最低目標 | 40 tok/s | **約61-62%** |
+| 理想目標 | 60 tok/s | 約41% |
+
+### 行った改造・チューニングの一覧 (効果順)
+
+1. FreeToken-Kai (yuuki-net, Apache-2.0) の `--pp-size` をマージし、そもそも
+   このモデルを2GPUで起動可能にした (upstream FreeTokenは起動不可だった)
+2. `--dense-quant fp8` + `--kv-cache-dtype q4_0`: 浮いたVRAMをexpertキャッシュへ
+   (moe_cache_size 1691→2224, +31%) → **+42%** (15.5→22 tok/s)
+3. `--pp-layers 30` (実測PCIe帯域: GPU1=25.8GB/s ≫ GPU0=6.2GB/s を根拠にした
+   非対称分割、本機固有の調整) → **+10%** (22→24.3 tok/s)
+4. `--memory-ratio 0.95`: さらにキャッシュを拡大 (2224→2670 slots) → **+4%**
+   (24.3→25.2 tok/s、ただしVRAM headroomが0.36GiBまで縮小しリスクあり)
+5. `--distributed-timeout` フラグを新規追加しpp-layers 34を検証 → 効果なし
+   (局所最適はpp-layers 30付近と確認)
+6. `--moe-strategy hybrid` → **-32%の悪化** (25.2→17.1)、web調査で見つけた
+   Ampereでのhybridバグ懸念が再現。offloadを維持する根拠として実測で裏付け
+7. `--spec-mtp` → チェックポイントにMTP expert重みが無く起動不可 (今回は断念)
+
+### 試したが効果が無かった/悪化したもの
+
+- `--moe-strategy hybrid`: 明確に悪化 (上記)
+- `--pp-layers 34` (34/14 非対称): 30/18から追加の伸びなし
+- `--spec-mtp`: チェックポイントの制約で実施不可
+
+### 未着手・今後の伸びしろ (ユーザーがChatGPTに調査させたレポートより抜粋、
+自分の環境で未検証)
+
+- **per-layer cache allocation**: 48層均等ではなくlayerごとのreuse localityに
+  応じてexpert cache容量を配分する。現状は`--moe-cache-auto`が全layer均等。
+- **RadixArk版など、MTP expert重みを含む別チェックポイント**への切替
+  (135GB超の追加ダウンロードが必要、ROIは要検証。Kai実測ではcode/toolで
+  30-36 tok/s、free proseでは11-14 tok/sとworkload依存が大きいため過度な
+  期待は禁物、との指摘あり)
+- **dynamic top-k削減 (top-10→top-6/8)** や **expert混合精度量子化**:
+  モデル出力そのものを変える近似で、速度と品質のトレードオフを要検証
+- **router trace収集 + オフラインcacheシミュレータ**: 本格的な観測基盤構築が
+  前提で、数日〜数週間規模の工数が必要。今回のセッションでは着手していない
+- PCIeやDDR4の理論帯域とrequired bandwidthを突き合わせた定量的な天井分析
+  (`required_bandwidth = target_tok/s × miss_rate × expert_bytes` 形式の
+  見積り) は今回実施していない — 次回セッションで着手する価値あり
+
+### git履歴
+
+本セッションの全作業は `~/My-FreeToken` にgitでコミット済み (コミット一覧は
+`git log --oneline`で追跡可能)。主要コミット:
+- `96cb1cb` FreeToken-Kaiマージ (dual-GPU基盤の獲得)
+- `e71e451` dense-quant fp8 + kv q4_0 (+42%)
+- pp-layers非対称分割、memory-ratio調整の各コミット
+- `--distributed-timeout`フラグ追加のソース改造コミット
+
 ## 未検証 / 次にやること
 
 - [ ] モデルダウンロード完了確認、チェックサム/欠損なしか確認
