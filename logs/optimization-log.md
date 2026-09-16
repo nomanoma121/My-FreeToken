@@ -1663,3 +1663,16 @@ Takeover再計測 (sched-h, serve_final_sched_h.log, 同一フラグmemory-ratio
   無改造top-10との同条件比較で差分評価する予定 (未実施)。
 - MMLU (high_school_mathematics/physics/chemistry/biology × 50問, sched-h): 測定中。
 - 評価用venv: `~/eval-venv` (python 3.12, `lm-eval[api]`, `datasets`)。
+
+### Takeover (Muse Spark, 2026-09-16): sched-h 品質ベンチ結果 (第一報)
+
+自前ハーネス `tools/bench_quality.py` (5-shot, temp=0.0, reasoning_effort=low) による実測。
+サーバー条件: sched-h, --pp-size 2 --gpu 1,0 --pp-layers 30 --moe-strategy offload
+--text-model-only --dense-quant fp8 --kv-cache-dtype q4_0 --memory-ratio 0.95。
+
+- GSM8K 200問: 112/200 = 56.0% (max_tokens=1024)
+- MMLU 高校理数4科目×50問: 159/200 = 79.5% (内訳は `/tmp/mmlu_sched_h.json` 参照、
+  max_tokens=1024 + "Reply with only the letter." 指示)
+- 注意: 両ベンチとも `finish=length` による空回答 (content空、推論だけで枠消費) が
+  不正解に混入している。測定条件由来の下振れを含むため、絶対値より無改造top-10との
+  同条件差分で評価する。top-10側は未実施。
