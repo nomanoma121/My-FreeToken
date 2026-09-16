@@ -149,3 +149,14 @@ GitHubの+15%報告は当環境では再現せず。
 | 4x | 48.9 | 54.7 |
 
 誤差範囲。launch queue不足は律速ではない。
+
+### 27B (2026-09-16): NCCLはinternalに敗北
+
+NCCL有効化ビルド (libnccl2/dev導入、cmakeでFound確認) で同条件比較:
+
+| AR backend | prose | code |
+|---|---|---|
+| internal (従来) | 49.2 | 54.7 |
+| NCCL | 47.6 | 50.6 |
+
+PHB環境ではNCCLが遅い (既報通り)。`GGML_CUDA_ALLREDUCE=internal` を常用とする。
