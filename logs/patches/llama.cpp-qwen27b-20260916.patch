@@ -1,0 +1,143 @@
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 06dea1e1c..74dba82a0 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -121,6 +121,9 @@ struct common_sampler {
+ 
+     llama_token_data_array cur_p;
+ 
++    // chain provably reduces to argmax over raw logits: skip building/sorting the n_vocab candidate array
++    bool greedy_fast = false;
++
+     void reset() {
+         prev.clear();
+ 
+@@ -322,6 +325,8 @@ struct common_sampler * common_sampler_init(
+         }
+     }
+ 
++    bool has_logit_bias = false;
++
+     // logit bias: user biases + model suppress tokens (-INFINITY)
+     {
+         std::vector<llama_logit_bias> merged = params.logit_bias;
+@@ -332,6 +337,7 @@ struct common_sampler * common_sampler_init(
+             merged.push_back({ suppress[i], -INFINITY });
+         }
+ 
++        has_logit_bias = !merged.empty();
+         if (!merged.empty()) {
+             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+         }
+@@ -424,14 +430,24 @@ struct common_sampler * common_sampler_init(
+         params.backend_sampling = false;
+     }
+ 
++    const bool has_temp = std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_TEMPERATURE) != params.samplers.end();
++    const bool greedy_fast =
++        params.temp <= 0.0f && has_temp && params.mirostat == 0 && !grmr && !rbudget && !has_logit_bias &&
++        !params.backend_sampling && params.n_probs == 0 &&
++        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
++        params.dry_multiplier == 0.0f && params.xtc_probability <= 0.0f && params.typ_p >= 1.0f &&
++        std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == params.samplers.end() &&
++        std::find(params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_INFILL) == params.samplers.end();
++
+     auto * result = new common_sampler {
+-        /* .params  = */ params,
+-        /* .grmr    = */ grmr,
+-        /* .rbudget = */ rbudget,
+-        /* .chain   = */ chain,
+-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+-        /* .cur     = */ {},
+-        /* .cur_p   = */ {},
++        /* .params      = */ params,
++        /* .grmr        = */ grmr,
++        /* .rbudget     = */ rbudget,
++        /* .chain       = */ chain,
++        /* .prev        = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
++        /* .cur         = */ {},
++        /* .cur_p       = */ {},
++        /* .greedy_fast = */ greedy_fast,
+     };
+ 
+     return result;
+@@ -515,6 +531,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+         /* .prev    = */ gsmpl->prev,
+         /* .cur     = */ gsmpl->cur,
+         /* .cur_p   = */ gsmpl->cur_p,
++        /* .greedy_fast = */ gsmpl->greedy_fast,
+     };
+ }
+ 
+@@ -604,6 +621,22 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
++    if (gsmpl->greedy_fast && !llama_get_sampled_logits_ith(ctx, idx) && !llama_get_sampled_probs_ith(ctx, idx)) {
++        const float * logits = llama_get_logits_ith(ctx, idx);
++        GGML_ASSERT(logits != nullptr);
++        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++        int max_i = 0;
++        for (int i = 1; i < n_vocab; ++i) {
++            if (logits[i] > logits[max_i]) {
++                max_i = i;
++            }
++        }
++        gsmpl->cur.resize(1);
++        gsmpl->cur[0] = llama_token_data{max_i, logits[max_i], 1.0f};
++        cur_p = { gsmpl->cur.data(), 1, 0, true };
++        return max_i;
++    }
++
+     gsmpl->set_logits(ctx, idx);
+ 
+     // Check if a backend sampler has already sampled a token in which case we
+diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
+index d56129a22..5b5a4cc76 100644
+--- a/ggml/src/ggml-cuda/allreduce.cu
++++ b/ggml/src/ggml-cuda/allreduce.cu
+@@ -304,6 +304,7 @@ struct ggml_cuda_ar_pipeline {
+     size_t   copy_threshold;
+     size_t   copy_chunk_bytes;
+     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
++    bool     no_host_sync;   // skip pool-lap cudaEventSynchronize; device-side arrival handshake already orders slot reuse
+     uint64_t call_count;
+ 
+     // Per-device resources.
+@@ -362,7 +363,7 @@ static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline *
+     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
+     p->call_count++;
+ 
+-    if (pool_lapped) {
++    if (pool_lapped && !p->no_host_sync) {
+         for (int i = 0; i < p->n_devices; ++i) {
+             ggml_cuda_set_device(p->devices[i]);
+             CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+@@ -428,6 +429,13 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
+     // byte threshold to opt out for small tensors.
+     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
++    // 1 = skip the per-AR host-side event sync on pool wraparound. Safe when all chunked ARs run
++    // on the caller compute streams (lockstep arrival handshake already orders slot reuse);
++    // lets whole decode steps capture into fewer CUDA graphs. Validate output quality!
++    p->no_host_sync     = ggml_cuda_ar_env_u64("GGML_CUDA_AR_NO_HOST_SYNC", 0) != 0;
++    if (p->no_host_sync) {
++        GGML_LOG_WARN("%s: GGML_CUDA_AR_NO_HOST_SYNC=1, skipping pool-lap host sync\n", __func__);
++    }
+     for (size_t i = 0; i < n_devices; ++i) {
+         p->devices[i] = devices[i];
+     }
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ad6612647..a122e5b67 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -466,7 +466,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+     cb(conv_states, "conv_states_reshaped", il);
+ 
+-    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
++    // cont before concat: the non-contiguous concat kernel is ~3x slower than cont + contiguous concat
++    qkv_mixed = ggml_cont(ctx0, ggml_transpose(ctx0, qkv_mixed));
+     cb(qkv_mixed, "qkv_mixed_transposed", il);
+ 
+     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);

@@ -270,3 +270,40 @@ Q4_0-fast, n-max 3。mean len は全条件で 2.49/2.68 (出力不変)、品質�
 - core+300 で GPU0 が不安定化 → 即 0/0 に戻し、再計測 59.2/63.9・5/5・Xidなしで正常を確認
 - 安全圏の上げ幅では +1% 程度でリスクに見合わないため、オフセットは 0 のまま (再起動でも0)
 - メモリクロックを上げてもほぼ伸びない → 帯域より電力/SMが律速
+
+### 27B (2026-09-16): 残り候補1〜5を全実施 → 最終 60.4 / 65.1 tok/s
+
+基準: Q4_0-fast, n-max 3, 59.4/64.1 (mean len 2.49/2.68)。比較は mean len 一致を確認したうえで tok/s。
+
+| # | 施策 | 結果 | 判定 |
+|---|---|---|---|
+| 1 | tensor-split 48/52, 46/54, 44/56 (131kはGPU1 OOM → -c 32768で計測) | サイクル/s 24.2, 23.7, 23.3〜23.5 (50/50は23.9〜24.0) | ±1〜2.5%、棄却 |
+| 2 | GPU1 電力上限 180→190W (+ts 50/50, 48/52) | 59.3/63.9, 56.6/63.3 | 効果なし (律速はGPU0)、180Wに戻した |
+| 3 | サンプラー greedy 高速経路 (common/sampling.cpp) | 59.8/64.4 前後 | +0.5%、**採用** |
+| 4 | AR待ちスピン間隔 __nanosleep 100→1000/10000ns | 59.9/64.5, 59.6/64.4 | 効果なし、100nsに戻した |
+| 5a | GDN conv state の concat 前に cont (delta-net-base.cpp) | 60.4/65.2, 60.3/65.0 | +1%、**採用** |
+| 5b | MMVQ up+gate+SwiGLU 融合を多列 (検証バッチ) に拡張 | 54.5/58.8, 54.3/58.5 | -10%、撤回 |
+| - | 参考: GGML_CUDA_DISABLE_FUSION=1 | 57.6/62.1 | 既存融合は有効、既定維持 |
+
+3: temp<=0 かつ grammar/reasoning budget/logit bias(抑制トークン含む)/penalties/DRY/XTC/typical/adaptive-p なし、n_probs=0、
+サンプラー列に temperature がある場合のみ、24.8万語の候補配列構築+top-kソートを省いて生logitsのargmaxを返す。
+結果はargmaxと同一 (mean len 完全一致で確認)。draft側は cur_p->data[0] の id/p しか参照しないので1要素(p=1)で互換。
+
+5a: conv_states(連続) と transpose(qkv_mixed)(非連続) の concat が `concat_non_cont` (48回 0.91ms, 1回19µs) になっていた。
+cont を挟んで `cpy_scalar_transpose` 0.14ms + `concat_cont` 0.13ms に。出力同一。
+
+perf (DWARF callgraph) で main thread の非待ち処理を確認: sampler 1.6%, meta split_state 0.7%, kv seq_rm 0.4% 程度で、
+残りは GPU 待ちスピン (libcuda 81% + vdso clock_gettime 12%)。ホスト側の伸びしろはほぼ尽きた。
+
+最終品質チェック: 5/5、is_prime 正常。
+llama.cpp の差分は `logs/patches/llama.cpp-qwen27b-20260916.patch` (base 8ea290247) に保存
+(greedy高速経路 + GDN concat cont + 既存の GGML_CUDA_AR_NO_HOST_SYNC(既定off))。
+
+**最終構成** (tmux llama27b, :8080):
+```
+GGML_CUDA_ALLREDUCE=internal ./build/bin/llama-server -m ~/models/qwen38-27b-gguf/Qwen3.8-27B-Q4_0-fast.gguf \
+  -ngl all -c 131072 -np 1 --split-mode tensor -fit off --cache-type-k q8_0 --cache-type-v q8_0 \
+  --flash-attn on --no-mmproj --spec-type draft-mtp --spec-draft-n-max 3 --host 0.0.0.0 --port 8080
+```
+開始時 48.9/54.7 → 最終 60.4/65.1 (+24% / +19%)。目標70は未達。
+律速は両GPUの電力キャップ (特にGPU0 170W ハード上限) 下での検証forward (約35ms/42msサイクル)。
