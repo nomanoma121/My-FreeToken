@@ -71,3 +71,26 @@ tensor n-max 2 ベースでの比較 (prose/code predicted_tps):
 | 1 | 49.1 | 54.7 | 同上 (変化なし) |
 
 適応的draft数制御はこの構成では挙動を変えない。n-max 2 + n-min defaultを維持。
+
+### 27B (2026-09-16): ARホスト同期スキップ改造 → 速度効果なし、機構は成功
+
+llama.cpp `ggml/src/ggml-cuda/allreduce.cu` に `GGML_CUDA_AR_NO_HOST_SYNC`
+環境変数を追加 (pool周回時の `cudaEventSynchronize` をスキップ。チャンクパスは
+computeストリーム順序＋カーネル内到着ハンドシェイクで順序保証されるという設計)。
+リビルド＋実測:
+
+| 構成 | prose | code |
+|---|---|---|
+| stock (n-max 2) | 48.9 | 54.5 |
+| NO_HOST_SYNC=1 | 48.9 | 54.6 |
+
+効果なし。nsys裏取り (`/tmp/nsys27b2.nsys-rep`) で判明した理由:
+- `cudaEventSynchronize` 92,420回は完全に消滅 (機構としては成功)
+- 代わりに `cudaStreamSynchronize` 72,350回が 2.63秒→12.65秒に増加
+- グラフ起動 92,496回のまま (ARごとに切断)
+- 待ちの場所が変わっただけで、op-by-op直列実行は不変
+
+結論: ホスト同期除去だけでは不足。本当に効かせるにはdecode 1ステップ全体の
+単一グラフ化 (スケジューラ級の改造、工数日単位・高リスク) が必要。
+品質は無傷 (算数408・羊9・34割り算すべて正解)。
+パッチはソースに残置 (デフォルト0で従来動作、バイナリも通常起動では等価)。
