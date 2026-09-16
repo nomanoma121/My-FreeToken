@@ -1676,3 +1676,20 @@ Takeover再計測 (sched-h, serve_final_sched_h.log, 同一フラグmemory-ratio
 - 注意: 両ベンチとも `finish=length` による空回答 (content空、推論だけで枠消費) が
   不正解に混入している。測定条件由来の下振れを含むため、絶対値より無改造top-10との
   同条件差分で評価する。top-10側は未実施。
+
+### Takeover (Muse Spark, 2026-09-16): 品質ベンチ確定値 + ベンチ中断、プロファイラ主導へ転換
+
+自前ハーネス `tools/bench_quality.py` (5-shot, temp=0.0, reasoning_effort=low) 実測。
+サーバー条件は両構成とも --pp-size 2 --gpu 1,0 --pp-layers 30 --moe-strategy offload
+--text-model-only --dense-quant fp8 --kv-cache-dtype q4_0 --memory-ratio 0.95。
+
+| ベンチ | 無改造top-10 | sched-h (平均2.75) | 差分 |
+|---|---|---|---|
+| GSM8K 200問 | 198/200 = 99.0% | 112/200 = 56.0% | -43pt |
+| MMLU 高校理数4科目×50問 | 134/141 = 95.0% (141問でユーザー指示により中断) | 159/200 = 79.5% | 約-15pt |
+
+結論: top-k削減の品質劣化は明確かつ大幅 (特にGSM8Kの記述式数学で顕著)。
+ユーザーの「性能落としたくない」意向を受け、ベンチ追加取得は中断し、
+方針を「品質を削らない高速化 (プロファイラ主導のカーネル最適化)」へ転換する。
+MTP投機デコード・dense FP8 GEMVのncu計測が次の主戦場。
+なお reboot により ncu が一般ユーザー権限で動作確認済み (sm__cycles_elapsed取得可)。
