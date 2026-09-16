@@ -1757,3 +1757,55 @@ decodeパス (M==1, W8A16 split-K GEMV) を `ncu` で計測。ncuはreboot後の
 - 結論: 重み読みが天井で伸びしろは約2割まで。occupancy改善の余地はあるがDRAM壁が先。
 
 (27Bスイープ・nsys解析・天井見積は `logs/optimization-log-qwen27b.md` へ移動)
+
+### 2026-09-16: DFlash/DSpark 投機デコードを llama.cpp で可否検証 (Flash Next)
+
+背景: 27B で DFlash2 が大きく効いたため Flash Next でも試行。公開 drafter は
+`PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash` のみ (非公式、作者カード自体が「math向け、code wash、
+chat は遅くなる、native MTP k=4 比 +3.87%」と明記、DGX Spark+vLLM・非thinking計測)。
+FreeToken は DFlash 未対応のため、まず llama.cpp (本家 8ea290247) で1-2時間の可否チェックとした。
+
+準備:
+- drafter を `convert_hf_to_gguf.py --target-model-dir ~/models/qwen38-flash-next-nvfp4 --outtype q8_0` で変換
+  (Qwen3DSparkModel → dflash arch, target_layers [4,16,24,36,44], 529MB)
+- **llama.cpp qwen4exp の tap バグを修正**: `res->t_layer_inp[il]` が HC幅 (4×2560) の残差ストリームを
+  指しており、extract は先頭2560要素 (ストリーム0) だけを読んでいた。drafter は各層 attention 入口の
+  HC縮約 (GatedResidual.mix の x, 2560幅) で学習されているため、`build_hc_mix` 出力に差し替え
+  (`logs/patches/llama.cpp-qwen4exp-dflash-tap-20260916.patch`)
+- 学習系は DeepSpec `Qwen4ExpDSparkTrainer` (markov/confidence無効)。`--spec-type draft-dflash` では
+  acceptance 1.6% (起点規約不一致)、`draft-dspark` で正常化
+
+ベンチ: /tmp/bench_llama.py 相当 (384トークン prose/code, greedy)、`-ngl 99 -t 12 -fa on -c 32768`、
+UD-Q4_K_XL。thinking無効版は chat_template_kwargs enable_thinking=false。
+
+| 構成 | thinking | prose | code | mean len |
+|---|---|---|---|---|
+| -ncmoe 44 (旧ベスト) | 有 | 14.9 | 16.1 | - |
+| -ncmoe 48 (全expert CPU) | 有 | 15.8 | 15.9 | - |
+| -ncmoe 48 | 無 | 15.5 | 15.6 | - |
+| ncmoe48 + draft-dflash n4 | 有 | 6.3 | 6.4 | 1.06/1.05 |
+| ncmoe48 + draft-dspark n4 | 有 | 9.4 | 11.5 | 1.59/1.88 |
+| ncmoe48 + dspark n4 | 無 | 12.5 | 19.0 | 2.12/3.17 |
+| ncmoe48 + dspark n3 | 無 | 14.4 | 19.9 | 2.12/2.85 |
+| ncmoe48 + dspark n2 | 無 | 15.4 | 19.8 | 1.91/2.39 |
+| ncmoe48 + dspark n2, **tap修正前** | 無 | 11.0 | 12.0 | 1.38/1.48 |
+
+**expert の GPU 配置 (-ot)** — 以前は -ncmoe が GPU1 にだけ積んで GPU0 が遊んでいた。
+層ごとに所属GPUへ明示配置 (1層あたり約1.5GiB):
+- ot7 = CUDA0: blk 0,1,3 / CUDA1: blk 24-27 (7層), ot9 = CUDA0: 0,1,3,5 / CUDA1: 24,25,26,27,29 (9層)
+
+| 構成 | thinking | prose | code | mean len | VRAM (GPU0/GPU1) |
+|---|---|---|---|---|---|
+| ot7 | 無 | 17.2 | 17.4 | - | 9.1/9.5GB |
+| ot9 | 無 | 17.5 | 17.9 | - | 10.6/11.0GB |
+| **ot9** | **有** | **17.4** | **17.6** | - | 10.6/11.0GB |
+| ot7 + dspark n2 | 無 | 16.7 | **22.2** | 1.88/2.40 | 10.1/10.9GB |
+| ot7 + dspark n2 | 有 | 13.6 | 13.1 | 1.55/1.48 | 10.1/10.9GB |
+| ot9 + dspark n2 | - | CUDA OOM (GPU1) | | | |
+
+結論:
+- expert 検証コストが重い (5トークン検証 ≈ 1トークン生成の約2.6倍、CPU計算の unique expert 増) ため、
+  投機デコードが得をするのは **thinking無効の code** のみ (ot7+dspark n2 で 22.2, ot9素比 +24%)
+- thinking有効 (既定) では drafter が非thinking学習のため当たらず、素の ot9 (17.4/17.6) が最速
+- 無損失の改善として **expert を両GPUへ明示配置 (ot9) が +10〜13%** (15.8/15.9 → 17.4/17.6)
+- FreeToken 実装へ進むほどの根拠はない (最良ケースでも thinking無効codeの+24%、FreeToken素の24.5より低速)

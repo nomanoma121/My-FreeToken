@@ -1,0 +1,23 @@
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 8ace95f73..b3d0b5cf0 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -375,8 +375,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+     cb(res_hc, "hc_init", -1);
+ 
+     for (int il = 0; il < n_layer; ++il) {
+-        res->t_layer_inp[il] = res_hc;
+-
+         if (hparams.is_ple(il)) {
+             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+         }
+@@ -389,6 +387,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+                 model.layers[il].hc_attn_inject,
+                 &inject, il);
+ 
++        // DFlash/EAGLE taps are the HC-contracted native-width attention input, not the hc-wide residual
++        res->t_layer_inp[il] = cur;
++
+         ggml_build_forward_expand(gf, cur);
+ 
+         if (hparams.is_recr(il)) {
