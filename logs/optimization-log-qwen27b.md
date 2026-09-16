@@ -104,8 +104,8 @@ computeストリーム順序＋カーネル内到着ハンドシェイクで順�
 - [x] p-min 0.7 (accept 89%も速度低下で棄却)
 - [x] p-min sweep (0.4/0.7とも悪化で棄却)
 - [x] MTP + ngram併用 (ngram単体31で棄却、併用不可)
-- [ ] CPU sampler wall time計測 → backend sampling対応 ←次
-- [ ] CUDA_SCALE_LAUNCH_QUEUES=4x
+- [x] CPU sampler→backend sampling (効果なし)
+- [ ] CUDA_SCALE_LAUNCH_QUEUES=4x ←次
 - [ ] minimal loop vs server比較
 - [ ] graph launch分類・fused QKV
 - [ ] MTP cycle graph specialization / DeltaNet fusion / GEMV+AR融合
@@ -130,3 +130,13 @@ GitHubの+15%報告は当環境では再現せず。
 
 新規prose/code生成では繰り返しが少なくngramが当たらない。MTP+ngram併用は
 当該llama.cppでは非対応 (spec-type単一)。MTP維持。
+
+### 27B (2026-09-16): --backend-sampling (-bs) は効果なし
+
+| -bs | prose | code |
+|---|---|---|
+| なし | 48.9 | 54.5 |
+| あり | 49.0 | 54.7 |
+
+誤差範囲。なお `-bs` でも `backend offload failed ... using CPU sampler` 警告は
+1件残存 (draft側はデフォルト有効)。CPU samplerは律速ではないと判断。
