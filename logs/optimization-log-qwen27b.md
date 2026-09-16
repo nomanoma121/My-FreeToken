@@ -221,3 +221,32 @@ draftが軽くなったことで n-max 3 が最適に変わった。
 品質簡易チェック (n-max 3): 17*24=408, 羊9, 1156/34=34, 首都=東京, 180km/2.5h=72 → 5/5正解、is_primeコードも正常。
 
 次: draft用縮小語彙ヘッド (FR-Spec方式) / MXFP4等さらに軽いカーネル形式の検証
+
+### 27B (2026-09-16): 追加検証 (いずれも Q4_0-fast 基準、n-max 3 = 59.4/64.1)
+
+**MXFP4 (FFN/attn/ssm_out, 14.0GB)**: 52.9/61.5、mean len 2.49/2.90、サイクル/s 21.2 (Q4_0-fast 23.8) → 棄却。小さくてもカーネルが遅い。
+
+**draft用縮小語彙ヘッド (FR-Spec方式, 3.2万語)**: 実装 (nextn.sub_head + sub_inv で logits を n_vocab に書き戻し) して 48.5/57.2 → 棄却・コード撤回。
+- 語彙カバー率は held-out で 99.06% (Python stdlib/llama.cpp docs/My-FreeToken ログ 1800万トークンで頻度算出)
+- ヘッドのMMVQは 1.20ms→0.62ms に減ったが、24.8万語への書き戻し `k_get_rows_float` が 1.79ms かかり逆効果
+- prose の accept率も 0.50→0.42 に低下
+
+**MMQ強制 (検証バッチをMMVQ→MMQ)**: MMVQ上限1/2/3 すべて 約47/54 → 棄却。MMVQが正解。
+
+**MMVQ多列カーネルの並列度 (Ampere=GENERIC表, ncols 2-4)**: nwarps×rows/block = 2×2, 8×2, 4×1, 4×4, 2×4, 4×8, 8×1, 2×8 を掃引。
+サイクル/s換算でベースライン(4×2)±1%以内 (rows/block=1 は大幅悪化) → 効果なし、撤回。
+tok/s はカーネル変更による丸め差で greedy 軌跡が変わり accept率が揺れるので、必ず mean len で正規化して比較すること。
+
+**バッチサイズ別 decode 時間** (llama-batched-bench, Q4_0-fast, 系列数=B):
+
+| B | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| ms/step | 29.0 | 32.4 | 36.5 | 40.2 | 45.1 | 52.4 |
+
+B1→B4 のGPU時間差分 (+10.2ms): MMVQ +4.9, GDN get_rows +1.4, gated_delta_net +1.4, AR +1.3。
+ただし実際の投機検証 (1系列4トークン) は B1 比 +5ms 程度で、MMVQ 増分は +1.2ms のみ → 列融合カーネルの上限は約1ms。
+
+**電力律速を発見**: n-max 3 ベンチ中の nvidia-smi (500ms毎):
+- GPU0: 平均163W (上限170W, ハード上限も170W), SM 1857MHz, 全サンプルで throttle reason 0x4 (SW power cap)
+- GPU1: 平均170W (上限180W, 最大190W), SM 1959MHz, 全サンプルで 0x4
+- 両GPUとも電力キャップでスロットリング中。遅いGPU0に全体が律速される
