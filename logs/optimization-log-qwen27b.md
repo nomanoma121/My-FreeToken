@@ -105,7 +105,7 @@ computeストリーム順序＋カーネル内到着ハンドシェイクで順�
 - [x] p-min sweep (0.4/0.7とも悪化で棄却)
 - [x] MTP + ngram併用 (ngram単体31で棄却、併用不可)
 - [x] CPU sampler→backend sampling (効果なし)
-- [ ] CUDA_SCALE_LAUNCH_QUEUES=4x ←次
+- [x] CUDA_SCALE_LAUNCH_QUEUES=4x (効果なし)
 - [ ] minimal loop vs server比較
 - [ ] graph launch分類・fused QKV
 - [ ] MTP cycle graph specialization / DeltaNet fusion / GEMV+AR融合
@@ -140,3 +140,12 @@ GitHubの+15%報告は当環境では再現せず。
 
 誤差範囲。なお `-bs` でも `backend offload failed ... using CPU sampler` 警告は
 1件残存 (draft側はデフォルト有効)。CPU samplerは律速ではないと判断。
+
+### 27B (2026-09-16): CUDA_SCALE_LAUNCH_QUEUES=4x は効果なし
+
+| LAUNCH_QUEUES | prose | code |
+|---|---|---|
+| 未設定 | 48.9 | 54.5 |
+| 4x | 48.9 | 54.7 |
+
+誤差範囲。launch queue不足は律速ではない。
