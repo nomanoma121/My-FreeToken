@@ -1644,3 +1644,22 @@ sched-lは既に定義済み (sched-hの12層削減にindex16を追加した13�
 結論: sched-k (13層) と同じ「推論はできるが書き出せない」崩壊パターンを再現。**13層は配置によらず実質的な崖**と確定。sched-h (12層) を最終推奨として維持する。サーバーはtakeover用に起動したsched-lを停止し、sched-hに戻す。
 
 Takeover再計測 (sched-h, serve_final_sched_h.log, 同一フラグmemory-ratio 0.95): prose 35.94 tok/s / code 37.75 tok/s。再現性バンド36-38内に収束。最終推奨sched-h不変。サーバーは127.0.0.1:1919で稼働中。
+
+### Takeover (Muse Spark, 2026-09-16): 品質ベンチ基盤の構築 + GSM8K測定中
+
+目的: top-k削減 (top-10 → sched-h平均2.75) の品質劣化幅を公開ベンチで定量化する。
+
+- `lm-eval` (lm-evaluation-harness) は推論モデルと相性不良のため断念:
+  FreeTokenサーバーは思考を `reasoning_content` に、最終回答を `content` に分離して返す。
+  デフォルトeffort (xhigh) では `content` が空になり全問0点になることを確認。
+  対策として自前ハーネス `/tmp/mybench.py` を作成 (5-shot, temperature=0.0,
+  `reasoning_effort=low`, max_tokens=1024)。
+- MMLUでは別問題を発見: 5-shot prompt + max_tokens=512 だと推論だけで枠を食い潰し
+  (`finish=length`, content空, reasoning 800-2000 chars) になる。max_tokens=1024 +
+  "Reply with only the letter." 指示で緩和中。`enable_thinking=false` は当該サーバーでは
+  無視されることを確認済み。
+- GSM8K (200問, sched-h): 112/200 = 56.0% で確定 (`/tmp/gsm_sched_h_200.json`)。
+  ただし `pred=None` (空回答) が約1/3混入しており、測定条件由来のノイズを含む。
+  無改造top-10との同条件比較で差分評価する予定 (未実施)。
+- MMLU (high_school_mathematics/physics/chemistry/biology × 50問, sched-h): 測定中。
+- 評価用venv: `~/eval-venv` (python 3.12, `lm-eval[api]`, `datasets`)。
