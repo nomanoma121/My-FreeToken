@@ -102,10 +102,21 @@ computeストリーム順序＋カーネル内到着ハンドシェイクで順�
 - [x] nsys通信解析 (AR 75%、同期10秒特定)
 - [x] AR BLOCKS 16 / NO_HOST_SYNC改造 (効果なし、原因はop-by-op直列)
 - [x] p-min 0.7 (accept 89%も速度低下で棄却)
-- [ ] p-min sweep残り (0.3/0.4/0.5/0.8)
-- [ ] MTP + ngram併用
+- [x] p-min sweep (0.4/0.7とも悪化で棄却)
+- [ ] MTP + ngram併用 ←次
 - [ ] CPU sampler wall time計測 → backend sampling対応
 - [ ] CUDA_SCALE_LAUNCH_QUEUES=4x
 - [ ] minimal loop vs server比較
 - [ ] graph launch分類・fused QKV
 - [ ] MTP cycle graph specialization / DeltaNet fusion / GEMV+AR融合
+
+### 27B (2026-09-16): p-min sweep → いずれも悪化で棄却
+
+| --spec-draft-p-min | prose | code | accept率 |
+|---|---|---|---|
+| 0.0 (default) | 48.9 | 54.5 | 57-69% |
+| 0.4 | 40.3 | 46.7 | 72-74% |
+| 0.7 | 35.2 | 40.6 | 89% |
+
+accept率は上がるが速度は単調悪化。低確率draftの棄却がforward回数を増やすため。
+GitHubの+15%報告は当環境では再現せず。
