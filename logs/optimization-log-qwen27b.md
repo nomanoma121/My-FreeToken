@@ -94,3 +94,18 @@ computeストリーム順序＋カーネル内到着ハンドシェイクで順�
 単一グラフ化 (スケジューラ級の改造、工数日単位・高リスク) が必要。
 品質は無傷 (算数408・羊9・34割り算すべて正解)。
 パッチはソースに残置 (デフォルト0で従来動作、バイナリも通常起動では等価)。
+
+## TODO (27B 70 tok/sへの道、順次実行中)
+
+- [x] ベースライン確定 (tensor n-max 2: 49/55)
+- [x] n-max 1/3、layer/row split、ctx、n-min sweep
+- [x] nsys通信解析 (AR 75%、同期10秒特定)
+- [x] AR BLOCKS 16 / NO_HOST_SYNC改造 (効果なし、原因はop-by-op直列)
+- [x] p-min 0.7 (accept 89%も速度低下で棄却)
+- [ ] p-min sweep残り (0.3/0.4/0.5/0.8)
+- [ ] MTP + ngram併用
+- [ ] CPU sampler wall time計測 → backend sampling対応
+- [ ] CUDA_SCALE_LAUNCH_QUEUES=4x
+- [ ] minimal loop vs server比較
+- [ ] graph launch分類・fused QKV
+- [ ] MTP cycle graph specialization / DeltaNet fusion / GEMV+AR融合
