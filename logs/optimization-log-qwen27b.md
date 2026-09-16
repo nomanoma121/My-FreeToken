@@ -103,8 +103,8 @@ computeストリーム順序＋カーネル内到着ハンドシェイクで順�
 - [x] AR BLOCKS 16 / NO_HOST_SYNC改造 (効果なし、原因はop-by-op直列)
 - [x] p-min 0.7 (accept 89%も速度低下で棄却)
 - [x] p-min sweep (0.4/0.7とも悪化で棄却)
-- [ ] MTP + ngram併用 ←次
-- [ ] CPU sampler wall time計測 → backend sampling対応
+- [x] MTP + ngram併用 (ngram単体31で棄却、併用不可)
+- [ ] CPU sampler wall time計測 → backend sampling対応 ←次
 - [ ] CUDA_SCALE_LAUNCH_QUEUES=4x
 - [ ] minimal loop vs server比較
 - [ ] graph launch分類・fused QKV
@@ -120,3 +120,13 @@ computeストリーム順序＋カーネル内到着ハンドシェイクで順�
 
 accept率は上がるが速度は単調悪化。低確率draftの棄却がforward回数を増やすため。
 GitHubの+15%報告は当環境では再現せず。
+
+### 27B (2026-09-16): ngram-mod単体は不発、MTP維持
+
+| spec-type | prose | code |
+|---|---|---|
+| draft-mtp n-max 2 | 48.9 | 54.5 |
+| ngram-mod (24/48/64) | 31.8 | 31.1 |
+
+新規prose/code生成では繰り返しが少なくngramが当たらない。MTP+ngram併用は
+当該llama.cppでは非対応 (spec-type単一)。MTP維持。
