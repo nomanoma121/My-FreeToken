@@ -168,3 +168,56 @@ PHB環境ではNCCLが遅い (既報通り)。`GGML_CUDA_ALLREDUCE=internal` を
   (GPU1のクロックまで低下)。均等維持。
 - fused-QKV: 当該checkoutにconvert flagあり。ただし適用にはHF元モデル約54GBの
   DL＋再変換＋再量子化が必要で効果はlaunch数削減のみ (小〜中)。未実施。
+
+### 27B (2026-09-16): 律速の再特定 → 「全体グラフ化」は不要と判明
+
+nsys (CUDA graph有効/無効の両方) でdecode 1サイクル (約43.5ms) を分解:
+
+- 入力H2D 0.6ms → 本体検証forward GPU 35.9ms → logits D2H 0.7ms → CPU 0.9ms → MTP(追い付き+draft1) 2.4ms → 0.45ms → draft2 2.3ms
+- 本体forward中、ホストは全launch (graph 258 + AR 256) を4.7msで出し終え、GPUが後追いで約30ms実行 → **GPU律速**
+- `GGML_CUDA_DISABLE_GRAPHS=1` でも 48.9/54.4 と不変 → launch/同期は律速でない
+- よって「decode 1ステップ全体の単一グラフ化」は効果ほぼゼロと判断し中止
+  (前回の cudaStream/EventSynchronize 待ちは「GPUが終わるのを待っている」だけだった)
+- 検証forwardのGPU時間内訳 (dev0, Q4_K_M): mul_mat_vec_q 27.1ms (74%), AR 3.3ms (dev1は4.4ms),
+  GDN 0.9, concat 0.9, rms_norm 0.9, quantize_q8_1 0.9, 他小粒
+- MMVQは帯域理論値の約85%で動作 (IQ4_XS FFN 77µs vs 理論66µs)。ただし Q3_K は 150µs vs 理論53µs で演算律速
+- 出力ヘッド Q6_K (1.04GB) は検証1回+draft毎に読まれ、1回約1.5ms
+- logits D2H は両GPUから分割読み出しで計0.3ms、非律速。GPU0はPCIe x4 (Max x16)、電力上限170Wはハード上限
+
+### 27B (2026-09-16): 量子化形式の比較 (n-max 2, greedy)
+
+| 量子化 | サイズ | prose | code | サイクル/s |
+|---|---|---|---|---|
+| UD-Q4_K_M (従来) | 16.5GB | 48.9 | 54.7 | 23.0 |
+| UD-IQ4_XS | 14.3GB | 53.0 | 51.8 | 23.1 |
+| unsloth Q4_0 | 16.1GB | 54.7 | 57.8 | 24.5 |
+| UD-Q3_K_XL | 13.2GB | 48.6 | 50.3 | 22.3 |
+
+サイズよりカーネルの単純さが効く。IQ4_XSは小さいが同速、Q3系は遅い、Q4_0が最速。
+(サイクル/s = tok/s ÷ mean len。accept率は量子化で多少揺れる)
+
+- ARカーネルブロック数 1/2/4/8 (Q4_0): 53.6/56.6, 54.6/57.7, 54.8/58.0, 54.7/57.8 → 効果なし、改造は撤回
+
+### 27B (2026-09-16): 自前 純Q4_0 量子化で 59.2 / 63.6 tok/s
+
+unsloth BF16 + imatrix_unsloth.gguf から作成 (`~/models/qwen38-27b-gguf/Qwen3.8-27B-Q4_0-fast.gguf`, 15.4GB):
+
+```
+llama-quantize --imatrix imatrix_unsloth.gguf --output-tensor-type q4_0 --token-embedding-type q4_0 \
+  --tensor-type ssm_out=q4_0 --tensor-type ffn_down=q4_0 Qwen3.8-27B-BF16-00001-of-00002.gguf \
+  Qwen3.8-27B-Q4_0-fast.gguf Q4_0 10
+```
+
+unsloth Q4_0 では出力ヘッドQ6_K・ssm_out Q5_K・一部ffn_down Q4_1 が残っていたのを全てQ4_0化。
+
+| 構成 | prose | code | mean len |
+|---|---|---|---|
+| Q4_0-fast n-max 2 | 56.6 | 61.2 | 2.15/2.32 |
+| **Q4_0-fast n-max 3** | **59.2** | **63.6** | 2.49/2.68 |
+| Q4_0-fast n-max 4 | 55.3 | 61.2 | 2.62/2.88 |
+| unsloth Q4_0 n-max 3 | 55.7 | 56.8 | 2.60/2.65 |
+
+draftが軽くなったことで n-max 3 が最適に変わった。
+品質簡易チェック (n-max 3): 17*24=408, 羊9, 1156/34=34, 首都=東京, 180km/2.5h=72 → 5/5正解、is_primeコードも正常。
+
+次: draft用縮小語彙ヘッド (FR-Spec方式) / MXFP4等さらに軽いカーネル形式の検証
