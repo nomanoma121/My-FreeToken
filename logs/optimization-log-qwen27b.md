@@ -307,3 +307,55 @@ GGML_CUDA_ALLREDUCE=internal ./build/bin/llama-server -m ~/models/qwen38-27b-ggu
 ```
 開始時 48.9/54.7 → 最終 60.4/65.1 (+24% / +19%)。目標70は未達。
 律速は両GPUの電力キャップ (特にGPU0 170W ハード上限) 下での検証forward (約35ms/42msサイクル)。
+
+### 27B (2026-09-16): DFlash2 (ブロック拡散draft) 導入 → 61.8 / 74.4 tok/s (code 70突破)
+
+論文系手法の調査で、z-lab/Qwen3.8-27B-DFlash2-GGUF (DFlash, ICML 2026 の後継。公称 acceptance length 5.3) を発見。
+llama.cpp の `--spec-type draft-dflash` は対応済み (DFlash2 selector 実装あり)。
+
+導入でハマった点:
+- tensor split の本体と同じメタデバイスに draft を載せると `ggml-backend-meta.cpp:543 GGML_ASSERT(src_ss[0].axis != AXIS_0)` で落ちる
+- `-devd CUDA1` で単独GPUに載せると、draft が本体の output.weight (メタバッファ) を借りて `pre-allocated tensor (output.weight) in a buffer (Meta())` で落ちる
+- dflash.cpp のコメント通り、draft GGUF に token_embd.weight / output.weight を同梱すれば本体テンソルを参照せず別デバイスで動く
+  (`add_head_to_draft.py`: 本体 Q4_0-fast から2テンソルを複製)
+
+n-max 掃引 (draft=公式 Q4_K_M+ownhead, -c 32768, greedy):
+
+| n-max | prose | code | mean len |
+|---|---|---|---|
+| 3 | 58.0 | 71.5 | 2.47/2.97 |
+| 4 | 57.7 | 70.4 | 2.69/3.19 |
+| 5 | 53.0 | 62.0 | 2.85/3.25 |
+| 7 | 42.2 | 55.5 | 2.83/3.65 |
+| 7 + p-min 0.3/0.5/0.7 | 42.4/36.6/36.2 | 49.4/41.4/36.2 | — (棄却) |
+
+nsys (n=3): 1サイクル 41.6ms = 本体検証 33.4ms + draft 8.0ms (GPU1, host1.1+wait6.9)。
+draft 1回の内訳 (CUDA graph無効): ヘッド Q4_0 24.8万語 2.15ms、本体5層 Q4_K/Q6_K 約4ms (同形状Q4_0の約2倍遅い)。
+
+改善:
+1. draft を公式BF16から Q4_0 に再量子化 (imatrix は形状不一致のため無し, 1033MiB) → 60.3/72.1 (サイクル+2%)
+2. draft ヘッドを頻出語彙に縮小 (native の d2t I64 マッピング、`draft_d2t.py`、頻度は前回のコーパス):
+
+| draft vocab | prose | code | mean len |
+|---|---|---|---|
+| 248320 (full) | 60.3 | 72.1 | 2.52/2.92 |
+| 32768 | 59.5 | 75.8 | 2.38/2.95 |
+| 49152 | 61.7 | 74.8 | 2.49/2.92 |
+| **65536** | **61.8** | **74.4** | 2.50/2.92 |
+| 65536, n-max 4 | 60.2 | 72.7 | 2.63/3.09 |
+
+(MTP縮小ヘッドと違い、d2t の書き戻しは fill+set_rows で軽い)
+日本語など頻度データの薄い言語への安全側として 65536 を採用。
+
+コンテキスト: draft (GPU1 +約1.7GB) のため 131072 は GPU1 OOM。98304 は速度同一で可。
+131072 を `-ts 52,48` で通すと 59.9/68.8 (-4%)、draft を CUDA0 に置くと OOM。→ 98304 を採用。
+
+品質チェック 5/5、is_prime は MTP 構成と完全一致 (greedy lossless)。
+
+**新・最良構成** (tmux llama27b, :8080):
+```
+GGML_CUDA_ALLREDUCE=internal ./build/bin/llama-server -m ~/models/qwen38-27b-gguf/Qwen3.8-27B-Q4_0-fast.gguf \
+  -ngl all -c 98304 -np 1 --split-mode tensor -fit off --cache-type-k q8_0 --cache-type-v q8_0 \
+  --flash-attn on --no-mmproj --spec-type draft-dflash --spec-draft-n-max 3 \
+  -md ~/models/qwen38-27b-dflash2/Qwen3.8-27B-DFlash2-Q4_0-d2t65536.gguf -devd CUDA1 --host 0.0.0.0 --port 8080
+```
