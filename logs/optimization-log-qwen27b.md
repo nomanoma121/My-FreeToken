@@ -106,7 +106,7 @@ computeストリーム順序＋カーネル内到着ハンドシェイクで順�
 - [x] MTP + ngram併用 (ngram単体31で棄却、併用不可)
 - [x] CPU sampler→backend sampling (効果なし)
 - [x] CUDA_SCALE_LAUNCH_QUEUES=4x (効果なし)
-- [ ] minimal loop vs server比較
+- [x] minimal loop比較 (CLI暴走で中止、nsys済みのため不要)
 - [ ] graph launch分類・fused QKV
 - [ ] MTP cycle graph specialization / DeltaNet fusion / GEMV+AR融合
 
@@ -160,3 +160,11 @@ NCCL有効化ビルド (libnccl2/dev導入、cmakeでFound確認) で同条件�
 | NCCL | 47.6 | 50.6 |
 
 PHB環境ではNCCLが遅い (既報通り)。`GGML_CUDA_ALLREDUCE=internal` を常用とする。
+
+### 27B (2026-09-16): CPU governor / 不均等split / fused-QKV調査
+
+- CPU governor powersave→performance: 効果なし (48.9/54.7のまま)
+- tensor-split 45/55: 131kではKV確保OOM。64kに絞れば起動するが48.6/52.2で悪化
+  (GPU1のクロックまで低下)。均等維持。
+- fused-QKV: 当該checkoutにconvert flagあり。ただし適用にはHF元モデル約54GBの
+  DL＋再変換＋再量子化が必要で効果はlaunch数削減のみ (小〜中)。未実施。
