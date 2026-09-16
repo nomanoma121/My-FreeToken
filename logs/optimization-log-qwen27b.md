@@ -60,3 +60,14 @@ n-max 2が最適。layer split 131kはKV確保でOOM (`cudaMalloc failed`, devic
 2. AR同期の融合・削減 (llama.cppのallreduce.cu改造、要工数)
 3. CPU sampler警告の解消 (ついで、効果は小の見込み)
 
+
+### 27B (2026-09-16): --spec-draft-n-min 1 は効果なし
+
+tensor n-max 2 ベースでの比較 (prose/code predicted_tps):
+
+| --spec-draft-n-min | prose | code | accept率/mean len |
+|---|---|---|---|
+| default | 48.9 | 54.5 | 57-69% / 2.14-2.38 |
+| 1 | 49.1 | 54.7 | 同上 (変化なし) |
+
+適応的draft数制御はこの構成では挙動を変えない。n-max 2 + n-min defaultを維持。
