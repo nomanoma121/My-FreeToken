@@ -1693,3 +1693,15 @@ Takeover再計測 (sched-h, serve_final_sched_h.log, 同一フラグmemory-ratio
 方針を「品質を削らない高速化 (プロファイラ主導のカーネル最適化)」へ転換する。
 MTP投機デコード・dense FP8 GEMVのncu計測が次の主戦場。
 なお reboot により ncu が一般ユーザー権限で動作確認済み (sm__cycles_elapsed取得可)。
+
+### Takeover (Muse Spark, 2026-09-16): --moe-cpu-threads 12 は効果なし
+
+ChatGPTレポートの「OMPスレッド数で45.2 tok/s (+15.3%)」という主張の実測検証。
+無改造top-10, 同一フラグ (pp-size 2, pp-layers 30, fp8+q4_0, ratio 0.95) で比較。
+
+| --moe-cpu-threads | prose | code |
+|---|---|---|
+| 0 (default) | 24.15 | 24.75 |
+| 12 | 24.54 | 25.05 |
+
+誤差範囲であり、45.2 tok/sの主張は棄却。当該主張は理論値扱いとする。
